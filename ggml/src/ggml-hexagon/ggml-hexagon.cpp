@@ -831,7 +831,7 @@ static constexpr const hexagon_op_caps ggmlhexagon_k_op_caps_special[] = {
     {false, GGML_OP_ADD1,     0, nullptr, nullptr},
     {false, GGML_OP_ACC,      0, nullptr, nullptr},
     {false, GGML_OP_SUB,      2, "ggmlop_dsp_sub",      nullptr},  // disabled for binary-search quality debug
-    {true,  GGML_OP_MUL,      2, "ggmlop_dsp_mul",      nullptr},
+    {false, GGML_OP_MUL,      2, "ggmlop_dsp_mul",      nullptr},
     {false, GGML_OP_DIV,      2, "ggmlop_dsp_div",      nullptr},  // disabled for binary-search quality debug
     {false, GGML_OP_SQR,      0, nullptr, nullptr},
     {false, GGML_OP_SQRT,     0, nullptr, nullptr},
@@ -849,15 +849,15 @@ static constexpr const hexagon_op_caps ggmlhexagon_k_op_caps_special[] = {
     {false, GGML_OP_CONCAT,     0, "ggmlop_dsp_concat",     nullptr},
     {false, GGML_OP_SILU_BACK, 0, nullptr, nullptr},
     {false, GGML_OP_NORM,     0, nullptr, nullptr},
-        {true,  GGML_OP_RMS_NORM, 2, "ggmlop_dsp_rmsnorm", nullptr},
-        {false, GGML_OP_RMS_NORM_BACK, 0, nullptr, nullptr},
+    {true,  GGML_OP_RMS_NORM, 2, "ggmlop_dsp_rmsnorm", nullptr},
+    {false, GGML_OP_RMS_NORM_BACK, 0, nullptr, nullptr},
     {false, GGML_OP_GROUP_NORM, 0, nullptr, nullptr},
     {false, GGML_OP_L2_NORM,  0, nullptr, nullptr},
     {true,  GGML_OP_MUL_MAT,  2, "ggmlop_dsp_mulmat",   ggmlop_dsp_mulmat},
     // ... all others false until DSP kernels are validated ...
     {false, GGML_OP_MUL_MAT_ID, 0, nullptr, nullptr},
     {false, GGML_OP_OUT_PROD, 0, nullptr, nullptr},
-    {true,  GGML_OP_SCALE,    1, "ggmlop_dsp_scale",   nullptr},
+    {false, GGML_OP_SCALE,    1, "ggmlop_dsp_scale",   nullptr},
     {false, GGML_OP_SET,      0, nullptr, nullptr},
     {false, GGML_OP_CPY,      0, "ggmlop_dsp_cpy",      nullptr},  // disabled for binary-search quality debug
     {false, GGML_OP_CONT,     0, nullptr, nullptr},
@@ -873,7 +873,7 @@ static constexpr const hexagon_op_caps ggmlhexagon_k_op_caps_special[] = {
     {false, GGML_OP_DIAG_MASK_ZERO, 0, nullptr, nullptr},
     {false, GGML_OP_SOFT_MAX, 2, "ggmlop_dsp_softmax",   nullptr},  // disabled: runs on CPU
     {false, GGML_OP_SOFT_MAX_BACK, 0, nullptr, nullptr},
-    {true,  GGML_OP_ROPE,     4, "ggmlop_dsp_rope",     nullptr},
+    {false, GGML_OP_ROPE,     4, "ggmlop_dsp_rope",     nullptr},
     {false, GGML_OP_ROPE_BACK, 0, nullptr, nullptr},
     {false, GGML_OP_CLAMP,    0, nullptr, nullptr},
     {false, GGML_OP_CONV_TRANSPOSE_1D, 0, nullptr, nullptr},

@@ -66,9 +66,6 @@ static void ggml_compute_forward_soft_max_f32(
         const ggml_tensor * src0,
         ggml_tensor * dst) {
 
-    GGMLHEXAGON_LOG_DEBUG("enter %s", __func__);
-    int64_t start_time = ggml_time_us();
-
     float scale = 1.0f;
     memcpy(&scale, dst->op_params, sizeof(float));
     // max_bias at op_params+1 (ignored for now, used in ALiBi)
@@ -125,20 +122,11 @@ static void ggml_compute_forward_soft_max_f32(
             soft_max_row_f32(ne00, dp, sp, scale);
         }
     }
-
-    int64_t end_time = ggml_time_us();
-    GGMLHEXAGON_LOG_INFO("SOFT_MAX elapse %lld us (ne00=%lld, nrows=%lld, scale=%f)",
-                         (long long)(end_time - start_time),
-                         (long long)ne00, (long long)nrows, scale);
-    GGMLHEXAGON_LOG_DEBUG("leave %s", __func__);
 }
 
 int ggmlop_dsp_softmax(remote_handle64 h, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_UNUSED(h);
     GGML_UNUSED(src1);  // mask tensor, not handled yet
-    GGMLHEXAGON_LOG_DEBUG("enter %s", __func__);
-
-    int64_t begin_time = ggml_time_us();
 
     if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         GGMLHEXAGON_LOG_ERROR("SOFT_MAX: unsupported type src0=%d dst=%d", src0->type, dst->type);
@@ -147,9 +135,5 @@ int ggmlop_dsp_softmax(remote_handle64 h, const ggml_tensor * src0, const ggml_t
 
     ggml_compute_forward_soft_max_f32(src0, dst);
 
-    int64_t end_time = ggml_time_us();
-    GGMLHEXAGON_LOG_INFO("elapse time of SOFT_MAX is %lld us", (long long)(end_time - begin_time));
-
-    GGMLHEXAGON_LOG_DEBUG("leave %s", __func__);
     return 0;
 }

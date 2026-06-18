@@ -159,9 +159,6 @@ static void ggml_compute_forward_rope_f32(
         const ggml_tensor * src2,
         ggml_tensor * dst) {
 
-    GGMLHEXAGON_LOG_DEBUG("enter %s", __func__);
-    int64_t start_time = ggml_time_us();
-
     // --- parse op_params (reference aligned) ---
     // [0]=n_past, [1]=n_dims, [2]=mode, [3]=n_ctx, [4]=n_ctx_orig
     // [5]=freq_base(f), [6]=freq_scale(f), [7]=ext_factor(f),
@@ -311,19 +308,10 @@ static void ggml_compute_forward_rope_f32(
     }
 
     free(cache);
-
-    int64_t end_time = ggml_time_us();
-    GGMLHEXAGON_LOG_INFO("ROPE elapse %lld us (ne0=%lld, ne1=%lld, ne2=%lld, mode=%d, type=%d)",
-                         (long long)(end_time - start_time),
-                         (long long)ne0, (long long)ne1, (long long)ne2, mode, src0->type);
-    GGMLHEXAGON_LOG_DEBUG("leave %s", __func__);
 }
 
 int ggmlop_dsp_rope(remote_handle64 h, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
     GGML_UNUSED(h);
-    GGMLHEXAGON_LOG_DEBUG("enter %s", __func__);
-
-    int64_t begin_time = ggml_time_us();
 
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
         GGMLHEXAGON_LOG_ERROR("ROPE: unsupported src0 type %d", src0->type);
@@ -336,9 +324,5 @@ int ggmlop_dsp_rope(remote_handle64 h, const ggml_tensor * src0, const ggml_tens
 
     ggml_compute_forward_rope_f32(src0, src1, src2, dst);
 
-    int64_t end_time = ggml_time_us();
-    GGMLHEXAGON_LOG_INFO("elapse time of ROPE is %lld us", (long long)(end_time - begin_time));
-
-    GGMLHEXAGON_LOG_DEBUG("leave %s", __func__);
     return 0;
 }
