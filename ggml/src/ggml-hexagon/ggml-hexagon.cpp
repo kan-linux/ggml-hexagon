@@ -366,6 +366,8 @@ struct hexagon_appcfg_t {
     const char * cfgfilename;
     const char * runtime_libpath;
     char version[GGMLHEXAGON_TMPBUF_LEN];
+    std::string enabled_ops;    // comma-separated list of ops to offload (empty = all supported ops)
+    std::string enabled_types;  // comma-separated list of weight types to offload for MUL_MAT (empty = all supported types)
 };
 
 static struct hexagon_appcfg_t g_hexagon_appcfg = {
@@ -2226,6 +2228,8 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "offload_cgraph_type", g_hexagon_appcfg.offload_cgraph_type, 2);
     hexagoncfg_instance.get_intvalue("cdsp", "dump_diag_info", g_hexagon_appcfg.dump_diag_info, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "ggml_dsp_use_hvx", g_hexagon_appcfg.ggml_dsp_use_hvx, 1);
+    hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
+    hexagoncfg_instance.get_stringvalue("cdsp", "enabled_types", g_hexagon_appcfg.enabled_types, "");
 
     memcpy(g_hexagon_appcfg.version, version.c_str(), strlen(version.c_str()));
 
@@ -2363,6 +2367,10 @@ static bool ggmlhexagon_check_valid_appcfg() {
         GGMLHEXAGON_LOG_WARN("invalid ggml_dsp_use_hvx %d, reset to 1", g_hexagon_appcfg.ggml_dsp_use_hvx);
         g_hexagon_appcfg.ggml_dsp_use_hvx = 1;
     }
+    if (g_hexagon_appcfg.enable_q_mulmat > 1) {
+        GGMLHEXAGON_LOG_WARN("invalid enable_q_mulmat %d, reset to 1", g_hexagon_appcfg.enable_q_mulmat);
+        g_hexagon_appcfg.enable_q_mulmat = 1;
+    }
 
     if (!is_valid_appcfg) {
         GGMLHEXAGON_LOG_VERBOSE("it seems there is non-default configuration in ggml-hexagon.cfg, will using the default ggml backend accordingly");
@@ -2388,6 +2396,7 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     ggmlhexagon_get_timestring(timestamp);
     if (HWACCEL_CDSP == g_hexagon_appcfg.hwaccel_approach) {
         GGMLHEXAGON_LOG_INFO("offload quantize GGML_OP_MUL_MAT: %s", g_hexagon_appcfg.enable_q_mulmat ? "YES" : "NO");
+        GGMLHEXAGON_LOG_INFO("offload MUL_MAT types: %s", g_hexagon_appcfg.enabled_types.empty() ? "ALL" : g_hexagon_appcfg.enabled_types.c_str());
         GGMLHEXAGON_LOG_INFO("using rpc ion memory pool:        %s", g_hexagon_appcfg.enable_rpc_ion_mempool ? "YES" : "NO");
         GGMLHEXAGON_LOG_INFO("thread_counts with HWACCEL_CDSP:  %d", g_hexagon_appcfg.thread_counts);
         GGMLHEXAGON_LOG_INFO("mulmat algo type on cDSP:         %d", g_hexagon_appcfg.mulmat_algotype);
@@ -6327,6 +6336,58 @@ static void ggmlhexagon_compute(ggml_backend_hexagon_context * ctx, struct ggml_
 //  section-8: implementation of ggml-hexagon backend according to specification in ggml backend subsystem
 // =================================================================================================
 //ref: ggml_hexagon_supported_mul_mat in Qualcomm's official ggml-hexagon backend
+
+// Check if a ggml_type is allowed by the enabled_types config filter
+// Returns true if the type is in the enabled list, or if the list is empty (all types allowed)
+// Only applies to quantized types and F16/BF16; F32 is always allowed
+static bool ggmlhexagon_type_is_enabled(enum ggml_type type) {
+    if (g_hexagon_appcfg.enabled_types.empty()) {
+        return true;
+    }
+    // F32 is always allowed
+    if (type == GGML_TYPE_F32) {
+        return true;
+    }
+    const char * type_name = ggml_type_name(type);
+    if (type_name == NULL) {
+        return false;
+    }
+    // Check if type_name appears as a whole word in the comma-separated list
+    const std::string & list = g_hexagon_appcfg.enabled_types;
+    size_t pos = 0;
+    while (pos < list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) end = list.size();
+        std::string token = list.substr(pos, end - pos);
+        // trim whitespace
+        size_t start = token.find_first_not_of(" \t");
+        size_t last = token.find_last_not_of(" \t");
+        if (start != std::string::npos && last != std::string::npos) {
+            token = token.substr(start, last - start + 1);
+        }
+        // "all" keyword enables all types
+        if (token.size() == 3 &&
+            tolower((unsigned char)token[0]) == 'a' &&
+            tolower((unsigned char)token[1]) == 'l' &&
+            tolower((unsigned char)token[2]) == 'l') {
+            return true;
+        }
+        // case-insensitive compare (ggml_type_name returns lowercase, cfg may use Q4_0 or q4_0)
+        if (token.size() == strlen(type_name)) {
+            bool match = true;
+            for (size_t i = 0; i < token.size(); ++i) {
+                if (tolower((unsigned char)token[i]) != tolower((unsigned char)type_name[i])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
 static bool ggmlhexagon_supported_mul_mat(const struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -6344,6 +6405,10 @@ static bool ggmlhexagon_supported_mul_mat(const struct ggml_tensor * dst) {
     }
 
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    if (!ggmlhexagon_type_is_enabled(src0->type)) {
         return false;
     }
 
@@ -6435,7 +6500,67 @@ static bool ggmlhexagon_supported_mul_mat(const struct ggml_tensor * dst) {
     return true;
 }
 
+// Check if an op is allowed by the enabled_ops config filter
+// Returns true if the op is in the enabled list, or if the list is empty (all ops allowed)
+// Shape/meta ops are always allowed since they are zero-copy metadata operations
+static bool ggmlhexagon_op_is_enabled(enum ggml_op op) {
+    if (g_hexagon_appcfg.enabled_ops.empty()) {
+        return true;
+    }
+    // Always allow shape/meta ops (zero-copy, no backend execution needed)
+    switch (op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_CONT:
+        case GGML_OP_REPEAT:
+            return true;
+        default:
+            break;
+    }
+    const char * op_name = ggml_op_name(op);
+    // Check if op_name appears as a whole word in the comma-separated list
+    const std::string & list = g_hexagon_appcfg.enabled_ops;
+    size_t pos = 0;
+    while (pos < list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) end = list.size();
+        std::string token = list.substr(pos, end - pos);
+        // trim whitespace
+        size_t start = token.find_first_not_of(" \t");
+        size_t last = token.find_last_not_of(" \t");
+        if (start != std::string::npos && last != std::string::npos) {
+            token = token.substr(start, last - start + 1);
+        }
+        // "all" keyword enables all ops
+        if (token.size() == 3 &&
+            tolower((unsigned char)token[0]) == 'a' &&
+            tolower((unsigned char)token[1]) == 'l' &&
+            tolower((unsigned char)token[2]) == 'l') {
+            return true;
+        }
+        // case-insensitive compare
+        if (token.size() == strlen(op_name)) {
+            bool match = true;
+            for (size_t i = 0; i < token.size(); ++i) {
+                if (tolower((unsigned char)token[i]) != tolower((unsigned char)op_name[i])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
 static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const struct ggml_tensor * op_tensor) {
+    if (!ggmlhexagon_op_is_enabled(op_tensor->op)) {
+        return false;
+    }
     ggml_backend_hexagon_context * ctx = (ggml_backend_hexagon_context *)dev->context;
     GGML_UNUSED(ctx);
     if (op_tensor->op == GGML_OP_NONE) {
@@ -6562,6 +6687,9 @@ static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const
 // This allows the scheduler to form larger subgraphs with more ops per batch,
 // reducing FastRPC call overhead (the dominant cost).
 static bool ggmlhexagon_can_handle_op_through_cdsp_special(ggml_backend_dev_t dev, const struct ggml_tensor * op_tensor) {
+    if (!ggmlhexagon_op_is_enabled(op_tensor->op)) {
+        return false;
+    }
     GGML_UNUSED(dev);
     if (op_tensor->op == GGML_OP_NONE) {
         return true;

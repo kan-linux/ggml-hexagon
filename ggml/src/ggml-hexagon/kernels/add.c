@@ -113,7 +113,6 @@ static void add_thread_func(void * data) {
         uint16_t * src1_ptr = (uint16_t *)src1->data;
 
         for (int64_t i = start_idx; i < end_idx; ++i) {
-            // Decompose flat index to 4D coordinates using dst shape
             int64_t i0 = i % ne0;
             int64_t r  = i / ne0;
             int64_t i1 = r % ne1;
@@ -121,7 +120,6 @@ static void add_thread_func(void * data) {
             int64_t i2 = r2 % ne2;
             int64_t i3 = r2 / ne2;
 
-            // Broadcast-aware coordinate mapping via modulo
             int64_t s0_0 = i0 % src0->ne[0];
             int64_t s0_1 = i1 % src0->ne[1];
             int64_t s0_2 = i2 % src0->ne[2];
@@ -134,10 +132,11 @@ static void add_thread_func(void * data) {
 
             int64_t off0 = s0_0*src0->nb[0] + s0_1*src0->nb[1] + s0_2*src0->nb[2] + s0_3*src0->nb[3];
             int64_t off1 = s1_0*src1->nb[0] + s1_1*src1->nb[1] + s1_2*src1->nb[2] + s1_3*src1->nb[3];
+            int64_t offd = i0*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
 
             float f0 = ggml_compute_fp16_to_fp32(src0_ptr[off0 >> 1]);
             float f1 = ggml_compute_fp16_to_fp32(src1_ptr[off1 >> 1]);
-            dst_ptr[i] = ggml_compute_fp32_to_fp16(f0 + f1);
+            dst_ptr[offd >> 1] = ggml_compute_fp32_to_fp16(f0 + f1);
         }
     } else {
         float * dst_ptr  = (float *)dst->data;
@@ -150,8 +149,18 @@ static void add_thread_func(void * data) {
                                src1->ne[2] != ne2 || src1->ne[3] != ne3);
 
         bool contig = !need_broadcast &&
-                      (src0->nb[0] == sizeof(float) && src0->nb[1] == src0->ne[0]*sizeof(float) &&
-                       src1->nb[0] == sizeof(float) && src1->nb[1] == src1->ne[0]*sizeof(float));
+                      src0->nb[0] == sizeof(float) &&
+                      src0->nb[1] == src0->ne[0]*sizeof(float) &&
+                      src0->nb[2] == src0->ne[0]*src0->ne[1]*sizeof(float) &&
+                      src0->nb[3] == src0->ne[0]*src0->ne[1]*src0->ne[2]*sizeof(float) &&
+                      src1->nb[0] == sizeof(float) &&
+                      src1->nb[1] == src1->ne[0]*sizeof(float) &&
+                      src1->nb[2] == src1->ne[0]*src1->ne[1]*sizeof(float) &&
+                      src1->nb[3] == src1->ne[0]*src1->ne[1]*src1->ne[2]*sizeof(float) &&
+                      dst->nb[0] == sizeof(float) &&
+                      dst->nb[1] == dst->ne[0]*sizeof(float) &&
+                      dst->nb[2] == dst->ne[0]*dst->ne[1]*sizeof(float) &&
+                      dst->nb[3] == dst->ne[0]*dst->ne[1]*dst->ne[2]*sizeof(float);
 
         if (contig) {
             const int n = end_idx - start_idx;
@@ -177,8 +186,9 @@ static void add_thread_func(void * data) {
 
                 int64_t off0 = s0_0*src0->nb[0] + s0_1*src0->nb[1] + s0_2*src0->nb[2] + s0_3*src0->nb[3];
                 int64_t off1 = s1_0*src1->nb[0] + s1_1*src1->nb[1] + s1_2*src1->nb[2] + s1_3*src1->nb[3];
+                int64_t offd = i0*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
 
-                dst_ptr[i] = src0_ptr[off0 >> 2] + src1_ptr[off1 >> 2];
+                dst_ptr[offd >> 2] = src0_ptr[off0 >> 2] + src1_ptr[off1 >> 2];
             }
         }
     }
@@ -214,8 +224,6 @@ static void ggml_compute_forward_add_f32(
             int64_t i2 = r2 % ne2;
             int64_t i3 = r2 / ne2;
 
-            // Broadcast-aware coordinate mapping via modulo
-            // Handles: same-shape (identity), ne=1 (broadcast), ne>1 divisor (repeat)
             int64_t s0_0 = i0 % src0->ne[0];
             int64_t s0_1 = i1 % src0->ne[1];
             int64_t s0_2 = i2 % src0->ne[2];
@@ -228,25 +236,35 @@ static void ggml_compute_forward_add_f32(
 
             int64_t off0 = s0_0*src0->nb[0] + s0_1*src0->nb[1] + s0_2*src0->nb[2] + s0_3*src0->nb[3];
             int64_t off1 = s1_0*src1->nb[0] + s1_1*src1->nb[1] + s1_2*src1->nb[2] + s1_3*src1->nb[3];
+            int64_t offd = i0*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
 
             float f0 = ggml_compute_fp16_to_fp32(src0_ptr[off0 >> 1]);
             float f1 = ggml_compute_fp16_to_fp32(src1_ptr[off1 >> 1]);
-            dst_ptr[i] = ggml_compute_fp32_to_fp16(f0 + f1);
+            dst_ptr[offd >> 1] = ggml_compute_fp32_to_fp16(f0 + f1);
         }
     } else {
         float * dst_ptr  = (float *)dst->data;
         float * src0_ptr = (float *)src0->data;
         float * src1_ptr = (float *)src1->data;
 
-        // Check if broadcast/repeat is needed (any src dimension != dst dimension)
         bool need_broadcast = (src0->ne[0] != ne0 || src0->ne[1] != ne1 ||
                                src0->ne[2] != ne2 || src0->ne[3] != ne3 ||
                                src1->ne[0] != ne0 || src1->ne[1] != ne1 ||
                                src1->ne[2] != ne2 || src1->ne[3] != ne3);
 
         bool contig = !need_broadcast &&
-                      (src0->nb[0] == sizeof(float) && src0->nb[1] == src0->ne[0]*sizeof(float) &&
-                       src1->nb[0] == sizeof(float) && src1->nb[1] == src1->ne[0]*sizeof(float));
+                      src0->nb[0] == sizeof(float) &&
+                      src0->nb[1] == src0->ne[0]*sizeof(float) &&
+                      src0->nb[2] == src0->ne[0]*src0->ne[1]*sizeof(float) &&
+                      src0->nb[3] == src0->ne[0]*src0->ne[1]*src0->ne[2]*sizeof(float) &&
+                      src1->nb[0] == sizeof(float) &&
+                      src1->nb[1] == src1->ne[0]*sizeof(float) &&
+                      src1->nb[2] == src1->ne[0]*src1->ne[1]*sizeof(float) &&
+                      src1->nb[3] == src1->ne[0]*src1->ne[1]*src1->ne[2]*sizeof(float) &&
+                      dst->nb[0] == sizeof(float) &&
+                      dst->nb[1] == dst->ne[0]*sizeof(float) &&
+                      dst->nb[2] == dst->ne[0]*dst->ne[1]*sizeof(float) &&
+                      dst->nb[3] == dst->ne[0]*dst->ne[1]*dst->ne[2]*sizeof(float);
 
         if (contig) {
             ggml_add_f32_hvx(n, dst_ptr, src0_ptr, src1_ptr);
@@ -271,8 +289,9 @@ static void ggml_compute_forward_add_f32(
 
                 int64_t off0 = s0_0*src0->nb[0] + s0_1*src0->nb[1] + s0_2*src0->nb[2] + s0_3*src0->nb[3];
                 int64_t off1 = s1_0*src1->nb[0] + s1_1*src1->nb[1] + s1_2*src1->nb[2] + s1_3*src1->nb[3];
+                int64_t offd = i0*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
 
-                dst_ptr[i] = src0_ptr[off0 >> 2] + src1_ptr[off1 >> 2];
+                dst_ptr[offd >> 2] = src0_ptr[off0 >> 2] + src1_ptr[off1 >> 2];
             }
         }
     }
@@ -297,7 +316,7 @@ static int ggmlop_dsp_add_singlethread(remote_handle64 h, const ggml_tensor * sr
 static int ggmlop_dsp_add_multithread(remote_handle64 h, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGMLHEXAGON_LOG_DEBUG("enter %s", __func__ );
 
-    const int64_t n = ggml_nelements(src0);
+    const int64_t n = ggml_nelements(dst);
     int num_threads = num_workers;
 
     if (src0->type == GGML_TYPE_F32) {
