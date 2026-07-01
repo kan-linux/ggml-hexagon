@@ -225,7 +225,12 @@ static inline dma_ptr dma_queue_pop(dma_queue * q) {
 
     // Wait for desc to complete
     if (!desc->done) {
+        unsigned int wait_cnt = 0;
         while (!desc->done) {
+            if ((++wait_cnt % 1000000) == 0) {
+                FARF(ALWAYS, "dma-queue: pop STUCK pop_idx=%u done=%d src=%p dst=%p (waited %u iterations)",
+                     q->pop_idx, desc->done, desc->src, desc->dst, wait_cnt);
+            }
             dmpoll();
         }
     }
