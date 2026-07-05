@@ -7459,10 +7459,25 @@ static __attribute__((always_inline)) HVX_Vector convert_qf32v_to_fltv(HVX_Vecto
  */
 void ggmlop_dsp_cache_flush_range(void * addr, size_t size) {
     if (!addr || size == 0) return;
+    // For large ranges, use bulk flush (matching QCOM hex_l2flush pattern).
+    // Bulk flush is more efficient than iterating every cache line when
+    // the range exceeds 128KB and is likely to cover most of the cache.
+    if (size > (128 * 1024)) {
+        qurt_mem_cache_clean((qurt_addr_t)0, 0, QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL, QURT_MEM_DCACHE);
+        return;
+    }
     char * p = (char *)addr;
     char * end = p + size;
     /* Align start down to cache line boundary */
     p = (char *)((uintptr_t)p & ~(DSP_CACHE_LINE_SIZE - 1));
+    // 4x unrolled: 4 cache lines per iteration (matching QCOM hex_l2flush)
+    for (; p + DSP_CACHE_LINE_SIZE * 4 <= end; p += DSP_CACHE_LINE_SIZE * 4) {
+        Q6_dccleaninva_A(p + DSP_CACHE_LINE_SIZE * 0);
+        Q6_dccleaninva_A(p + DSP_CACHE_LINE_SIZE * 1);
+        Q6_dccleaninva_A(p + DSP_CACHE_LINE_SIZE * 2);
+        Q6_dccleaninva_A(p + DSP_CACHE_LINE_SIZE * 3);
+    }
+    // tail: remaining lines
     for (; p < end; p += DSP_CACHE_LINE_SIZE) {
         Q6_dccleaninva_A(p);
     }
@@ -7483,9 +7498,22 @@ void ggmlop_dsp_cache_flush_range(void * addr, size_t size) {
  */
 void ggmlop_dsp_cache_inval_range(void * addr, size_t size) {
     if (!addr || size == 0) return;
+    // Note: we intentionally do NOT use bulk invalidate (qurt_mem_cache_clean)
+    // here because QURT_MEM_CACHE_FLUSH_INVALIDATE_ALL would write back dirty
+    // DSP cache lines from previous ops that reuse the same ION addresses,
+    // corrupting the fresh data AP just flushed via DC CVAC. Per-line
+    // Q6_dcinva_A (invalidate only) is the safe choice for ION src tensors.
     char * p = (char *)addr;
     char * end = p + size;
     p = (char *)((uintptr_t)p & ~(DSP_CACHE_LINE_SIZE - 1));
+    // 4x unrolled: 4 cache lines per iteration (matching QCOM hex_l2flush)
+    for (; p + DSP_CACHE_LINE_SIZE * 4 <= end; p += DSP_CACHE_LINE_SIZE * 4) {
+        Q6_dcinva_A(p + DSP_CACHE_LINE_SIZE * 0);
+        Q6_dcinva_A(p + DSP_CACHE_LINE_SIZE * 1);
+        Q6_dcinva_A(p + DSP_CACHE_LINE_SIZE * 2);
+        Q6_dcinva_A(p + DSP_CACHE_LINE_SIZE * 3);
+    }
+    // tail: remaining lines
     for (; p < end; p += DSP_CACHE_LINE_SIZE) {
         Q6_dcinva_A(p);
     }

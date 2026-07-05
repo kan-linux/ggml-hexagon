@@ -1524,6 +1524,38 @@ AEEResult ggmlop_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uin
 
     GGMLHEXAGON_LOG_INFO("ion-batch: start n_ops=%u n_tensors=%u", hdr->n_ops, hdr->n_tensors);
 
+    /* Track tensors that have already been cache-invalidated in this batch.
+     * Intermediate tensors (dst of one op consumed as src by another) are
+     * already in DSP L2 cache; re-invalidating them forces a DDR re-read.
+     * We track both initially-invalidated src tensors and DSP-written dst
+     * tensors to avoid redundant dcinva calls.
+     *
+     * QCOM's dspqueue framework handles this implicitly: intermediate
+     * buffers have no FLUSH_SENDER / INVALIDATE_RECIPIENT flags, so the
+     * framework skips cache maintenance for them. We replicate that here. */
+    #define MAX_TRACKED_DCINVA 256
+    const void * dcinva_tracked[MAX_TRACKED_DCINVA];
+    uint32_t dcinva_count = 0;
+
+    #define DCINVA_IS_TRACKED(addr)                                       \
+        ({                                                               \
+            bool _found = false;                                         \
+            for (uint32_t _i = 0; _i < dcinva_count; _i++) {            \
+                if (dcinva_tracked[_i] == (const void *)(addr)) {        \
+                    _found = true; break;                                \
+                }                                                        \
+            }                                                            \
+            _found;                                                      \
+        })
+
+    #define DCINVA_TRACK(addr)                                           \
+        do {                                                             \
+            if ((addr) && dcinva_count < MAX_TRACKED_DCINVA              \
+                && !DCINVA_IS_TRACKED(addr)) {                           \
+                dcinva_tracked[dcinva_count++] = (const void *)(addr);   \
+            }                                                            \
+        } while (0)
+
     for (uint32_t i = 0; i < hdr->n_ops; i++) {
         const hex_op_desc * op = &ops[i];
 
@@ -1623,15 +1655,26 @@ AEEResult ggmlop_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uin
 
         /* Cache maintenance for non-coherent ION memory:
          * - Invalidate DSP cache before reading src (AP wrote data into ION)
-         * - Always invalidate, even for weights: ION region reuse means the
-         *   same address may hold different data from a previous allocation
+         * - Skip invalidation for flags=2 tensors: persistent weights that
+         *   never change after the initial write.
+         * - Skip invalidation for already-tracked tensors: intermediate
+         *   tensors produced by a prior op in the same batch are already
+         *   in DSP L2 cache; re-invalidating forces a DDR re-read.
          * - Use dcinva (invalidate only), not dccleaninva: AP already flushed
-         *   fresh src to DRAM via DC CVAC, so dccleaninva would write back
-         *   stale DSP cache lines and clobber the fresh DRAM data. */
-        ggmlop_dsp_cache_inval_range(src0_dt.data, src0_dt.data_len);
-        if (src1_dt_ptr) ggmlop_dsp_cache_inval_range(src1_dt_buf.data, src1_dt_buf.data_len);
-        if (src2_dt_ptr) ggmlop_dsp_cache_inval_range(src2_dt_buf.data, src2_dt_buf.data_len);
-        if (src3_dt_ptr) ggmlop_dsp_cache_inval_range(src3_dt_buf.data, src3_dt_buf.data_len);
+         *   fresh src to DRAM via DC CVAC. */
+        #define DCINVA_IF_NEEDED(buf, has_ptr)                              \
+            do {                                                            \
+                if ((has_ptr) && (buf).flags != 2                           \
+                    && !DCINVA_IS_TRACKED((buf).data)) {                    \
+                    ggmlop_dsp_cache_inval_range((buf).data, (buf).data_len); \
+                    DCINVA_TRACK((buf).data);                               \
+                }                                                           \
+            } while (0)
+        DCINVA_IF_NEEDED(src0_dt, true);
+        DCINVA_IF_NEEDED(src1_dt_buf, src1_dt_ptr != NULL);
+        DCINVA_IF_NEEDED(src2_dt_buf, src2_dt_ptr != NULL);
+        DCINVA_IF_NEEDED(src3_dt_buf, src3_dt_ptr != NULL);
+        #undef DCINVA_IF_NEEDED
 
         if (1 == g_dump_diag_info) {
             /* DSP-side DIAG: dump first 4 f32 values from src0 data (AFTER dcinva).
@@ -1678,8 +1721,29 @@ AEEResult ggmlop_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uin
                 return AEE_EFAILED;
             }
 
-            GGMLHEXAGON_LOG_INFO("ion-batch: op %u done, flushing %zuB", i, dst_dt_buf[0].data_len);
-            ggmlop_dsp_cache_flush_range(dst_dt_buf[0].data, dst_dt_buf[0].data_len);
+            /* Cache maintenance for self-built kernel output.
+             *
+             * Two categories of self-built kernels:
+             * - HMX modes (algotype 30/32): HMX writes directly to DDR,
+             *   bypassing DSP L2 cache. We must dcinva the dst so that
+             *   subsequent ops fetch the HMX output from DDR rather than
+             *   reading stale L2 cache lines. dccleaninva must NOT be
+             *   used here: it would write stale L2 data back to DDR,
+             *   overwriting the HMX output.
+             * - HVX modes (algotype 31/33, non-mulmat ops): HVX writes
+             *   through L2 cache. The data stays valid in L2. No cache
+             *   operation is needed; just track the tensor so subsequent
+             *   ops skip dcinva on src (data is already in L2).
+             *
+             * Final output tensors are flushed to DRAM at batch end. */
+            if (op->opcode == GGML_OP_MUL_MAT &&
+                (g_mulmat_algotype == 30 || g_mulmat_algotype == 32)) {
+                /* HMX writes directly to DDR. Invalidate L2 so the next
+                 * op fetches the correct data from DDR. */
+                ggmlop_dsp_cache_inval_range(dst_dt_buf[0].data, dst_dt_buf[0].data_len);
+            }
+            DCINVA_TRACK(dst_dt_buf[0].data);
+
             continue;
         }
 
@@ -1793,13 +1857,19 @@ AEEResult ggmlop_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uin
             return AEE_EFAILED;
         }
 
-        GGMLHEXAGON_LOG_INFO("ion-batch: op %u done, flushing %zuB", i, dst_dt_buf[0].data_len);
-
-        /* Flush DSP cache after writing dst (so AP can read from DRAM).
-         * For multi-output ops (QKV/FFN fusion), flush all non-NULL dsts. */
+        /* QCOM execute_op uses HMX/DMA internally, which writes output
+         * directly to DDR, bypassing DSP L2 cache. We must dcinva the
+         * dst buffers to bring the data into L2 cache before tracking,
+         * otherwise subsequent ops that consume these tensors as src
+         * will skip dcinva (tracked) and read stale L2 cache lines.
+         *
+         * execute_op also does hex_l2flush (dccleaninva) on dst internally,
+         * so we don't need to flush here. Self-built kernels (algotype != 29)
+         * do their own dccleaninva + dcinva + DCINVA_TRACK above. */
         for (int k = 0; k < HTP_OP_MAX_OUTPUTS; k++) {
             if (dst_dt_ptrs[k]) {
-                ggmlop_dsp_cache_flush_range(dst_dt_buf[k].data, dst_dt_buf[k].data_len);
+                ggmlop_dsp_cache_inval_range(dst_dt_buf[k].data, dst_dt_buf[k].data_len);
+                DCINVA_TRACK(dst_dt_buf[k].data);
             }
         }
 
@@ -1816,6 +1886,41 @@ AEEResult ggmlop_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uin
     }
 
     GGMLHEXAGON_LOG_INFO("ion-batch: all %u ops done", hdr->n_ops);
+
+    /* Flush only final output tensors (not consumed by subsequent ops) to DRAM.
+     * Intermediate tensors stay in DSP L2 cache (tracked by dcinva_tracked).
+     * This avoids the conflict between dcinva tracking and cache invalidation:
+     * if we flush+invalidate a tracked tensor, subsequent ops skip dcinva but
+     * the cache line is already invalidated -> stale data from DDR.
+     *
+     * Determine final outputs: a tensor is final if it is a dst of some op
+     * but NOT a src of any subsequent op in the same batch. */
+    {
+        /* Mark tensors that are consumed as src by any op */
+        bool consumed_as_src[256] = {false};  // max 256 tensors per batch
+        for (uint32_t i = 0; i < hdr->n_ops; i++) {
+            const hex_op_desc * o = &ops[i];
+            for (int k = 0; k < 6; k++) {
+                if (o->src_idx[k] >= 0 && o->src_idx[k] < (int)hdr->n_tensors) {
+                    consumed_as_src[o->src_idx[k]] = true;
+                }
+            }
+        }
+        /* Flush dst tensors that are NOT consumed as src by any op */
+        for (uint32_t i = 0; i < hdr->n_ops; i++) {
+            const hex_op_desc * o = &ops[i];
+            for (int k = 0; k < HTP_OP_MAX_OUTPUTS; k++) {
+                if (o->dst_idx[k] >= 0 && o->dst_idx[k] < (int)hdr->n_tensors
+                    && !consumed_as_src[o->dst_idx[k]]) {
+                    const hex_tensor_desc * td = &tens[o->dst_idx[k]];
+                    void * data = (void *)(base + td->data_offset);
+                    if (data && td->data_len > 0) {
+                        ggmlop_dsp_cache_flush_range(data, td->data_len);
+                    }
+                }
+            }
+        }
+    }
 
     __asm__ __volatile__("" ::: "memory");
     if (hdr->n_ops > 0 && ops[hdr->n_ops - 1].dst_idx[0] < hdr->n_tensors) {
