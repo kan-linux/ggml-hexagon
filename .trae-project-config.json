@@ -7,6 +7,51 @@
     "scope_of_approval": "Approval is per-change. A prior approved change does not grant blanket permission for subsequent unrelated edits.",
     "applies_to": "All source files, scripts, configs, and documentation in the workspace."
   },
+  "commit_rules": {
+    "description": "Mandatory rules that MUST be followed before any git commit",
+    "pre_commit_testing": {
+      "description": "Before committing, MUST run inference tests on all 4 models with all 4 algotypes (29,30,32,33) to verify no regression",
+      "commands": [
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli gemma4 29",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli gemma4 30",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli gemma4 32",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli gemma4 33",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen3 29",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen3 30",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen3 32",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen3 33",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen1 29",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen1 30",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen1 32",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli qwen1 33",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli llama3 29",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli llama3 30",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli llama3 32",
+        "./scripts/build-run-ggmlhexagon-android.sh run_llamacli llama3 33"
+      ],
+      "validation_criteria": {
+        "pp_tg_valid": "PP and TG values must be valid numbers (not 'inf', 'nan', or empty). If PP/TG shows 'inf', the test is INVALID and MUST be re-run.",
+        "no_garbled_output": "Inference output must be readable text in the expected language. Garbled/random characters indicate a regression and MUST be fixed before commit.",
+        "all_models_pass": "All 4 models X 4 algotypes (16 tests) MUST pass both validation criteria. If any test fails, the commit MUST NOT proceed.",
+        "algotype_meanings": {
+          "29": "Qualcomm execute_op (delegates to ../htp/*.c)",
+          "30": "x4x2 repack (HVX quant kernels)",
+          "32": "HMX pipeline (DMA + HVX + HMX 3-stage pipeline)",
+          "33": "HVX + VTCM + multithread"
+        }
+      }
+    },
+    "commit_message_rules": {
+      "description": "Format rules for commit messages",
+      "format": "ggml-hexagon: <brief description>",
+      "no_ai_generated": "The agent MUST NOT write commit messages. The user writes the commit message."
+    },
+    "commit_actions": {
+      "agent_allowed": ["git status", "git diff", "git log"],
+      "agent_forbidden": ["git add", "git checkout", "git commit", "git push", "gh pr create"],
+      "reason": "Commits and pushes must be explicitly performed by the user. Automated PR submissions may result in contributor ban."
+    }
+  },
   "scripts": {
     "build": "./scripts/build-run-android.sh build",
     "run_testops": "./scripts/build-run-android.sh run_testops",
