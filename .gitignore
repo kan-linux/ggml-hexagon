@@ -170,3 +170,6 @@ refs/
 .ccache_qcom/
 tags
 *.bk
+.ccache_cpu/
+docs/backend/jz-ggml-hexagon/
+*.txt
