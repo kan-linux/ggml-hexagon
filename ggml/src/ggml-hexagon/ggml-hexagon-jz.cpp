@@ -4582,6 +4582,9 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     }
 
     // Mark weights dirty so Phase 6.5 flushes them on the next batch.
+    // For repack-buft weights, flush immediately after repack; this moves the
+    // cold-state cache-clean cost from the first inference batch to model-load
+    // time and lets Phase 6.5 skip already-coherent repack weights.
     ggml_backend_hexagon_buffer_context * bctx =
         (ggml_backend_hexagon_buffer_context *)buffer->context;
     if (bctx && bctx->is_ion_buffer && bctx->backend_ctx) {
@@ -4589,7 +4592,13 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         const char * dp   = (const char *)tensor->data + offset;
         const char * base = (const char *)hctx->rpc_mempool;
         if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
-            hctx->weights_dirty = true;
+            if (is_repack) {
+                cpu_dcache_flush_range(hctx, hctx->rpc_mempool_handle,
+                                       tensor->data, ggml_nbytes(tensor));
+                hctx->weights_dirty = false;
+            } else {
+                hctx->weights_dirty = true;
+            }
         }
     }
 }

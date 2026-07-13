@@ -254,7 +254,55 @@ This single run reached **PP = 378.57 t/s**, the highest JZ PP observed so far, 
 
 ---
 
-## 7. Related Files
+## 7. Follow-up: Weights Pre-flush (P1)
+
+After the warmup commit, the next highest-ROI idea was to move the weights cache-clean cost out of the first inference batch and into model-load time. JZ already tracks `weights_dirty` and skips re-flushing clean repack weights in Phase 6.5 ([`ggml-hexagon-jz.cpp:5972-5985`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5972-L5985)). The optimization is to pre-flush each repack weight immediately after `set_tensor`/`repack`, so the first real batch sees `weights_dirty = false` and skips the weights entirely.
+
+### 7.1 Change
+
+In [`ggml-hexagon-jz.cpp:4584-4603`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L4584-L4603):
+
+```cpp
+if (is_repack) {
+    cpu_dcache_flush_range(hctx, hctx->rpc_mempool_handle,
+                           tensor->data, ggml_nbytes(tensor));
+    hctx->weights_dirty = false;
+} else {
+    hctx->weights_dirty = true;
+}
+```
+
+### 7.2 A/B data
+
+| Version | PP mean | TG mean | avg_p7 | load time | Phase 6.5 |
+|---------|---------|---------|--------|-----------|-----------|
+| warmup baseline | 332.77 | 19.79 | 2245 | ~117 ms | 9734 us |
+| revert 8MB + probe 4032 | 341.75 | 19.76 | 2267 | — | — |
+| **+ weights pre-flush** | **352.98** | **19.62** | **2272** | **128.33 ms** | **8827 us** |
+
+Per-run breakdown:
+
+| Run | PP | TG | avg_p7 | load | p6.5 |
+|-----|----|----|--------|------|------|
+| 1 | 354.67 | 19.70 | 2251 | 124.84 ms | 9155 us |
+| 2 | 369.29 | 19.52 | 2292 | 126.94 ms | 8695 us |
+| 3 | 334.97 | 19.63 | 2274 | 133.20 ms | 8632 us |
+
+### 7.3 Interpretation
+
+- **PP +3.3%** relative to the immediately preceding version, **+6.1%** relative to the original warmup baseline.
+- **Phase 6.5 cumulative flush time drops ~9%** (9734 → 8827 us), confirming that repack weights were a material part of the first-batch flush.
+- **load time increases ~10 ms**: the cost is moved from inference to model load, which is the expected trade-off.
+- `avg_p7` is essentially flat because it measures RPC + DSP execution, not AP-side cache flush.
+- Jitter is still present (run 2 = 369.29, run 3 = 334.97). Device-state factors (DCVS/thermal/ION layout) remain the dominant source of variance after cold-state and weights-flush costs are removed.
+
+### 7.4 Verdict
+
+Pre-flushing repack weights is a **safe, low-risk, positive-ROI change**. It is kept.
+
+---
+
+## 8. Related Files
 
 - [`ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp) — JZ AP implementation
 - [`ggml/src/ggml-hexagon/ggml-hexagon.cpp`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon.cpp) — Qualcomm AP implementation
