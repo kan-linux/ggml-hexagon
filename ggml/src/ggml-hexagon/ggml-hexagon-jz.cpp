@@ -1686,15 +1686,22 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
 
     if (nullptr == ctx)
         return 2;
+    /* Probe ION capacity with 32/64 MiB-aligned slots.
+     * A smoother gradient avoids the big 3072 -> 3972 MiB jump and gives
+     * the allocator more chances to find a large contiguous block near the
+     * 4 GiB boundary on modern devices. */
     probe_slots.push_back(1024);
     probe_slots.push_back(1536);
-    probe_slots.push_back(2000);
     probe_slots.push_back(2048);
-    probe_slots.push_back(1024+2048);
+    probe_slots.push_back(2560);
+    probe_slots.push_back(3072);
+    probe_slots.push_back(3584);
+    probe_slots.push_back(3840);
+    probe_slots.push_back(3968);
     if (htp_arch > 75) {
-        probe_slots.push_back(1024+2048+900);
+        probe_slots.push_back(4032);
     } else {
-        probe_slots.push_back(1024+2048+200);
+        probe_slots.push_back(3272);
     }
 
     size_t probe_counts     = probe_slots.size();
@@ -2087,6 +2094,16 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
                 GGMLHEXAGON_LOG_ALWAYS("[AP-CACHE-MODE] dsp_cache_mode=0x%x + dsp_cache_trace_bit0=%d + dsp_cache_trace_bit1=%d pushed to DSP (payload=0x%x)",
                                        mode_bits, g_hexagon_appcfg.dsp_cache_trace_bit0,
                                        g_hexagon_appcfg.dsp_cache_trace_bit1, payload);
+            }
+
+            /* Warmup FastRPC/ION path once before first real inference.
+             * This triggers delayed ION mapping and touches the DSP entry path
+             * so the first real batch does not pay cold-state penalty. */
+            int warmup_err = ggml_dsp_execute_batch(ctx->ggmlop_handle, 0, 0xFFFB);
+            if (AEE_SUCCESS != warmup_err) {
+                GGMLHEXAGON_LOG_WARN("warmup execute_batch failed: 0x%x", warmup_err);
+            } else {
+                GGMLHEXAGON_LOG_ALWAYS("[AP-WARMUP] FastRPC/ION warmup done");
             }
         }
     } else {

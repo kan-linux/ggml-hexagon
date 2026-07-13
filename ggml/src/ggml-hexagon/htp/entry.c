@@ -1763,6 +1763,14 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         return AEE_SUCCESS;
     }
 
+    /* Warmup mode: batch_size == 0xFFFB.
+     * AP calls this once after session init to warm up the FastRPC/ION path
+     * without doing any real compute. Just logs and returns. */
+    if (batch_size == 0xFFFB) {
+        GGMLHEXAGON_LOG_INFO("[DSP-WARMUP] no-op warmup done");
+        return AEE_SUCCESS;
+    }
+
     /* Normal batch execution */
     /* Invalidate DSP cache for the batch descriptor before reading.
      * ION is non-coherent: AP reuses the mempool and writes a new batch
