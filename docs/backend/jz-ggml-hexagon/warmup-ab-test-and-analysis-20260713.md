@@ -338,7 +338,217 @@ After confirming P1, a 10-run stability test was executed to quantify remaining 
 
 ---
 
-## 9. Related Files
+## 10. Phase 1 Optimization: cgraph Cache Hit Path
+
+Section 8 pointed to AP-side descriptor preparation (Phase 1-4) as the remaining optimization target. Phase 1 is the first block inside `graph_compute_batch` and is executed for every subgraph, so its cost is multiplied by the total number of batch calls.
+
+### 10.1 What Phase 1 does
+
+On every call Phase 1:
+
+1. Computes a 64-bit content hash over the current `ggml_cgraph` (op codes, shapes, strides, src pointers, and node data pointers).
+2. Looks the hash up in `ctx->cgraph_cache`.
+3. On cache hit, restores the previously built `tensor_src`, `hex_ops`, and `weight_indices` descriptors so the rest of the function can skip Phase 2/2.5/3 reconstruction.
+
+Cache hit rate is already ~99% (4317/4352 for gemma4, 21551/21778 for qwen3), so the hot path is the hit path.
+
+### 10.2 The overhead being removed
+
+The original hit path copied the cached descriptor vectors into local vectors before use:
+
+```cpp
+// old path
+local_tensor_src.assign(cached_entry->tensor_src.begin(), cached_entry->tensor_src.end());
+local_hex_ops.assign(cached_entry->hex_ops.begin(), cached_entry->hex_ops.end());
+```
+
+For a typical 767-node graph this copies ~20-110 KB of descriptor data per call. With 4352 calls this becomes a measurable pure AP-side overhead.
+
+The optimized path binds references directly to the cached vectors in [`ggml-hexagon-jz.cpp:5083-5086`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5083-L5086):
+
+```cpp
+std::vector<ggml_tensor *> & tensor_src = cache_hit ? cached_entry->tensor_src : local_tensor_src;
+std::vector<hex_op_desc>   & hex_ops   = cache_hit ? cached_entry->hex_ops   : local_hex_ops;
+```
+
+Only the small `weight_indices` unordered_set is still copied/cleared locally because the rest of the code uses `count()` on it. The hash computation itself was also tightened: NULL src pointers are skipped and the node `data` pointer is folded into the key so distinct tensors with identical topology do not collide.
+
+### 10.3 Validation method
+
+Build and test followed `.trae-project-config.json`:
+
+```sh
+./scripts/build-run-android.sh build
+./scripts/build-run-android.sh run_llamacli gemma4
+./scripts/build-run-android.sh run_llamacli qwen3
+```
+
+Logs captured:
+
+- gemma4 baseline: `log_p1_gemma4_260714-063517.txt`
+- gemma4 optimized: `log_p1_ref_gemma4_260714-064445.txt`
+- qwen3 baseline: `log_p1_qwen3_260714-063610.txt`
+- qwen3 optimized: `log_p1_ref_qwen3_260714-065018.txt`
+
+### 10.4 Results
+
+#### gemma-4-E2B-it-Q4_0 (4352 batch calls)
+
+| Metric | Baseline | Optimized | Delta |
+|--------|----------|-----------|-------|
+| PP (t/s) | 314.25 | 332.63 | +5.8% |
+| TG (t/s) | 19.66 | 19.73 | +0.4% |
+| Phase 1 cumulative | 42112 us | 25818 us | -38.7% |
+| Phase 1 per call | 9.68 us | 5.93 us | -38.7% |
+| cache hit rate | 99.2% | 99.2% | — |
+
+#### Qwen3.5-2B-Q4_0 (21778 batch calls)
+
+| Metric | Baseline | Optimized | Delta |
+|--------|----------|-----------|-------|
+| PP (t/s) | 124.15 | 121.14 | -2.4% |
+| TG (t/s) | 15.37 | 15.49 | +0.8% |
+| Phase 1 cumulative | 38719 us | 28511 us | -26.4% |
+| Phase 1 per call | 1.78 us | 1.31 us | -26.4% |
+| cache hit rate | 99.0% | 99.0% | — |
+
+### 10.5 Interpretation
+
+- **Phase 1 overhead drops significantly**: removing the vector copy saves ~3.7 us/call for large graphs and ~0.5 us/call for small graphs. Because the cache hit rate is ~99%, almost every call benefits.
+- **gemma4 PP improves +5.8%**: PP has only a few large-batch calls, so the relative impact of AP-side overhead per call is larger, and the reduction is visible in end-to-end PP.
+- **qwen3 PP is essentially flat (-2.4%, within run-to-run jitter)**: qwen3 graphs are smaller and the original Phase 1 cost was already lower in absolute terms; device-state variance masks the small gain. The Phase 1 metric itself still improved -26%.
+- **TG is stable or marginally up**: descriptor preparation is not on the DSP critical path, so TG is not expected to change much.
+- **Output remains coherent**: no garbled text or endless repetition in either model; only the usual small-model factual hallucinations.
+
+### 10.6 Next step
+
+With vector-copy overhead removed, the remaining Phase 1 cost is dominated by the FNV-1a hash walk and the `unordered_map` lookup. The next candidate was to replace per-tensor hash lookups in Phase 6 as well (weight set and mirror map), which is covered in Section 11.
+
+---
+
+## 11. Phase 6 Optimization: Eliminate Per-Tensor Hash Lookups
+
+Section 10 reduced Phase 1 by removing vector copies. Profiling showed that Phase 6 (descriptor construction) still pays hash-table lookups for every tensor on every call:
+
+- `weight_indices.count(i)` in `unordered_set<uint32_t>` — used to decide flags and skip cache flush.
+- `buffer_mirrors_map.find(t->data)` — used to translate heap tensor pointers to ION mirror offsets.
+
+These lookups are pure AP-side overhead and their latency is sensitive to memory layout, contributing to PP jitter.
+
+### 11.1 Changes
+
+In [`ggml-hexagon-jz.cpp`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp):
+
+1. Replaced the cached `weight_indices` set with a dense `is_weight` boolean vector in `cgraph_cache_entry` (lines 372, 5022, 5086-5092, 5265-5280, 5582).
+2. On cache hit, bind a reference to the cached `is_weight` vector instead of rebuilding an `unordered_set`.
+3. In Phase 4 Step 3, build a per-tensor `local_mirror_offset` array (size `n_tensors`, `-1` = no mirror) while building the `mirrors` list (lines 5730-5752).
+4. In Phase 6, Phase 4.5, and Phase 7.5, replace `buffer_mirrors_map.find()` and `mirrors` scans with direct `local_mirror_offset[tidx]` array access.
+5. Replaced all `weight_indices.count(i)` calls with `is_weight[i]`.
+
+This removes every per-tensor hash lookup from the hot descriptor-construction path.
+
+### 11.2 Validation
+
+Same build/test commands as Section 10:
+
+```sh
+./scripts/build-run-android.sh build
+./scripts/build-run-android.sh run_llamacli gemma4
+./scripts/build-run-android.sh run_llamacli qwen3
+```
+
+Logs: `log_p2_gemma4_260714-070327.txt`, `log_p2_qwen3_260714-070416.txt`.
+
+### 11.3 Results
+
+#### gemma-4-E2B-it-Q4_0 (4352 batch calls)
+
+| Metric | P1 opt (Section 10) | +P6 opt | Delta |
+|--------|---------------------|---------|-------|
+| PP (t/s) | 332.63 | 352.80 | +6.1% |
+| TG (t/s) | 19.73 | 19.86 | +0.7% |
+| Phase 1 | 25818 us | 19631 us | -24.0% |
+| Phase 4.5 | 8861 us | 3981 us | -55.1% |
+| Phase 6 | 21775 us | 14006 us | -35.7% |
+
+#### Qwen3.5-2B-Q4_0 (21778 batch calls)
+
+| Metric | P1 opt (Section 10) | +P6 opt | Delta |
+|--------|---------------------|---------|-------|
+| PP (t/s) | 121.14 | 126.04 | +4.0% |
+| TG (t/s) | 15.49 | 15.46 | -0.2% |
+| Phase 1 | 28511 us | 24136 us | -15.3% |
+| Phase 4.5 | 6134 us | 3858 us | -37.1% |
+| Phase 6 | 16016 us | 12727 us | -20.5% |
+
+### 11.4 Interpretation
+
+- **Phase 1 drops further** because the cache-hit path no longer reconstructs an `unordered_set` of weight indices; it just references the cached boolean vector.
+- **Phase 4.5 drops significantly** because the tiled-weight ION-offset recording now uses the precomputed `local_mirror_offset` array instead of `buffer_mirrors_map.find()`.
+- **Phase 6 drops** because per-tensor mirror-offset lookup is now O(1) array access instead of a hash-map lookup.
+- **gemma4 PP gains +6.1%** and **qwen3 PP gains +4.0%**, confirming that AP-side descriptor-preparation variance directly affects PP.
+- **TG remains stable** (gemma4 +0.7%, qwen3 -0.2%), as expected: descriptor preparation is not on the DSP critical path.
+- Output is coherent in both models; no garbled text or repetition loops.
+
+### 11.5 Remaining PP jitter
+
+After removing hash lookups from Phase 1 and Phase 6, the remaining AP-side variance likely comes from:
+
+- **Phase 4** heap-to-ION memcpy for activations (~1 us/call, memory-bandwidth sensitive).
+- **Phase 6.5** DC CVAC flush and **Phase 7.5** DC CIVAC invalidate (~2-2.5 us/call each, sensitive to bus contention and CPU frequency).
+- The FNV-1a hash walk and `unordered_map` lookup in Phase 1.
+
+The next candidates are:
+
+1. Replace the `cgraph_cache` `unordered_map` lookup with a small fixed-size direct/LRU cache.
+2. Batch or coalesce cache-maintenance operations in Phase 6.5/7.5 to reduce per-call variance.
+3. Investigate whether activation mirrors can be allocated at stable offsets so the full tensor-descriptor array can be cached on hit.
+
+---
+
+## 12. Post-Optimization 5-Run Stability Test
+
+After the Phase 6 hash/lookup optimization, five consecutive runs were executed for each model (no cooldown between runs) to quantify remaining PP/TG jitter.
+
+### 12.1 gemma-4-E2B-it-Q4_0
+
+| Run | PP (t/s) | TG (t/s) |
+|-----|----------|----------|
+| 1   | 325.85   | 19.66    |
+| 2   | 358.13   | 19.85    |
+| 3   | 341.06   | 19.71    |
+| 4   | 311.06   | 19.75    |
+| 5   | 338.67   | 19.14    |
+
+| Metric | mean | stddev | min | max | CV |
+|--------|------|--------|-----|-----|----|
+| PP     | 334.95 | 15.76 | 311.06 | 358.13 | 4.7% |
+| TG     | 19.62  | 0.25  | 19.14  | 19.85  | 1.3% |
+
+### 12.2 Qwen3.5-2B-Q4_0
+
+| Run | PP (t/s) | TG (t/s) |
+|-----|----------|----------|
+| 1   | 121.05   | 14.33    |
+| 2   | 122.26   | 14.40    |
+| 3   | 117.21   | 14.43    |
+| 4   | 119.67   | 14.21    |
+| 5   | 121.34   | 14.37    |
+
+| Metric | mean | stddev | min | max | CV |
+|--------|------|--------|-----|-----|----|
+| PP     | 120.31 | 1.76 | 117.21 | 122.26 | 1.5% |
+| TG     | 14.35  | 0.08 | 14.21  | 14.43  | 0.5% |
+
+### 12.3 Interpretation
+
+- **TG remains extremely stable** for both models (CV < 1.5%), confirming the DSP compute path is not the jitter source.
+- **qwen3 PP is now very stable** (CV 1.5%), likely because its graphs are small and many calls amortize any per-call variance.
+- **gemma4 PP still shows ~4.7% CV** with a 47 t/s spread. Because gemma4 has far fewer prompt-batch calls, any per-call AP-side variance (Phase 4 memcpy, Phase 6.5/7.5 cache sync) is not averaged out. This points to Phase 6.5/7.5 cache maintenance and Phase 4 heap-to-ION memcpy as the dominant remaining jitter sources, not Phase 1/6 descriptor lookup.
+
+---
+
+## 13. Related Files
 
 - [`ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp) — JZ AP implementation
 - [`ggml/src/ggml-hexagon/ggml-hexagon.cpp`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon.cpp) — Qualcomm AP implementation

@@ -2008,7 +2008,11 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         for (int k = 0; k < HTP_OP_MAX_OUTPUTS; k++) {
             if (!dst_dt_ptrs[k]) continue;
             if (g_dsp_ctx->dsp_cache_mode & 0x4) {
-                prior_dst_add(dst_dt_buf[k].data, dst_dt_buf[k].data_len);
+                /* prior_dst ranges are only consumed by bit 1; avoid dead
+                 * work when bit 2 is enabled without bit 1. */
+                if (g_dsp_ctx->dsp_cache_mode & 0x2) {
+                    prior_dst_add(dst_dt_buf[k].data, dst_dt_buf[k].data_len);
+                }
                 bulk_flush_add(dst_dt_buf[k].data, dst_dt_buf[k].data_len);
             } else {
                 ggml_dsp_cache_flush_range(dst_dt_buf[k].data, dst_dt_buf[k].data_len);
