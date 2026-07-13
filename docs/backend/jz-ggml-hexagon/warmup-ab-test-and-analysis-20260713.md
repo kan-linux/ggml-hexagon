@@ -302,7 +302,43 @@ Pre-flushing repack weights is a **safe, low-risk, positive-ROI change**. It is 
 
 ---
 
-## 8. Related Files
+## 8. 10-Run Stability Test
+
+After confirming P1, a 10-run stability test was executed to quantify remaining PP/TG jitter and identify whether thermal decay was a factor. The device was a Snapdragon 8 Elite with the current optimized build (warmup + probe 4032 + weights pre-flush + `dcvs_option` retained).
+
+### 8.1 Raw data
+
+| Run | PP (t/s) | TG (t/s) | avg_p7 (us) | load (ms) | batch calls | TG runs | Notes |
+|-----|----------|----------|-------------|-----------|-------------|---------|-------|
+| 1   | 319.37   | 19.67    | 2291        | 139.62    | 4352        | 255     | complete |
+| 2   | 330.53   | inf      | 4049        | 135.53    | 17          | 1       | early-stop |
+| 3   | 344.41   | 19.67    | 2267        | 129.34    | 4352        | 255     | complete |
+| 4   | 370.05   | inf      | 3853        | 119.73    | 17          | 1       | early-stop |
+| 5   | 324.28   | 19.79    | 2249        | 137.65    | 4352        | 255     | complete |
+| 6   | 334.11   | 19.49    | 2277        | 132.54    | 4352        | 255     | complete |
+| 7   | 328.44   | 19.59    | 2268        | 134.87    | 4352        | 255     | complete |
+| 8   | 327.07   | 19.45    | 2298        | 135.24    | 4352        | 255     | complete |
+| 9   | 336.42   | 19.66    | 2262        | 131.80    | 4352        | 255     | complete |
+| 10  | 338.66   | 19.42    | 2303        | 130.71    | 4182        | 245     | complete |
+
+### 8.2 Statistics (8 complete runs only)
+
+| Metric | min | max | mean | range |
+|--------|-----|-----|------|-------|
+| PP     | 319.37 | 344.41 | **331.60** | **25.04** |
+| TG     | 19.42  | 19.79  | **19.59**  | **0.37**  |
+| avg_p7 | 2249   | 2303   | **2276**   | **54**    |
+
+### 8.3 Interpretation
+
+- **TG is extremely stable**: range only 0.37 t/s and avg_p7 range only ~2.4%. This indicates the HMX/HVX compute path, FastRPC channel, and DSP execution are consistent once the model is running.
+- **PP jitter is ~7.5% CV**: the 25 t/s range is real and does not show thermal decay (runs do not monotonically decrease: 319 → 344 → 324 → 336).
+- **Jitter source is therefore not thermal**. Likely contributors are per-session ION physical layout variance, initial DCVS corner selection, and AP-side descriptor preparation time.
+- **AP-side preparation matters**: Run 3 PP=344.41 with avg_p7=2267 vs Run 10 PP=338.66 with avg_p7=2303 shows PP can vary even when DSP execution time is similar. This points to Phase 1–4 of `graph_compute_batch` as the remaining optimization target.
+
+---
+
+## 9. Related Files
 
 - [`ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp) — JZ AP implementation
 - [`ggml/src/ggml-hexagon/ggml-hexagon.cpp`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon.cpp) — Qualcomm AP implementation

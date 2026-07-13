@@ -254,6 +254,7 @@ struct ggml_backend_hexagon_context {
     int64_t  cum_p65_us;      // Phase 6.5: cache flush
     int64_t  cum_p75_us;      // Phase 7.5: cache inval
     int64_t  cum_p8_us;       // Phase 8: ION->heap copy-back
+    int64_t  cum_unaccounted_us; // wall-clock not covered by p1..p8 (gaps, scheduler, etc.)
 
     // Per-call fine-grained profiling (ring buffer, capacity 1024).
     // Captures per-call durations so dump_perf_stats can compute
@@ -273,6 +274,7 @@ struct ggml_backend_hexagon_context {
     int64_t  p7_hist[PERF_HIST_CAP];   // Phase 7: FastRPC + DSP exec + cache inval (cumulative; see 3-way split below)
     int64_t  p75_hist[PERF_HIST_CAP];  // Phase 7.5: cache inval
     int64_t  p8_hist[PERF_HIST_CAP];   // Phase 8: ION->heap copy-back
+    int64_t  unaccounted_hist[PERF_HIST_CAP]; // wall-clock not covered by p1..p8
     int64_t  graph_us_hist[PERF_HIST_CAP];   // total wall-clock per graph_compute_batch call
     int32_t  n_nodes_hist[PERF_HIST_CAP];    // cgraph->n_nodes at entry
     int32_t  n_ops_hist[PERF_HIST_CAP];      // offloaded DSP ops at FastRPC dispatch
@@ -289,6 +291,7 @@ struct ggml_backend_hexagon_context {
     uint32_t diag_first_n_tensors[DIAG_FIRST_N];
     int64_t  diag_first_graph_us [DIAG_FIRST_N];
     int64_t  diag_first_gap_us   [DIAG_FIRST_N];
+    int64_t  diag_first_unaccounted_us[DIAG_FIRST_N];
     // Also a once-per-session LARGE-BATCH op distribution dump (n_ops > 500),
     // to identify whether a huge sub-graph is 1 mega-op or many small layers.
     // -----------------------------------------------------------------------
@@ -654,22 +657,24 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
                           ? ctx->diag_n_calls : (uint32_t)ctx->DIAG_FIRST_N;
         // Each entry up to ~50 bytes ([31]nnnnn/nnnnn/nnnnnnn/nnnnnnn = ~40), so 4 KiB fits 64+ entries.
         char line[4096]; int off = 0;
-        off += snprintf(line+off, sizeof(line)-off, "first-%u graphs (n_nodes/n_tensors/graph_us/gap_us):",
+        off += snprintf(line+off, sizeof(line)-off, "first-%u graphs (n_nodes/n_tensors/graph_us/gap_us/unaccounted_us):",
                         dump_n);
         for (uint32_t i = 0; i < dump_n; i++) {
-            off += snprintf(line+off, sizeof(line)-off, " [%u]%u/%u/%lld/%lld",
+            off += snprintf(line+off, sizeof(line)-off, " [%u]%u/%u/%lld/%lld/%lld",
                             i, ctx->diag_first_n_nodes[i], ctx->diag_first_n_tensors[i],
-                            (long long)ctx->diag_first_graph_us[i], (long long)ctx->diag_first_gap_us[i]);
+                            (long long)ctx->diag_first_graph_us[i], (long long)ctx->diag_first_gap_us[i],
+                            (long long)ctx->diag_first_unaccounted_us[i]);
         }
         GGMLHEXAGON_LOG_ALWAYS("%s", line);
     }
-    GGMLHEXAGON_LOG_VERBOSE("AP phase cumulative: p1=%lld p2=%lld p2.5=%lld p3=%lld p4=%lld p4.5=%lld p5=%lld p6=%lld p6.5=%lld p7.5=%lld p8=%lld us",
+    GGMLHEXAGON_LOG_VERBOSE("AP phase cumulative: p1=%lld p2=%lld p2.5=%lld p3=%lld p4=%lld p4.5=%lld p5=%lld p6=%lld p6.5=%lld p7.5=%lld p8=%lld unaccounted=%lld us",
                              (long long)ctx->cum_p1_us, (long long)ctx->cum_p2_us,
                              (long long)ctx->cum_p25_us, (long long)ctx->cum_p3_us,
                              (long long)ctx->cum_p4_us, (long long)ctx->cum_p45_us,
                              (long long)ctx->cum_p5_us,
                              (long long)ctx->cum_p6_us, (long long)ctx->cum_p65_us,
-                             (long long)ctx->cum_p75_us, (long long)ctx->cum_p8_us);
+                             (long long)ctx->cum_p75_us, (long long)ctx->cum_p8_us,
+                             (long long)ctx->cum_unaccounted_us);
     // Fine-grained: 3-way p7 split + per-call distribution
     GGMLHEXAGON_LOG_VERBOSE("p7 3-way cumulative: rpc_setup=%lld dsp_exec=%lld civac=%lld us (sum=%lld)",
                              (long long)ctx->cum_p7_rpc_setup_us,
@@ -766,6 +771,7 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
         DUMP_PHASE_HIST("p7",   ctx->p7_hist,   false);
         DUMP_PHASE_HIST("p7.5", ctx->p75_hist,  false);
         DUMP_PHASE_HIST("p8",   ctx->p8_hist,   false);
+        DUMP_PHASE_HIST("unaccounted", ctx->unaccounted_hist, false);
         DUMP_PHASE_HIST("p7rpc", ctx->p7_rpc_setup_hist, true);
         DUMP_PHASE_HIST("p7dsp", ctx->p7_dsp_exec_hist, true);
         DUMP_PHASE_HIST("p7civ", ctx->p7_civac_hist, true);
@@ -3285,6 +3291,7 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
       cum_p65_us(0),
       cum_p75_us(0),
       cum_p8_us(0),
+      cum_unaccounted_us(0),
       perf_hist_count(0),
       diag_n_calls(0),
       perf_hist_idx(0),
@@ -4945,6 +4952,15 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     int64_t begin_time = ggml_time_us();
     int64_t gap_from_prev = ctx->last_graph_end_us ? (begin_time - ctx->last_graph_end_us) : 0;
 
+    // Snapshot cumulative phase counters at entry so we can compute the
+    // current call's accounted time at exit (used for unaccounted-time).
+    int64_t snap_p1  = ctx->cum_p1_us;
+    int64_t snap_p2  = ctx->cum_p2_us;
+    int64_t snap_p25 = ctx->cum_p25_us;
+    int64_t snap_p3  = ctx->cum_p3_us;
+    int64_t snap_p5  = ctx->cum_p5_us;
+    int64_t snap_p7  = ctx->cumulative_p7_us;
+
     // track per-graph node statistics (what ggml core assigned to this backend)
     uint32_t graph_n_nodes = (uint32_t)cgraph->n_nodes;
     ctx->total_nodes_processed += graph_n_nodes;
@@ -6362,6 +6378,27 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     int64_t graph_dur = end_time - begin_time;
     // (cumulative_p7_us is already updated at the end of the Phase 7 invoke()
     //  block; do not add t_p7 a second time here.)
+
+    // Compute wall-clock time not covered by the explicit phase timers.
+    // Use entry snapshots so the subtraction yields this call's contribution only.
+    {
+        int64_t accounted_this_call = (ctx->cum_p1_us  - snap_p1)
+                                    + (ctx->cum_p2_us  - snap_p2)
+                                    + (ctx->cum_p25_us - snap_p25)
+                                    + (ctx->cum_p3_us  - snap_p3)
+                                    + (ctx->cum_p5_us  - snap_p5)
+                                    + (ctx->cumulative_p7_us - snap_p7)
+                                    + t_p4 + t_p45 + t_p6 + t_p65 + t_p75 + t_p8;
+        int64_t unaccounted = graph_dur - accounted_this_call;
+        if (unaccounted < 0) unaccounted = 0;  // guard against measurement noise
+        ctx->cum_unaccounted_us += unaccounted;
+        PERF_RECORD(unaccounted, ctx->unaccounted_hist);
+        uint32_t my_id = ctx->diag_n_calls - 1;
+        if (my_id < ctx->DIAG_FIRST_N) {
+            ctx->diag_first_unaccounted_us[my_id] = unaccounted;
+        }
+    }
+
     ctx->cumulative_graph_us += graph_dur;
     ctx->last_graph_end_us   = end_time;
     // TEMP DIAG: record graph_dur for the first N calls
