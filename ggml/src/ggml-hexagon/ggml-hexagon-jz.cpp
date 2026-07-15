@@ -190,15 +190,32 @@ struct qcom_socinfo {
     char soc_desc[GGML_MAX_NAME];
 };
 
+// ION pool zoning roles. When ion_zoning is enabled, allocations are grouped
+// by lifetime/cache-policy role instead of mixed in one flat offset space.
+enum ion_zone_role {
+    ION_ZONE_NONE = 0,      // legacy flat-pool allocations
+    ION_ZONE_WEIGHT,        // read-only weights (repack buffer type), session lifetime
+    ION_ZONE_ACTIVATION,    // read-write activations/intermediates (main buffer type)
+    ION_ZONE_MIRROR,        // per-batch heap -> ION mirrors
+    ION_ZONE_BATCH_DESC,    // per-batch op/tensor descriptor blob
+    ION_ZONE_SCRATCH,       // probe/diagnostic scratch at pool base
+    ION_ZONE_MAX
+};
+
 // ION pool region tracking for free-space management.
 // Each region records an allocated area within the ION pool.
 // When free_buffer is called, the region is marked as not-in-use.
-// Free regions can be reused by best-fit allocation.
+// Free regions can be reused by best-fit allocation within the same role.
 struct ion_pool_region {
     size_t offset;      // byte offset from ION pool base
     size_t size;        // allocation size in bytes
     bool   in_use;      // true if currently allocated
+    uint8_t role;       // ion_zone_role, used for zone-aware cache maintenance
+    bool   dirty;       // AP has written to this region since last Phase 6.5 flush
 };
+
+// Forward declaration for dirty-region tracking used by set_tensor/memset_tensor.
+static void ggmlhexagon_mark_ion_region_dirty(ggml_backend_hexagon_context * ctx, size_t offset);
 
 struct ggml_backend_hexagon_context {
     int device;
@@ -219,6 +236,10 @@ struct ggml_backend_hexagon_context {
     int rpc_mempool_handle;
     void * rpc_mempool_dsp_base;        // DSP-side VA from fastrpc_mmap() (NOT from FastRPC pointer translation)
     std::vector<ion_pool_region> ion_regions;  // region tracking for ION pool free-space management
+    bool   ion_zoning_enabled;          // true if role-based zoning is active
+    size_t zone_base[ION_ZONE_MAX];     // base offset of each zone
+    size_t zone_limit[ION_ZONE_MAX];    // exclusive end offset of each zone
+    size_t zone_usage[ION_ZONE_MAX];    // current bump pointer within each zone
     remote_handle64 ggmlop_handle;
     int domain_id;
     int session_id;
@@ -409,6 +430,11 @@ struct hexagon_appcfg_t {
                                 //   5/6/7 garble on the new matmul pipeline (81ff7abe5). Pair with
                                 //   dsp_cache_trace_bit0 to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
+    int ion_zoning;             // 0=legacy flat ION pool (default), 1=role-based zoning
+    int ion_zone_weight_pct;    // weight zone size as % of ION pool (default 60)
+    int ion_zone_activation_pct;// activation zone size as % of ION pool (default 35)
+    int ion_zone_mirror_pct;    // mirror zone size as % of ION pool (default 4)
+    int ion_zone_batch_desc_pct;// batch descriptor zone size as % of ION pool (default 1)
 
     const char * cfgfilename;
     const char * runtime_libpath;
@@ -427,6 +453,11 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .fa_select              = 2,
         .dsp_cache_mode         = 4,
         .enable_graph_optimize  = 1,
+        .ion_zoning             = 0,
+        .ion_zone_weight_pct    = 60,
+        .ion_zone_activation_pct= 35,
+        .ion_zone_mirror_pct    = 4,
+        .ion_zone_batch_desc_pct= 1,
         .cfgfilename            = "ggml-hexagon.cfg",
 #if defined(__ANDROID__)
         .runtime_libpath        = "/data/local/tmp/",
@@ -599,6 +630,7 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(DSP):              %d", g_hexagon_appcfg.dump_diag_info);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(AP):               %d", g_hexagon_appcfg.dump_debug_info);
     GGMLHEXAGON_LOG_VERBOSE("enable graph_optimize:            %d", g_hexagon_appcfg.enable_graph_optimize);
+    GGMLHEXAGON_LOG_VERBOSE("ion_zoning:                       %d", g_hexagon_appcfg.ion_zoning);
     if (NULL != ctx) {
         GGMLHEXAGON_LOG_VERBOSE("ggml-dsp use hmx:                 %d", ctx->has_hmx);
     }
@@ -691,6 +723,17 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
                              (unsigned long long)ctx->cgraph_cache_misses,
                              total_cache_lookups ? (100.0 * ctx->cgraph_cache_hits / total_cache_lookups) : 0.0,
                              ctx->cgraph_cache.size());
+    if (ctx->ion_zoning_enabled) {
+        GGMLHEXAGON_LOG_VERBOSE("ion zone usage: weight=%zu/%zu activation=%zu/%zu mirror=%zu/%zu desc=%zu/%zu",
+                                 ctx->zone_usage[ION_ZONE_WEIGHT] - ctx->zone_base[ION_ZONE_WEIGHT],
+                                 ctx->zone_limit[ION_ZONE_WEIGHT] - ctx->zone_base[ION_ZONE_WEIGHT],
+                                 ctx->zone_usage[ION_ZONE_ACTIVATION] - ctx->zone_base[ION_ZONE_ACTIVATION],
+                                 ctx->zone_limit[ION_ZONE_ACTIVATION] - ctx->zone_base[ION_ZONE_ACTIVATION],
+                                 ctx->zone_usage[ION_ZONE_MIRROR] - ctx->zone_base[ION_ZONE_MIRROR],
+                                 ctx->zone_limit[ION_ZONE_MIRROR] - ctx->zone_base[ION_ZONE_MIRROR],
+                                 ctx->zone_usage[ION_ZONE_BATCH_DESC] - ctx->zone_base[ION_ZONE_BATCH_DESC],
+                                 ctx->zone_limit[ION_ZONE_BATCH_DESC] - ctx->zone_base[ION_ZONE_BATCH_DESC]);
+    }
 
     // MUL_MAT optimization diagnostics (PP). Cumulative across the run.
     // - n_mul_mat_total: every MUL_MAT in supported_nodes (cache miss only)
@@ -981,6 +1024,11 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit0", g_hexagon_appcfg.dsp_cache_trace_bit0, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit1", g_hexagon_appcfg.dsp_cache_trace_bit1, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
+    hexagoncfg_instance.get_intvalue("cdsp", "ion_zoning", g_hexagon_appcfg.ion_zoning, 0);
+    hexagoncfg_instance.get_intvalue("cdsp", "ion_zone_weight_pct", g_hexagon_appcfg.ion_zone_weight_pct, 60);
+    hexagoncfg_instance.get_intvalue("cdsp", "ion_zone_activation_pct", g_hexagon_appcfg.ion_zone_activation_pct, 35);
+    hexagoncfg_instance.get_intvalue("cdsp", "ion_zone_mirror_pct", g_hexagon_appcfg.ion_zone_mirror_pct, 4);
+    hexagoncfg_instance.get_intvalue("cdsp", "ion_zone_batch_desc_pct", g_hexagon_appcfg.ion_zone_batch_desc_pct, 1);
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_types", g_hexagon_appcfg.enabled_types, "");
 
@@ -1022,6 +1070,25 @@ static bool ggmlhexagon_check_valid_appcfg() {
     if (g_hexagon_appcfg.dump_diag_info > 1) {
         GGMLHEXAGON_LOG_WARN("invalid dump_diag_info %d, reset to 0", g_hexagon_appcfg.dump_diag_info);
         g_hexagon_appcfg.dump_diag_info = 0;
+    }
+
+    if (g_hexagon_appcfg.ion_zoning < 0 || g_hexagon_appcfg.ion_zoning > 1) {
+        GGMLHEXAGON_LOG_WARN("invalid ion_zoning %d, reset to 0", g_hexagon_appcfg.ion_zoning);
+        g_hexagon_appcfg.ion_zoning = 0;
+    }
+    int zone_sum = g_hexagon_appcfg.ion_zone_weight_pct + g_hexagon_appcfg.ion_zone_activation_pct +
+                   g_hexagon_appcfg.ion_zone_mirror_pct + g_hexagon_appcfg.ion_zone_batch_desc_pct;
+    if (g_hexagon_appcfg.ion_zoning && zone_sum != 100) {
+        GGMLHEXAGON_LOG_WARN("ion zone percentages sum to %d, must be 100; disabling ion_zoning",
+                             zone_sum);
+        g_hexagon_appcfg.ion_zoning = 0;
+    }
+    if (g_hexagon_appcfg.ion_zoning) {
+        if (g_hexagon_appcfg.ion_zone_weight_pct <= 0 || g_hexagon_appcfg.ion_zone_activation_pct <= 0 ||
+            g_hexagon_appcfg.ion_zone_mirror_pct <= 0 || g_hexagon_appcfg.ion_zone_batch_desc_pct <= 0) {
+            GGMLHEXAGON_LOG_WARN("ion zone percentages must all be > 0; disabling ion_zoning");
+            g_hexagon_appcfg.ion_zoning = 0;
+        }
     }
 
     return true;
@@ -1742,6 +1809,38 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
     GGMLHEXAGON_LOG_WARN("rpc mempool handle %d", ctx->rpc_mempool_handle);
     GGMLHEXAGON_LOG_WARN("rpc mempool addr %p", ctx->rpc_mempool);
     GGMLHEXAGON_LOG_WARN("rpc mempool size %lld(%dMB)", ctx->rpc_mempool_len, ctx->rpc_mempool_len/ SIZE_IN_MB);
+
+    // Initialize role-based zoning if enabled in config.
+    ctx->ion_zoning_enabled = (g_hexagon_appcfg.ion_zoning == 1);
+    if (ctx->ion_zoning_enabled) {
+        const size_t total = ctx->rpc_mempool_len;
+        const int w = g_hexagon_appcfg.ion_zone_weight_pct;
+        const int a = g_hexagon_appcfg.ion_zone_activation_pct;
+        const int m = g_hexagon_appcfg.ion_zone_mirror_pct;
+        ctx->zone_base[ION_ZONE_WEIGHT]     = 0;
+        ctx->zone_limit[ION_ZONE_WEIGHT]    = (total * w) / 100;
+        ctx->zone_base[ION_ZONE_ACTIVATION] = ctx->zone_limit[ION_ZONE_WEIGHT];
+        ctx->zone_limit[ION_ZONE_ACTIVATION]= ctx->zone_base[ION_ZONE_ACTIVATION] + (total * a) / 100;
+        ctx->zone_base[ION_ZONE_MIRROR]     = ctx->zone_limit[ION_ZONE_ACTIVATION];
+        ctx->zone_limit[ION_ZONE_MIRROR]    = ctx->zone_base[ION_ZONE_MIRROR] + (total * m) / 100;
+        ctx->zone_base[ION_ZONE_BATCH_DESC] = ctx->zone_limit[ION_ZONE_MIRROR];
+        ctx->zone_limit[ION_ZONE_BATCH_DESC]= total;
+        ctx->zone_usage[ION_ZONE_WEIGHT]    = ctx->zone_base[ION_ZONE_WEIGHT];
+        ctx->zone_usage[ION_ZONE_ACTIVATION]= ctx->zone_base[ION_ZONE_ACTIVATION];
+        ctx->zone_usage[ION_ZONE_MIRROR]    = ctx->zone_base[ION_ZONE_MIRROR];
+        ctx->zone_usage[ION_ZONE_BATCH_DESC]= ctx->zone_base[ION_ZONE_BATCH_DESC];
+        GGMLHEXAGON_LOG_ALWAYS("[ION-ZONE] enabled: weight=[0,%zu) activation=[%zu,%zu) mirror=[%zu,%zu) desc=[%zu,%zu)",
+                               ctx->zone_limit[ION_ZONE_WEIGHT],
+                               ctx->zone_base[ION_ZONE_ACTIVATION], ctx->zone_limit[ION_ZONE_ACTIVATION],
+                               ctx->zone_base[ION_ZONE_MIRROR], ctx->zone_limit[ION_ZONE_MIRROR],
+                               ctx->zone_base[ION_ZONE_BATCH_DESC], ctx->zone_limit[ION_ZONE_BATCH_DESC]);
+    } else {
+        ctx->zone_base[ION_ZONE_NONE]  = 0;
+        ctx->zone_limit[ION_ZONE_NONE] = ctx->rpc_mempool_len;
+        ctx->zone_usage[ION_ZONE_NONE] = 0;
+        GGMLHEXAGON_LOG_ALWAYS("[ION-ZONE] disabled: legacy flat pool");
+    }
+
     {
         // Register ION buffer with FastRPC kernel driver using DELAYED mapping.
         // FASTRPC_MAP_FD_DELAYED: registers fd but does NOT create immediate mapping.
@@ -3269,6 +3368,7 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
       rpc_mempool(nullptr),
       rpc_mempool_handle(0),
       rpc_mempool_dsp_base(nullptr),
+      ion_zoning_enabled(false),
       ggmlop_handle(0),
       domain_id(CDSP_DOMAIN_ID),
       session_id(0),
@@ -3325,6 +3425,9 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
     snprintf(buft_name, sizeof(buft_name), "hexagon-ion-buffer-%s", name);
     snprintf(repack_buft_name, sizeof(repack_buft_name), "hexagon-ion-buffer-%s-REPACK", name);
     lib[0] = '\0';
+    memset(zone_base, 0, sizeof(zone_base));
+    memset(zone_limit, 0, sizeof(zone_limit));
+    memset(zone_usage, 0, sizeof(zone_usage));
 
     buffer_type.iface.get_name         = ggml_backend_hexagon_buffer_type_name;
     buffer_type.iface.alloc_buffer     = ggml_backend_hexagon_buffer_type_alloc_buffer;
@@ -3898,6 +4001,7 @@ struct ggml_backend_hexagon_buffer_context {
                             for (auto & r : backend_ctx->ion_regions) {
                                 if (r.in_use && r.offset == buf_offset) {
                                     r.in_use = false;
+                                    r.dirty  = false;
                                     GGMLHEXAGON_LOG_WARN("[FREE] device=%d region offset=%zu size=%zu", backend_ctx->device, r.offset, r.size);
                                     break;
                                 }
@@ -4612,6 +4716,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 hctx->weights_dirty = false;
             } else {
                 hctx->weights_dirty = true;
+                ggmlhexagon_mark_ion_region_dirty(hctx, (size_t)(dp - base));
             }
         }
     }
@@ -4630,6 +4735,7 @@ static void ggml_backend_hexagon_buffer_memset_tensor(ggml_backend_buffer_t buff
         const char * base = (const char *)hctx->rpc_mempool;
         if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
             hctx->weights_dirty = true;
+            ggmlhexagon_mark_ion_region_dirty(hctx, (size_t)(dp - base));
         }
     }
 }
@@ -4718,6 +4824,113 @@ static const char * ggml_backend_hexagon_buffer_type_name(ggml_backend_buffer_ty
     return "hexagon-ion-buffer";
 }
 
+// Allocate a region of `size` bytes from the ION pool for the given role.
+// Returns the byte offset from pool base, or (size_t)-1 on failure.
+static size_t ggmlhexagon_alloc_ion_region(ggml_backend_hexagon_context * ctx,
+                                            size_t size, ion_zone_role role) {
+    GGML_ASSERT(ctx && ctx->rpc_mempool);
+    if (size == 0) return (size_t)-1;
+
+    const ion_zone_role alloc_role = ctx->ion_zoning_enabled ? role : ION_ZONE_NONE;
+    const size_t align     = 128;
+
+    size_t aligned_size = (size + align - 1) & ~(align - 1);
+
+    if (ctx->ion_zoning_enabled) {
+        // Best-fit reuse within the same zone
+        size_t best_idx  = (size_t)-1;
+        size_t best_waste = (size_t)-1;
+        for (size_t ri = 0; ri < ctx->ion_regions.size(); ri++) {
+            const auto & r = ctx->ion_regions[ri];
+            if (!r.in_use && r.role == (uint8_t)alloc_role && r.size >= aligned_size) {
+                size_t waste = r.size - aligned_size;
+                if (waste < best_waste) {
+                    best_waste = waste;
+                    best_idx = ri;
+                }
+            }
+        }
+        if (best_idx != (size_t)-1) {
+            auto & r = ctx->ion_regions[best_idx];
+            r.in_use = true;
+            r.dirty  = false;
+            if (r.offset + aligned_size > ctx->zone_usage[alloc_role]) {
+                ctx->zone_usage[alloc_role] = r.offset + aligned_size;
+            }
+            return r.offset;
+        }
+
+        // Bump allocate from zone tail
+        size_t base  = ctx->zone_base[alloc_role];
+        size_t limit = ctx->zone_limit[alloc_role];
+        size_t usage = ctx->zone_usage[alloc_role];
+        size_t aligned_offset = (usage + align - 1) & ~(align - 1);
+        if (aligned_offset < base) aligned_offset = base;
+        if (aligned_offset + aligned_size <= limit) {
+            ion_pool_region new_region;
+            new_region.offset = aligned_offset;
+            new_region.size   = aligned_size;
+            new_region.in_use = true;
+            new_region.role   = (uint8_t)alloc_role;
+            new_region.dirty  = false;
+            ctx->ion_regions.push_back(new_region);
+            ctx->zone_usage[alloc_role] = aligned_offset + aligned_size;
+            return aligned_offset;
+        }
+    } else {
+        // Legacy flat allocation: reuse any free region
+        size_t best_idx  = (size_t)-1;
+        size_t best_waste = (size_t)-1;
+        for (size_t ri = 0; ri < ctx->ion_regions.size(); ri++) {
+            const auto & r = ctx->ion_regions[ri];
+            if (!r.in_use && r.size >= aligned_size) {
+                size_t waste = r.size - aligned_size;
+                if (waste < best_waste) {
+                    best_waste = waste;
+                    best_idx = ri;
+                }
+            }
+        }
+        if (best_idx != (size_t)-1) {
+            auto & r = ctx->ion_regions[best_idx];
+            r.in_use = true;
+            r.dirty  = false;
+            if (r.offset + aligned_size > ctx->rpc_mempool_usage) {
+                ctx->rpc_mempool_usage = r.offset + aligned_size;
+            }
+            return r.offset;
+        }
+
+        size_t aligned_offset = (ctx->rpc_mempool_usage + align - 1) & ~(align - 1);
+        if (aligned_offset + aligned_size <= ctx->rpc_mempool_len) {
+            ion_pool_region new_region;
+            new_region.offset = aligned_offset;
+            new_region.size   = aligned_size;
+            new_region.in_use = true;
+            new_region.role   = (uint8_t)ION_ZONE_NONE;
+            new_region.dirty  = false;
+            ctx->ion_regions.push_back(new_region);
+            ctx->rpc_mempool_usage = aligned_offset + aligned_size;
+            return aligned_offset;
+        }
+    }
+
+    return (size_t)-1;
+}
+
+// Mark the ION region containing `offset` as dirty. Used only when
+// ion_zoning_enabled is true so Phase 6.5 can flush just the regions
+// the AP actually wrote to, instead of the whole zone.
+static void ggmlhexagon_mark_ion_region_dirty(ggml_backend_hexagon_context * ctx, size_t offset) {
+    if (!ctx || !ctx->ion_zoning_enabled) return;
+    for (auto & r : ctx->ion_regions) {
+        if (r.in_use && offset >= r.offset && offset < r.offset + r.size) {
+            r.dirty = true;
+            return;
+        }
+    }
+}
+
 static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
            ggml_backend_buffer_type_t buft, size_t size) {
     struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
@@ -4742,55 +4955,30 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
                           ctx->device, size, size / SIZE_IN_MB, ctx->rpc_mempool_usage, ctx->rpc_mempool_usage / SIZE_IN_MB,
                           ctx->rpc_mempool_len, ctx->rpc_mempool_len / SIZE_IN_MB);
 
-    size_t data_limit = ctx->rpc_mempool_len;
-
-    // Try to reuse a free region (best fit)
-    size_t best_idx = (size_t)-1;
-    size_t best_waste = (size_t)-1;
-    for (size_t ri = 0; ri < ctx->ion_regions.size(); ri++) {
-        const auto & r = ctx->ion_regions[ri];
-        if (!r.in_use && r.size >= size_aligned) {
-            size_t waste = r.size - size_aligned;
-            if (waste < best_waste) {
-                best_waste = waste;
-                best_idx = ri;
-            }
-        }
+    // Determine role from buffer type: repack buffer type holds weights,
+    // main buffer type holds activations.
+    ion_zone_role role = ION_ZONE_ACTIVATION;
+    if (buft == &ctx->repack_buffer_type) {
+        role = ION_ZONE_WEIGHT;
     }
 
-    if (best_idx != (size_t)-1) {
-        // Reuse free region
-        auto & r = ctx->ion_regions[best_idx];
-        buffer_ctx->buffer      = (char *)ctx->rpc_mempool + r.offset;
-        buffer_ctx->buffer_size = size_aligned;  // actual requested size, not region size
-        r.in_use = true;
-        if (r.offset + size_aligned > ctx->rpc_mempool_usage) {
-            ctx->rpc_mempool_usage = r.offset + size_aligned;
+    size_t offset = ggmlhexagon_alloc_ion_region(ctx, size_aligned, role);
+
+    if (offset != (size_t)-1) {
+        buffer_ctx->buffer      = (char *)ctx->rpc_mempool + offset;
+        buffer_ctx->buffer_size = size_aligned;
+        if (offset + size_aligned > ctx->rpc_mempool_usage) {
+            ctx->rpc_mempool_usage = offset + size_aligned;
         }
-        GGMLHEXAGON_LOG_ALWAYS("[ALLOC] device=%d reuse free region: offset=%zu size=%zu (requested=%zu, waste=%zu)",
-                             ctx->device, r.offset, r.size, size_aligned, r.size - size_aligned);
+        GGMLHEXAGON_LOG_ALWAYS("[ALLOC] device=%d role=%d region: offset=%zu size=%zu", ctx->device,
+                             (int)role, offset, size_aligned);
     } else {
-        // Allocate new region from bump allocator tail
-        size_t aligned_offset = ((ctx->rpc_mempool_usage + 127) / 128) * 128;
-        if (aligned_offset + size_aligned <= data_limit) {
-            buffer_ctx->buffer      = (char *)ctx->rpc_mempool + aligned_offset;
-            buffer_ctx->buffer_size = size_aligned;
-            ctx->rpc_mempool_usage  = aligned_offset + size_aligned;
-            // Record new region
-            ion_pool_region new_region;
-            new_region.offset = aligned_offset;
-            new_region.size   = size_aligned;
-            new_region.in_use = true;
-            ctx->ion_regions.push_back(new_region);
-            GGMLHEXAGON_LOG_ALWAYS("[ALLOC] device=%d new region: offset=%zu size=%zu", ctx->device, aligned_offset, size_aligned);
-        } else {
-            GGMLHEXAGON_LOG_ALWAYS("device=%d ion pool exhausted: needed %zu MiB, remaining %zu MiB -- falling back to system memory",
-                                 ctx->device, size_aligned / SIZE_IN_MB,
-                                 (data_limit - ctx->rpc_mempool_usage) / SIZE_IN_MB);
-            buffer_ctx->buffer = ggml_aligned_malloc(size_aligned);
-            buffer_ctx->buffer_size = size_aligned;
-            buffer_ctx->is_ion_buffer = false;
-        }
+        GGMLHEXAGON_LOG_ALWAYS("device=%d ion pool exhausted: needed %zu MiB, remaining %zu MiB -- falling back to system memory",
+                             ctx->device, size_aligned / SIZE_IN_MB,
+                             (ctx->rpc_mempool_len - ctx->rpc_mempool_usage) / SIZE_IN_MB);
+        buffer_ctx->buffer = ggml_aligned_malloc(size_aligned);
+        buffer_ctx->buffer_size = size_aligned;
+        buffer_ctx->is_ion_buffer = false;
     }
 
     if (nullptr == buffer_ctx->buffer) {
@@ -5005,6 +5193,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // This avoids FastRPC's scatter-gather limits on large batches.
     // ====================================================================
     size_t saved_mempool_usage = ctx->rpc_mempool_usage;
+    size_t saved_zone_usage[ION_ZONE_MAX];
+    memcpy(saved_zone_usage, ctx->zone_usage, sizeof(saved_zone_usage));
     if (!ctx->rpc_mempool || ctx->rpc_mempool_len == 0) {
         GGMLHEXAGON_LOG_WARN("special: no ION mempool, falling back to per-op");
         return result;  // let scheduler use per-op path
@@ -5701,31 +5891,23 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     }
 
     // Step 2: Allocate mirrors for each unique data pointer
-    size_t data_limit = ion_size;
     for (auto & kv : buffer_mirrors_map) {
         void * data_ptr = kv.first;
         buffer_mirror_info & info = kv.second;
         size_t mirror_size = info.max_data_len;
-        size_t aligned_offset = (ctx->rpc_mempool_usage + 127u) & ~127u;
 
-        if (aligned_offset + mirror_size > data_limit) {
+        size_t moff_sz = ggmlhexagon_alloc_ion_region(ctx, mirror_size, ION_ZONE_MIRROR);
+        if (moff_sz == (size_t)-1) {
             GGMLHEXAGON_LOG_WARN("ion-batch: mempool full for mirror (%zu bytes)", mirror_size);
             continue;
         }
 
-        uint32_t moff = (uint32_t)aligned_offset;
+        uint32_t moff = (uint32_t)moff_sz;
         void * ion_buf = (char *)ctx->rpc_mempool + moff;
-        ctx->rpc_mempool_usage = aligned_offset + mirror_size;
-
-        // Record mirror as a temporary ION region
-        ion_pool_region mirror_region;
-        mirror_region.offset = aligned_offset;
-        mirror_region.size   = mirror_size;
-        mirror_region.in_use = true;
-        ctx->ion_regions.push_back(mirror_region);
         temp_region_indices.push_back(ctx->ion_regions.size() - 1);
 
         memcpy(ion_buf, data_ptr, mirror_size);
+        ggmlhexagon_mark_ion_region_dirty(ctx, moff);
 
         info.mirror_offset = moff;
         info.allocated = true;
@@ -5819,28 +6001,19 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // ---- Phase 5: allocate batch descriptor region in ION mempool ----
     t_p45 = ggml_time_us() - t_prev; t_prev = ggml_time_us();
     PERF_RECORD(t_p45, ctx->p45_hist);
-    size_t batch_align = HEX_BATCH_ALIGN;
-    size_t batch_offset_raw = ctx->rpc_mempool_usage;
-    size_t batch_offset_aligned = (batch_offset_raw + batch_align - 1) & ~(batch_align - 1);
 
-    if (batch_offset_aligned + total_desc_size > data_limit) {
-        GGMLHEXAGON_LOG_ERROR("ion-batch: mempool full for batch desc (%zu bytes at offset %zu)",
-                              total_desc_size, batch_offset_aligned);
+    size_t batch_offset_sz = ggmlhexagon_alloc_ion_region(ctx, total_desc_size, ION_ZONE_BATCH_DESC);
+    if (batch_offset_sz == (size_t)-1) {
+        GGMLHEXAGON_LOG_ERROR("ion-batch: mempool full for batch desc (%zu bytes)", total_desc_size);
         // Free temporary mirror regions before returning
         for (size_t ri : temp_region_indices) {
             ctx->ion_regions[ri].in_use = false;
+            ctx->ion_regions[ri].dirty  = false;
         }
         return result;
     }
 
-    uint32_t batch_offset = (uint32_t)batch_offset_aligned;
-    ctx->rpc_mempool_usage = batch_offset_aligned + total_desc_size;
-    // Record batch descriptor as a temporary ION region
-    ion_pool_region batch_region;
-    batch_region.offset = batch_offset_aligned;
-    batch_region.size   = total_desc_size;
-    batch_region.in_use = true;
-    ctx->ion_regions.push_back(batch_region);
+    uint32_t batch_offset = (uint32_t)batch_offset_sz;
     temp_region_indices.push_back(ctx->ion_regions.size() - 1);
 
     t_p5 = t_prev; t_prev = ggml_time_us(); ctx->cum_p5_us += t_prev - t_p5;
@@ -5851,6 +6024,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     uint8_t *ion_batch = (uint8_t *)ctx->rpc_mempool + batch_offset;
     hex_batch_hdr * hdr = (hex_batch_hdr *)ion_batch;
     memset(hdr, 0, sizeof(*hdr));
+    ggmlhexagon_mark_ion_region_dirty(ctx, batch_offset);
     hdr->n_ops         = n_ops;
     hdr->n_tensors    = n_tensors;
     hdr->ops_offset   = ops_offset;
@@ -5998,57 +6172,74 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                                   g_hexagon_appcfg.ion_sync_mode, was_weights_dirty);
         } else {
 
-        for (uint32_t i = 0; i < n_tensors; i++) {
-            ggml_tensor * t = tensor_src[i];
-            if (!t || !t->data) continue;
-            if (is_weight[i] && !ctx->weights_dirty) continue;
-            const char * dp = (const char *)t->data;
-            if (dp >= ion_base && dp < ion_base + (ptrdiff_t)ion_size) {
-                // For quantized weights repacked in-place by set_tensor,
-                // use the repacked size (larger than ggml_nbytes).
-                bool is_quant_weight = is_weight[i] && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16;
-                size_t flush_size = is_quant_weight ? ggml_hexagon_repacked_size(t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]) : ggml_nbytes(t);
-                if (flush_size == 0) flush_size = ggml_nbytes(t);
-                add_range((uint32_t)(dp - ion_base), (uint32_t)flush_size);
-                dbg_bytes_tensor += flush_size;
-                dbg_ranges_tensor++;
+        if (ctx->ion_zoning_enabled) {
+            // Zone-aware flush: only flush regions the AP has actually written to
+            // since the last flush. Repack-buft weights are flushed immediately in
+            // set_tensor and are never marked dirty here, so they are skipped.
+            // Mirror and batch-descriptor regions are marked dirty when copied/built.
+            for (const auto & r : ctx->ion_regions) {
+                if (!r.in_use || !r.dirty) continue;
+                add_range((uint32_t)r.offset, (uint32_t)r.size);
             }
-        }
-        for (const auto & m : mirrors) {
-            add_range(m.mirror_offset, m.data_len);
-            dbg_bytes_mirror += m.data_len;
-        }
-        for (const auto & rw : repacked_ion_weights) {
-            add_range(rw.first, rw.second);
-            dbg_bytes_repack_ion += rw.second;
-        }
-        add_range(batch_offset, total_desc_size);
-        dbg_bytes_batch += total_desc_size;
+            // Clear dirty flags now that they have been flushed.
+            for (auto & r : ctx->ion_regions) {
+                if (r.in_use) r.dirty = false;
+            }
+            ctx->weights_dirty = false;
+        } else {
+            // Legacy flat-pool flush: scan per-tensor/cgraph to collect ranges.
+            for (uint32_t i = 0; i < n_tensors; i++) {
+                ggml_tensor * t = tensor_src[i];
+                if (!t || !t->data) continue;
+                if (is_weight[i] && !ctx->weights_dirty) continue;
+                const char * dp = (const char *)t->data;
+                if (dp >= ion_base && dp < ion_base + (ptrdiff_t)ion_size) {
+                    // For quantized weights repacked in-place by set_tensor,
+                    // use the repacked size (larger than ggml_nbytes).
+                    bool is_quant_weight = is_weight[i] && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16;
+                    size_t flush_size = is_quant_weight ? ggml_hexagon_repacked_size(t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]) : ggml_nbytes(t);
+                    if (flush_size == 0) flush_size = ggml_nbytes(t);
+                    add_range((uint32_t)(dp - ion_base), (uint32_t)flush_size);
+                    dbg_bytes_tensor += flush_size;
+                    dbg_ranges_tensor++;
+                }
+            }
+            for (const auto & m : mirrors) {
+                add_range(m.mirror_offset, m.data_len);
+                dbg_bytes_mirror += m.data_len;
+            }
+            for (const auto & rw : repacked_ion_weights) {
+                add_range(rw.first, rw.second);
+                dbg_bytes_repack_ion += rw.second;
+            }
+            add_range(batch_offset, total_desc_size);
+            dbg_bytes_batch += total_desc_size;
 
-        // Also flush non-op tensors in cgraph not in tensor_src (e.g., test sentinels).
-        // Without this, Phase 7.5 DC CIVAC can invalidate cache lines containing
-        // unflushed sentinel data, causing sentinel mismatch.
-        //
-        // CRITICAL: skip repack-buft weights when weights_dirty is false.
-        // The per-tensor loop above already guards against re-flushing clean
-        // weights via weight_indices; this loop did not, which caused every
-        // graph_compute call to re-flush the entire repack weight region
-        // (~1.5 GB for gemma4 9B) even though no repack had happened. That
-        // single oversight was responsible for ~22 s of the 34 s total
-        // graph_compute time in the algotype=29 path.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * t = cgraph->nodes[i];
-            if (!t || !t->data) continue;
-            if (!ctx->weights_dirty &&
-                t->buffer && ggml_backend_buffer_is_hexagon_repack(t->buffer)) {
-                continue;  // repack-buft weight, cache already coherent
-            }
-            const char * dp = (const char *)t->data;
-            if (dp >= ion_base && dp < ion_base + (ptrdiff_t)ion_size) {
-                size_t sz = ggml_nbytes(t);
-                add_range((uint32_t)(dp - ion_base), (uint32_t)sz);
-                dbg_bytes_cgraph += sz;
-                dbg_ranges_cgraph++;
+            // Also flush non-op tensors in cgraph not in tensor_src (e.g., test sentinels).
+            // Without this, Phase 7.5 DC CIVAC can invalidate cache lines containing
+            // unflushed sentinel data, causing sentinel mismatch.
+            //
+            // CRITICAL: skip repack-buft weights when weights_dirty is false.
+            // The per-tensor loop above already guards against re-flushing clean
+            // weights via weight_indices; this loop did not, which caused every
+            // graph_compute call to re-flush the entire repack weight region
+            // (~1.5 GB for gemma4 9B) even though no repack had happened. That
+            // single oversight was responsible for ~22 s of the 34 s total
+            // graph_compute time in the algotype=29 path.
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * t = cgraph->nodes[i];
+                if (!t || !t->data) continue;
+                if (!ctx->weights_dirty &&
+                    t->buffer && ggml_backend_buffer_is_hexagon_repack(t->buffer)) {
+                    continue;  // repack-buft weight, cache already coherent
+                }
+                const char * dp = (const char *)t->data;
+                if (dp >= ion_base && dp < ion_base + (ptrdiff_t)ion_size) {
+                    size_t sz = ggml_nbytes(t);
+                    add_range((uint32_t)(dp - ion_base), (uint32_t)sz);
+                    dbg_bytes_cgraph += sz;
+                    dbg_ranges_cgraph++;
+                }
             }
         }
 
@@ -6280,28 +6471,66 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             }
         } else {
         uint32_t inval_min = ~0u, inval_max = 0;
-        for (uint32_t oi = 0; oi < n_ops; oi++) {
-            const hex_op_desc & cur_op = hex_ops[oi];
-            uint32_t dst_idx = cur_op.dst_idx[0];
-            if (dst_idx >= n_tensors) continue;
-            ggml_tensor * dst_t = tensor_src[dst_idx];
-            if (!dst_t || !dst_t->data) continue;
+        if (ctx->ion_zoning_enabled) {
+            // Zone-aware invalidate: DSP writes only to activation and mirror zones.
+            // Track per-dst-tensor ranges instead of invalidating entire zones.
+            for (uint32_t oi = 0; oi < n_ops; oi++) {
+                const hex_op_desc & cur_op = hex_ops[oi];
+                uint32_t dst_idx = cur_op.dst_idx[0];
+                if (dst_idx >= n_tensors) continue;
+                ggml_tensor * dst_t = tensor_src[dst_idx];
+                if (!dst_t || !dst_t->data) continue;
 
-            uint32_t dst_off = 0xFFFFFFFFu;
-            const char * dp = (const char *)dst_t->data;
-            if (dp >= ion_base && dp < ion_base + (ptrdiff_t)ion_size) {
-                dst_off = (uint32_t)(dp - ion_base);
-            } else {
-                int32_t moff = local_mirror_offset[dst_idx];
-                if (moff >= 0) dst_off = (uint32_t)moff;
+                uint32_t dst_off = 0xFFFFFFFFu;
+                const char * dp = (const char *)dst_t->data;
+                if (dp >= ion_base && dp < ion_base + (ptrdiff_t)ion_size) {
+                    size_t off = (size_t)(dp - ion_base);
+                    bool is_activation = false;
+                    for (const auto & r : ctx->ion_regions) {
+                        if (r.in_use && r.role == ION_ZONE_ACTIVATION &&
+                            off >= r.offset && off < r.offset + r.size) {
+                            is_activation = true;
+                            break;
+                        }
+                    }
+                    if (is_activation) dst_off = (uint32_t)off;
+                } else {
+                    int32_t moff = local_mirror_offset[dst_idx];
+                    if (moff >= 0) dst_off = (uint32_t)moff;
+                }
+                if (dst_off == 0xFFFFFFFFu) continue;
+
+                uint32_t dst_len = (uint32_t)ggml_nbytes(dst_t);
+                uint32_t start = dst_off & ~63u;
+                uint32_t end   = (dst_off + dst_len + 63u) & ~63u;
+                if (start < inval_min) inval_min = start;
+                if (end > inval_max) inval_max = end;
             }
-            if (dst_off == 0xFFFFFFFFu) continue;
+        } else {
+            // Legacy flat-pool invalidate: scan per-dst-tensor.
+            for (uint32_t oi = 0; oi < n_ops; oi++) {
+                const hex_op_desc & cur_op = hex_ops[oi];
+                uint32_t dst_idx = cur_op.dst_idx[0];
+                if (dst_idx >= n_tensors) continue;
+                ggml_tensor * dst_t = tensor_src[dst_idx];
+                if (!dst_t || !dst_t->data) continue;
 
-            uint32_t dst_len = (uint32_t)ggml_nbytes(dst_t);
-            uint32_t start = dst_off & ~63u;
-            uint32_t end   = (dst_off + dst_len + 63u) & ~63u;
-            if (start < inval_min) inval_min = start;
-            if (end > inval_max) inval_max = end;
+                uint32_t dst_off = 0xFFFFFFFFu;
+                const char * dp = (const char *)dst_t->data;
+                if (dp >= ion_base && dp < ion_base + (ptrdiff_t)ion_size) {
+                    dst_off = (uint32_t)(dp - ion_base);
+                } else {
+                    int32_t moff = local_mirror_offset[dst_idx];
+                    if (moff >= 0) dst_off = (uint32_t)moff;
+                }
+                if (dst_off == 0xFFFFFFFFu) continue;
+
+                uint32_t dst_len = (uint32_t)ggml_nbytes(dst_t);
+                uint32_t start = dst_off & ~63u;
+                uint32_t end   = (dst_off + dst_len + 63u) & ~63u;
+                if (start < inval_min) inval_min = start;
+                if (end > inval_max) inval_max = end;
+            }
         }
         if (inval_max > inval_min) {
             cpu_dcache_inval_range(ctx, 0, (const char *)ctx->rpc_mempool + inval_min, inval_max - inval_min);
@@ -6343,6 +6572,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // Without this, rpc_mempool_usage only grows and eventually exhausts the pool,
     // causing mirror alloc failure (data_offset=0 -> DSP corrupts model weights).
     ctx->rpc_mempool_usage = saved_mempool_usage;
+    memcpy(ctx->zone_usage, saved_zone_usage, sizeof(ctx->zone_usage));
 
     // ---- Phase 8: copy-back mirrored results to heap ----
     // t_p75 = Phase 7.6 verify + Phase 8 copy-back (civac is now its own field)
@@ -6400,6 +6630,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // in the next call. Mark them as free (no tail compaction).
     for (size_t ri : temp_region_indices) {
         ctx->ion_regions[ri].in_use = false;
+        ctx->ion_regions[ri].dirty  = false;
     }
     t_p8 = ggml_time_us() - t_prev;
     PERF_RECORD(t_p8, ctx->p8_hist);
