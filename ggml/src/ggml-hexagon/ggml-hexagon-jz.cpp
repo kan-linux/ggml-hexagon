@@ -3480,7 +3480,9 @@ static bool hexagon_validate_get_rows(ggml_backend_hexagon_context *ctx, const g
     const ggml_tensor *src1 = op->src[1];
     if (!src1 || src1->type != GGML_TYPE_I32)
         return false;
-    if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_Q4_K)
+        return false;
+    if (op->type != GGML_TYPE_F32)
         return false;
     return true;
 }
@@ -4640,7 +4642,7 @@ static bool ggml_backend_buft_is_hexagon_repack(ggml_backend_buffer_type_t buft)
 
 static bool ggml_backend_hexagon_buffer_is_host(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return true;
+    return false;
 }
 
 // Repack buffer type: is_host=false forces GGML core to call set_tensor
