@@ -1,6 +1,6 @@
 > Author: MiniMax-M3
 > Date: 2026-07-19
-> Context: pipeline feature (pipeline_mode=1) 在 native FastRPC + single ION mempool 架构下的乱码调试复盘; 期间在 JZ 后端 graph_compute_batch 与 worker 线程两条路径间做了一系列对照实验, 排除了若干具体 cache 一致性维护方案, 但未能找到可稳定 ship 的修复.
+> Context: pipeline feature (pipeline_mode=1) 在 native FastRPC + single ION mempool 架构下的乱码调试复盘; 期间在 JZ 后端 graph_compute_batch 与 worker 线程两条路径间做了一系列对照实验, 排除了若干具体 cache 一致性维护方案与一条 driver 层替代路径, 但未能找到可稳定 ship 的修复.
 >
 > 与本文相关的代码路径:
 > - AP: ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp (graph_compute_batch, pipeline_worker_loop)
@@ -15,7 +15,7 @@ JZ ggml-hexagon 在同步架构 (pipeline_mode=0) 下, PP 已达到甚至偶尔�
 
 本次工作的目标: 在保持 native FastRPC (而非 dspqueue) + single ION shared mempool (而非 per-buffer ION) 的 JZ 架构前提下, 通过 AP 端 graph 准备与 DSP 端 batch 执行的 batch-level 重叠, 把 TG 拉近到 Qualcomm 水平. 实现上引入 pipeline feature: 双 floor ION mempool + AP 端 worker 线程 + heap snapshot 机制.
 
-实际效果: pipeline_mode=1 启用时 TG 抬升到 ~21 tok/s, 但推理输出出现有规律乱码 (token 重复 1 次到 3 次不等, 偶发提前 EOS, 具体模式随 cache 配置变化). pipeline_mode=0 时推理完全正常.
+实际效果: pipeline_mode=1 启用时 TG 抬升到 ~24 tok/s, 但推理输出出现有规律乱码 (token 重复 1 次到 3 次不等, 偶发提前 EOS, 具体模式随 cache 配置变化). pipeline_mode=0 时推理完全正常.
 
 ## 2. 架构概览 (pipeline_mode=1)
 
@@ -81,6 +81,15 @@ graph i+1:           main  |  prep P1..P6  |  push task i+1  |  return
 - 关键对照: 在同样的 cache 配置下, `pipeline_mode=0` 推理完全正常, TG 回到 pipeline 引入前的水平.
 - 推论: 乱码严格与 pipeline 模式的并发重叠相关, 而非 dsp_cache_mode / ion_sync_mode 单独决定.
 
+### 3.7 async fastrpc probe (2026-07-19, init 阶段)
+
+- 动机: worker 线程 + 同步 invoke 方案下, native FastRPC 阻塞到 DSP 返回是性能上界. async fastrpc 在 driver 层把"调用"与"完成"解耦, 理论上是另一条 batch-level 重叠路径.
+- 改动: 在 `ggmlhexagon_init_dsp` 末尾加 TEMP DIAG probe 块, 用与同步 `execute_batch` (mid=4) 相同的 marshalling (prim[2] = {0u, 0xFFFB}) 调 `remote_handle64_invoke_async`, 立即 `fastrpc_async_get_status` + `fastrpc_release_async_job`.
+- 结果 (两次独立 init):
+  - `err=0x14` `jobid=0` 两次一致.
+- 错误码含义: `0x14` (十进制 20) = `AEE_EUNSUPPORTED` (见 `prebuilts/Hexagon_SDK/6.6.0.0/incs/stddef/AEEStdErr.idl:66`). 即当前 handle/域配置上 driver 拒绝 async 调用.
+- 推论: JZ 平台 + Hexagon SDK 6.6.0.0 配合当前 `ggmlop_handle` 的获取方式下, async fastrpc API 不可用. 这条突破方向被关闭, 不再作为后续选项.
+
 ## 4. 已确证 / 已排除
 
 - **确证 (positive):**
@@ -98,6 +107,7 @@ graph i+1:           main  |  prep P1..P6  |  push task i+1  |  return
 | D | DSP 端 bit 2 bulk flush 引起乱码 | dsp_cache_mode=0 后仍乱码 |
 | E1 | heap snapshot 未生效, live heap 被竞争 | pm_count=0, 路径未激活 |
 | E2 (Test E) | 关掉 whole-pool `ion_sync`, 改 per-range `dc cvac` 能修 | 反而恶化, 乱码程度加深 + 性能退化 |
+| F | async fastrpc 替代 worker 线程 + 同步 invoke | invoke_async 返回 AEE_EUNSUPPORTED (0x14), API 在当前 handle/域配置上不可用 |
 
 **仍 open:**
 
@@ -105,25 +115,24 @@ graph i+1:           main  |  prep P1..P6  |  push task i+1  |  return
 - descriptor 内部结构错位 (hex_op_desc / hex_tensor_desc / hex_batch_hdr 字段布局, 与 mirror 写入错位无关).
 - worker 端 Phase 7.5 DC CIVAC 是否完整覆盖 DSP 写入的所有 dst (当前实现基于 `task->mirrors` + 所有 ION-resident dst, 但 split output 边界可能漏覆盖).
 - Phase 8 copy-back 的时序: worker 做完 CIVAC 后立刻 memcpy 回 heap, 中间没有 barrier 等待 in-flight DMA.
-- async fastrpc (替代 worker 线程 + 同步 invoke 的硬件/driver 层方案).
 - DSP 侧 dspqueue 化 (这与 native FastRPC 的架构前提冲突, 属于架构级重写).
 
 ## 5. 技术结论
 
 - **架构层面**: native FastRPC + single ION mempool 这套约束下, batch-level cache 一致性没有 driver 提供的语义保障. Qualcomm 的 dspqueue 把 AP->DSP buffer 的 flush/invalidate 抽象成 `DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | INVALIDATE_RECIPIENT`, 由 driver 在合适时点统一维护. JZ 在 native FastRPC 下, 必须自己枚举所有 dirty range, 自己选 flush 策略, 自己处理 AP 端 cache 与 DSP 端 SMMU 的可见性. 在单线程同步模型下, 这条路经过多次迭代已经收敛到稳态. 但在双线程并发模型下, cache flush 的"操作者"与"被操作者"分布在不同 CPU core 上, 而 ARM 的 `dc cvac` 是 per-core local 操作, 跨 core 不可见. 这条不变量在 sync 模式下不暴露, 在 pipeline 模式下成为核心难点.
 - **方法层面**: Test A 到 Test E 的逐条假设排除走得有效, 排除了若干表面合理但实际不成立的方案. 但仍未命中. 这与 Kimi-K3 在此方向上 ~9 小时未取得突破是一致的信号: 该搜索空间靠纯静态推理 + 有限次实测不收敛.
-- **不能做等价推断**: "缓存一致性问题比 dspqueue 复杂" (经验事实) 不等于 "pipeline 在 native FastRPC + single ION mempool 架构下不可行" (原则结论). 复杂与不可行之间没有蕴含关系. 当前只能断言"在已尝试的具体方案范围内, 未找到稳定方案", 不能断言"所有可能方案都不行". async fastrpc 与 DSP 侧 dspqueue 化是尚未被充分测试的两个方向.
+- **不能做等价推断**: "缓存一致性问题比 dspqueue 复杂" (经验事实) 不等于 "pipeline 在 native FastRPC + single ION mempool 架构下不可行" (原则结论). 复杂与不可行之间没有蕴含关系. 当前只能断言"在已尝试的具体方案范围内, 未找到稳定方案", 不能断言"所有可能方案都不行". 截至 2026-07-19, open 选项已从"async fastrpc + DSP 侧 dspqueue 化"两个收窄为只剩"DSP 侧 dspqueue 化"一个 (async fastrpc 已实测 AEE_EUNSUPPORTED 关闭).
 
 ## 6. 工程决策
 
 - pipeline_mode=1 在当前状态下暂不启用.
 - pipeline feature 作为 feature 分支保留, 不合并到主开发分支. 主分支保持 pipeline_mode 默认 0.
 - 已稳定的其它 TG 优化 (cgraph reorder, QKV/FFN fusion, single ION mempool) 与 pipeline 解耦, 独立 ship.
-- 任何对 pipeline feature 的继续探索 (async fastrpc, DSP 侧 dspqueue 化, 4/8 floor 扩展等) 应在 feature 分支内进行, 每次都需要先在测试模型上跑通再考虑合并.
+- 任何对 pipeline feature 的继续探索 (DSP 侧 dspqueue 化, 4/8 floor 扩展等) 应在 feature 分支内进行, 每次都需要先在测试模型上跑通再考虑合并. async fastrpc 在 2026-07-19 已实测不可用 (AEE_EUNSUPPORTED 0x14), 不再是选项.
 
 ## 7. 后续可能突破方向 (供参考, 不承诺)
 
-1. **async fastrpc**: 利用 `remote_handle_invoke_async` 让一次 RPC 提交后立即返回 jobid, AP 端用 `fastrpc_async_get_status` 轮询或回调. 这从 driver 层把"调用"与"完成"在时间上解耦, 可能避开 worker 线程方案中的"阻塞到 DSP 返回"硬限制. 需要先验证 JZ Hexagon SDK 6.6.0.0 是否支持 (`ASYNC_FASTRPC_SUPPORT` capability). 文档: `prebuilts/Hexagon_SDK/6.6.0.0/incs/remote.md`.
+1. ~~**async fastrpc**~~ (2026-07-19 已实测关闭): init 阶段 TEMP DIAG probe 两次返回 AEE_EUNSUPPORTED (0x14), JZ 平台 + Hexagon SDK 6.6.0.0 配合当前 handle 不可用. 不再是选项.
 2. **DSP 侧 dspqueue 化**: 把当前 AP 主导的 batch descriptor 协议重写为 DSP 侧 dspqueue 协议. 这与 native FastRPC 前提冲突, 属于架构级重写, 短期不现实.
 3. **descriptor 内部错位**: 仍 open 的假设之一. 如果乱码根因不在 cache 而在 descriptor 结构, 现有的 cache flush 路径优化都是徒劳. 验证手段: 在测试模型上加 sentinel tensor, 比对 AP 写前/DSP 读后/worker CIVAC 后三个时间点上的 descriptor 字节.
 4. **4/8 floor mempool**: 增加 floor 数量, 进一步隔离 main 写入与 DSP DMA 的时间窗口. 曾在 sync 模式下讨论, 理论上有用, 但在 pipeline 模式下的 cache 维护复杂度会进一步上升. 优先级低.

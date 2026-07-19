@@ -28,7 +28,6 @@
 #include <vector>
 #include <thread>
 #include <mutex>
-#include <atomic>
 #include <map>
 #include <set>
 #include <tuple>
@@ -451,40 +450,10 @@ struct ggml_backend_hexagon_context {
     // and worker-thread in_use updates (end of task)
     std::mutex ion_regions_mutex;
 
-    // TEMP DIAG race-probe: records AP-side ION tensor accesses that happen
-    // while DSP work is in flight (pipeline_inflight > 0). Diagnostics only,
-    // no behavior change; remove after the pipeline race analysis is done.
-    struct race_rec {
-        char     name[40];
-        uint32_t ion_off;
-        uint32_t len;
-        uint32_t in_flight;
-        uint8_t  op;         // 0=set 1=memset 2=get 3=set_2d 4=get_2d
-    };
-    race_rec race_log[96];
-    std::atomic<int>      race_log_n{0};
-    std::atomic<int>      pipeline_inflight{0};  // submitted, not yet completed
-    std::atomic<uint64_t> sync_calls{0};         // pipeline_wait_idle calls
-    std::atomic<uint64_t> sync_waits{0};         // of which inflight was > 0
-
     void pipeline_start();
     void pipeline_wait_submit();       // main: block until this call's floor is free
     void pipeline_wait_idle();         // synchronize: block until queue empty && !busy
     void pipeline_worker_loop();       // worker: invoke + Phase 7.5 + Phase 8
-
-    // TEMP DIAG race-probe helper
-    void record_race(const char * name, uint32_t ion_off, uint32_t len, uint8_t op) {
-        if (pipeline_inflight.load(std::memory_order_relaxed) <= 0) return;
-        int n = race_log_n.fetch_add(1, std::memory_order_relaxed);
-        if (n >= 96) return;
-        race_rec & r = race_log[n];
-        strncpy(r.name, name, sizeof(r.name) - 1);
-        r.name[sizeof(r.name) - 1] = '\0';
-        r.ion_off = ion_off;
-        r.len = len;
-        r.in_flight = (uint32_t)pipeline_inflight.load(std::memory_order_relaxed);
-        r.op = op;
-    }
 
     ggml_backend_hexagon_context(int dev_id, ggml_backend_dev_t dev);
     ~ggml_backend_hexagon_context();
@@ -521,9 +490,10 @@ struct hexagon_appcfg_t {
                                 //   5/6/7 garble on the new matmul pipeline (81ff7abe5). Pair with
                                 //   dsp_cache_trace_bit0 to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
-    int pipeline_mode;          // 1=AP worker thread runs the sync FastRPC invoke so the next
-                                //   graph's AP prep overlaps DSP execution (default);
-                                // 0=fully synchronous graph_compute (baseline behavior)
+    int pipeline_mode;          // 0=fully synchronous graph_compute (default, baseline);
+                                // 1=AP worker thread runs the sync FastRPC invoke so the next
+                                //   graph's AP prep overlaps DSP execution (shelved, see
+                                //   docs/backend/jz-ggml-hexagon/pipeline-feature-garble-retrospective-20260719.md)
 
     const char * cfgfilename;
     const char * runtime_libpath;
@@ -545,7 +515,7 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit0   = 0,
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
-        .pipeline_mode          = 1,
+        .pipeline_mode          = 0,
         .cfgfilename            = "ggml-hexagon.cfg",
 #if defined(__ANDROID__)
         .runtime_libpath        = "/data/local/tmp/",
@@ -1120,7 +1090,7 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit0", g_hexagon_appcfg.dsp_cache_trace_bit0, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit1", g_hexagon_appcfg.dsp_cache_trace_bit1, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
-    hexagoncfg_instance.get_intvalue("cdsp", "pipeline_mode", g_hexagon_appcfg.pipeline_mode, 1);
+    hexagoncfg_instance.get_intvalue("cdsp", "pipeline_mode", g_hexagon_appcfg.pipeline_mode, 0);
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_types", g_hexagon_appcfg.enabled_types, "");
 
@@ -4496,7 +4466,6 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         const char * dp   = (const char *)tensor->data + offset;
         const char * base = (const char *)hctx->rpc_mempool;
         if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
-            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)size, 0); // TEMP DIAG
             if (is_repack) {
                 cpu_dcache_flush_range(hctx, hctx->rpc_mempool_handle,
                                        tensor->data, ggml_nbytes(tensor));
@@ -4520,7 +4489,6 @@ static void ggml_backend_hexagon_buffer_memset_tensor(ggml_backend_buffer_t buff
         const char * dp   = (const char *)tensor->data + offset;
         const char * base = (const char *)hctx->rpc_mempool;
         if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
-            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)size, 1); // TEMP DIAG
             hctx->weights_dirty = true;
         }
     }
@@ -4553,15 +4521,6 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         }
     }
     memcpy(data, (const char *)tensor->data + offset, size);
-    ggml_backend_hexagon_buffer_context * gctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
-    if (gctx && gctx->is_ion_buffer && gctx->backend_ctx) {
-        ggml_backend_hexagon_context * hctx = gctx->backend_ctx;
-        const char * dp   = (const char *)tensor->data + offset;
-        const char * base = (const char *)hctx->rpc_mempool;
-        if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
-            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)size, 2); // TEMP DIAG
-        }
-    }
     GGML_UNUSED(buffer);
 }
 
@@ -4584,30 +4543,14 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
     for (size_t copy = 0; copy < n_copies; copy++) {
         memcpy((char *)tensor->data + offset + copy * stride_tensor, (const char *)data + copy * stride_data, size);
     }
-    ggml_backend_hexagon_buffer_context * bctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
-    if (bctx && bctx->is_ion_buffer && bctx->backend_ctx) {
-        ggml_backend_hexagon_context * hctx = bctx->backend_ctx;
-        const char * dp   = (const char *)tensor->data + offset;
-        const char * base = (const char *)hctx->rpc_mempool;
-        if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
-            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)(size * n_copies), 3); // TEMP DIAG
-        }
-    }
+    GGML_UNUSED(buffer);
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     for (size_t copy = 0; copy < n_copies; copy++) {
         memcpy((char *)data + copy * stride_data, (const char *)tensor->data + offset + copy * stride_tensor, size);
     }
-    ggml_backend_hexagon_buffer_context * bctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
-    if (bctx && bctx->is_ion_buffer && bctx->backend_ctx) {
-        ggml_backend_hexagon_context * hctx = bctx->backend_ctx;
-        const char * dp   = (const char *)tensor->data + offset;
-        const char * base = (const char *)hctx->rpc_mempool;
-        if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
-            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)(size * n_copies), 4); // TEMP DIAG
-        }
-    }
+    GGML_UNUSED(buffer);
 }
 
 static ggml_backend_buffer_i ggml_backend_hexagon_buffer_interface = {
@@ -4895,20 +4838,6 @@ void ggml_backend_hexagon_context::pipeline_worker_loop() {
         const bool do_dc_cvac  = (g_hexagon_appcfg.ion_sync_mode != 1);
         const bool do_ion_sync = (g_hexagon_appcfg.ion_sync_mode != 2);
 
-        // Test D: floor offset diagnostic
-        {
-            uint32_t first_pm_off = task->pending_mirrors.empty() ? 0u : task->pending_mirrors[0].mirror_offset;
-            uint32_t first_pm_len = task->pending_mirrors.empty() ? 0u : task->pending_mirrors[0].copy_len;
-            uint64_t floor_abs = (uint64_t)rpc_mempool + this->pipeline_floor_base
-                               + (task->seq & 1) * this->pipeline_floor_size;
-            GGMLHEXAGON_LOG_ALWAYS("[FLOOR-CHECK-WORKER] seq=%lu floor_id=%lu pm_count=%u pm[0].off=0x%x pm[0].len=%u floor_abs=0x%llx",
-                                   (unsigned long)task->seq,
-                                   (unsigned long)(task->seq & 1),
-                                   (unsigned)task->pending_mirrors.size(),
-                                   first_pm_off, first_pm_len,
-                                   (unsigned long long)floor_abs);
-        }
-
         // ---- Phase 6.7: deferred heap->ION mirror copies ----
         // Sources come from the task-owned heap_snapshot (captured on the
         // main thread in Phase 6), never from live ggml heap tensors: the
@@ -5041,7 +4970,6 @@ void ggml_backend_hexagon_context::pipeline_worker_loop() {
             std::lock_guard<std::mutex> lock(pipeline_mutex);
             pipeline_busy     = false;
             pipeline_done_seq = task->seq;
-            pipeline_inflight.fetch_sub(1, std::memory_order_release); // TEMP DIAG
         }
         pipeline_cv.notify_all();
     }
@@ -5065,11 +4993,8 @@ void ggml_backend_hexagon_context::pipeline_wait_submit() {
         return;
     }
     std::unique_lock<std::mutex> lock(pipeline_mutex);
-    // TEMP DIAG depth-1 bisect: serialize submissions (no task overlap) to
-    // determine whether the garble comes from the worker machinery itself or
-    // from the 2-in-flight interaction. Revert to "<= 1" after the experiment.
     pipeline_cv.wait(lock, [&] {
-        return pipeline_queue.size() + (pipeline_busy ? 1 : 0) <= 0;
+        return pipeline_queue.size() + (pipeline_busy ? 1 : 0) <= 1;
     });
 }
 
@@ -5078,25 +5003,8 @@ void ggml_backend_hexagon_context::pipeline_wait_idle() {
     if (!pipeline_started) {
         return;
     }
-    sync_calls.fetch_add(1, std::memory_order_relaxed);
-    if (pipeline_inflight.load(std::memory_order_relaxed) > 0) {
-        sync_waits.fetch_add(1, std::memory_order_relaxed);
-    }
     std::unique_lock<std::mutex> lock(pipeline_mutex);
     pipeline_cv.wait(lock, [&] { return pipeline_queue.empty() && !pipeline_busy; });
-
-    // TEMP DIAG: dump race records once the pipeline is fully drained
-    int n = race_log_n.exchange(0, std::memory_order_relaxed);
-    if (n > 0) {
-        GGMLHEXAGON_LOG_ALWAYS("[RACE-PROBE] %d AP-side ION accesses while DSP in flight (sync_calls=%llu sync_waits=%llu):",
-                               n, (unsigned long long)sync_calls.load(), (unsigned long long)sync_waits.load());
-        const char * op_names[] = {"set", "memset", "get", "set_2d", "get_2d"};
-        for (int i = 0; i < n; i++) {
-            race_rec & r = race_log[i];
-            GGMLHEXAGON_LOG_ALWAYS("  [%02d] op=%s name=%s ion_off=0x%x len=%u in_flight=%u",
-                                   i, op_names[r.op], r.name, r.ion_off, r.len, r.in_flight);
-        }
-    }
 }
 
 // ION-based op-batch - packs all ops into ION shared memory,
@@ -6247,25 +6155,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         task->temp_region_indices = std::move(temp_region_indices);
         task->flush_ranges        = std::move(deferred_flush_ranges);
         ctx->pipeline_seq++;
-        // Test D: floor offset diagnostic (log BEFORE moving task into queue)
-        {
-            const auto & pm_ref = task->pending_mirrors;
-            uint32_t first_pm_off = pm_ref.empty() ? 0u : pm_ref[0].mirror_offset;
-            uint32_t first_pm_len = pm_ref.empty() ? 0u : pm_ref[0].copy_len;
-            uint64_t floor_abs = (uint64_t)ctx->rpc_mempool + ctx->pipeline_floor_base
-                               + (task->seq & 1) * ctx->pipeline_floor_size;
-            GGMLHEXAGON_LOG_ALWAYS("[FLOOR-CHECK-MAIN] seq=%lu floor_id=%lu pm_count=%u pm[0].off=0x%x pm[0].len=%u batch_off=0x%x floor_abs=0x%llx",
-                                   (unsigned long)task->seq,
-                                   (unsigned long)(task->seq & 1),
-                                   (unsigned)pm_ref.size(),
-                                   first_pm_off, first_pm_len,
-                                   batch_offset,
-                                   (unsigned long long)floor_abs);
-        }
         {
             std::lock_guard<std::mutex> lock(ctx->pipeline_mutex);
             ctx->pipeline_queue.push_back(std::move(task));
-            ctx->pipeline_inflight.fetch_add(1, std::memory_order_release); // TEMP DIAG
         }
         ctx->pipeline_cv.notify_one();
         // real p7/p75/p8 values are recorded by the worker thread
