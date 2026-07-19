@@ -76,8 +76,8 @@ HEXAGON_TOOLS_PATH=${HEXAGON_SDK_PATH}/tools/HEXAGON_Tools/${HEXAGON_TOOLS_VERSI
 HTP_ARCH_VERSION=v79
 HTP_ARCH_VERSION_a=V79
 #all DSP skel versions to build and deploy (AP-side lib built once with HTP_ARCH_VERSION, extra DSP skels built via make)
-HTP_ARCH_VERSIONS="v73 v75 v79 v81"
-#HTP_ARCH_VERSIONS="v79"
+#HTP_ARCH_VERSIONS="v73 v75 v79 v81"
+HTP_ARCH_VERSIONS="v79"
 
 ######## part-2: prompt and LLM models ########
 

@@ -28,6 +28,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <map>
 #include <set>
 #include <tuple>
@@ -199,6 +200,56 @@ struct ion_pool_region {
     size_t offset;      // byte offset from ION pool base
     size_t size;        // allocation size in bytes
     bool   in_use;      // true if currently allocated
+};
+
+// heap-tensor -> ION mirror record (file scope: shared by graph_compute_batch
+// and the pipeline worker task)
+struct ion_mirror {
+    int32_t  tensor_idx;
+    void *   original_data;
+    uint32_t mirror_offset;
+    uint32_t data_len;
+    // pipeline mode: worker-side deferred heap->ION copy descriptor.
+    // src_off is (group_base - tensor->data) where group_base is the unique
+    // heap pointer shared by aliasing tensors; copy_len is the group's
+    // max_data_len. copy_len == 0 means no deferred copy for this entry.
+    // snapshot_off >= 0 means the deferred source lives in the task's
+    // heap_snapshot buffer (decoupled from live heap lifetime), not at
+    // original_data + src_off.
+    uint32_t src_off;
+    uint32_t copy_len;
+    int32_t  snapshot_off;
+};
+
+// state handed from the main thread (Phases 1-6.5) to the pipeline worker
+// (FastRPC invoke + Phase 7.5 civac + Phase 8 copy-back + region free)
+struct hexagon_pipeline_task {
+    uint64_t seq = 0;
+    uint32_t batch_offset = 0;
+    uint32_t total_desc_size = 0;
+    uint32_t n_ops = 0;
+    uint32_t n_tensors = 0;
+    int      hist_slot = 0;
+    int64_t  t_p65_end = 0;             // main-side Phase 6.5 end timestamp
+    // on cgraph hit these point into the (immutable) cache entry; on miss
+    // they point at the owned vectors below (moved from the call's locals)
+    const std::vector<ggml_tensor *> * tensor_src = nullptr;
+    const std::vector<hex_op_desc>   * hex_ops = nullptr;
+    std::vector<ggml_tensor *> tensor_src_own;
+    std::vector<hex_op_desc>   hex_ops_own;
+    std::vector<int32_t>       mirror_offset;   // per-tensor ION mirror offset, -1 = none
+    std::vector<ion_mirror>    mirrors;
+    std::vector<ion_mirror>    pending_mirrors; // heap->ION copies deferred to the worker
+    // pipeline mode: heap snapshot decoupling. The main thread copies heap
+    // tensor data into this owned buffer in Phase 6; the worker reads from
+    // here (not from live ggml heap tensors) in Phase 6.7, eliminating the
+    // race where the main thread overwrites/frees the next token's inputs
+    // while the worker is still copying them into ION.
+    std::vector<char>          heap_snapshot;
+    std::vector<size_t>        temp_region_indices;
+    // merged ION [start,end) ranges from the main-side Phase 6.5 scan; the
+    // DC CVAC itself is deferred to the worker (see pipeline_worker_loop)
+    std::vector<std::pair<uint32_t, uint32_t>> flush_ranges;
 };
 
 struct ggml_backend_hexagon_context {
@@ -378,6 +429,63 @@ struct ggml_backend_hexagon_context {
     uint64_t cgraph_cache_hits   = 0;
     uint64_t cgraph_cache_misses = 0;
 
+    // ---- AP-side worker pipeline (hexagon_appcfg_t::pipeline_mode) ----
+    // A single worker thread runs the blocking FastRPC invoke + post-invoke
+    // cache maintenance + copy-back so the next graph's AP prep (Phases 1-6.5)
+    // overlaps DSP execution. FIFO order is preserved (one worker), and the
+    // ION pool temp area is split into 2 floors so at most 2 graphs can be
+    // in flight without overwriting each other's mirrors/descriptors.
+    std::thread                               pipeline_thread;
+    std::mutex                                pipeline_mutex;
+    std::condition_variable                   pipeline_cv;
+    std::deque<std::unique_ptr<hexagon_pipeline_task>> pipeline_queue;
+    uint64_t pipeline_seq      = 0;      // next task seq (main thread only)
+    uint64_t pipeline_done_seq = 0;      // all tasks <= this seq completed (FIFO)
+    bool     pipeline_busy       = false; // worker is executing a task
+    bool     pipeline_stop       = false;
+    bool     pipeline_started    = false;
+    bool     pipeline_floor_set  = false;
+    size_t   pipeline_floor_base = 0;    // ION offset where the temp floors start
+    size_t   pipeline_floor_size = 0;    // per-floor byte capacity
+    // guards ion_regions against concurrent main-thread push_back (Phase 4/5)
+    // and worker-thread in_use updates (end of task)
+    std::mutex ion_regions_mutex;
+
+    // TEMP DIAG race-probe: records AP-side ION tensor accesses that happen
+    // while DSP work is in flight (pipeline_inflight > 0). Diagnostics only,
+    // no behavior change; remove after the pipeline race analysis is done.
+    struct race_rec {
+        char     name[40];
+        uint32_t ion_off;
+        uint32_t len;
+        uint32_t in_flight;
+        uint8_t  op;         // 0=set 1=memset 2=get 3=set_2d 4=get_2d
+    };
+    race_rec race_log[96];
+    std::atomic<int>      race_log_n{0};
+    std::atomic<int>      pipeline_inflight{0};  // submitted, not yet completed
+    std::atomic<uint64_t> sync_calls{0};         // pipeline_wait_idle calls
+    std::atomic<uint64_t> sync_waits{0};         // of which inflight was > 0
+
+    void pipeline_start();
+    void pipeline_wait_submit();       // main: block until this call's floor is free
+    void pipeline_wait_idle();         // synchronize: block until queue empty && !busy
+    void pipeline_worker_loop();       // worker: invoke + Phase 7.5 + Phase 8
+
+    // TEMP DIAG race-probe helper
+    void record_race(const char * name, uint32_t ion_off, uint32_t len, uint8_t op) {
+        if (pipeline_inflight.load(std::memory_order_relaxed) <= 0) return;
+        int n = race_log_n.fetch_add(1, std::memory_order_relaxed);
+        if (n >= 96) return;
+        race_rec & r = race_log[n];
+        strncpy(r.name, name, sizeof(r.name) - 1);
+        r.name[sizeof(r.name) - 1] = '\0';
+        r.ion_off = ion_off;
+        r.len = len;
+        r.in_flight = (uint32_t)pipeline_inflight.load(std::memory_order_relaxed);
+        r.op = op;
+    }
+
     ggml_backend_hexagon_context(int dev_id, ggml_backend_dev_t dev);
     ~ggml_backend_hexagon_context();
 };
@@ -413,6 +521,9 @@ struct hexagon_appcfg_t {
                                 //   5/6/7 garble on the new matmul pipeline (81ff7abe5). Pair with
                                 //   dsp_cache_trace_bit0 to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
+    int pipeline_mode;          // 1=AP worker thread runs the sync FastRPC invoke so the next
+                                //   graph's AP prep overlaps DSP execution (default);
+                                // 0=fully synchronous graph_compute (baseline behavior)
 
     const char * cfgfilename;
     const char * runtime_libpath;
@@ -434,6 +545,7 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit0   = 0,
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
+        .pipeline_mode          = 1,
         .cfgfilename            = "ggml-hexagon.cfg",
 #if defined(__ANDROID__)
         .runtime_libpath        = "/data/local/tmp/",
@@ -609,6 +721,7 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     GGMLHEXAGON_LOG_VERBOSE("thread_counts on CDSP:            %d", g_hexagon_appcfg.thread_counts);
     GGMLHEXAGON_LOG_VERBOSE("ion_sync_mode:                    %d", g_hexagon_appcfg.ion_sync_mode);
     GGMLHEXAGON_LOG_VERBOSE("rpc_mmap_mode:                    %d", g_hexagon_appcfg.rpc_mmap_mode);
+    GGMLHEXAGON_LOG_VERBOSE("pipeline_mode:                    %d", g_hexagon_appcfg.pipeline_mode);
     GGMLHEXAGON_LOG_VERBOSE("dsp_cache_mode:                   %d", g_hexagon_appcfg.dsp_cache_mode);
     GGMLHEXAGON_LOG_VERBOSE("dsp_cache_trace_bit0:             %d", g_hexagon_appcfg.dsp_cache_trace_bit0);
     GGMLHEXAGON_LOG_VERBOSE("dsp_cache_trace_bit1:             %d", g_hexagon_appcfg.dsp_cache_trace_bit1);
@@ -1007,6 +1120,7 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit0", g_hexagon_appcfg.dsp_cache_trace_bit0, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit1", g_hexagon_appcfg.dsp_cache_trace_bit1, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
+    hexagoncfg_instance.get_intvalue("cdsp", "pipeline_mode", g_hexagon_appcfg.pipeline_mode, 1);
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_types", g_hexagon_appcfg.enabled_types, "");
 
@@ -3153,6 +3267,16 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
 }
 
 ggml_backend_hexagon_context::~ggml_backend_hexagon_context() {
+    // stop the AP worker before deinit_cdsp closes the DSP session handle
+    if (pipeline_started) {
+        {
+            std::lock_guard<std::mutex> lock(pipeline_mutex);
+            pipeline_stop = true;
+        }
+        pipeline_cv.notify_all();
+        pipeline_thread.join();
+        pipeline_started = false;
+    }
     ggmlhexagon_deinit_cdsp(this);
     ggmlhexagon_print_running_timestamp(NULL);
 }
@@ -4372,6 +4496,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         const char * dp   = (const char *)tensor->data + offset;
         const char * base = (const char *)hctx->rpc_mempool;
         if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
+            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)size, 0); // TEMP DIAG
             if (is_repack) {
                 cpu_dcache_flush_range(hctx, hctx->rpc_mempool_handle,
                                        tensor->data, ggml_nbytes(tensor));
@@ -4395,6 +4520,7 @@ static void ggml_backend_hexagon_buffer_memset_tensor(ggml_backend_buffer_t buff
         const char * dp   = (const char *)tensor->data + offset;
         const char * base = (const char *)hctx->rpc_mempool;
         if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
+            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)size, 1); // TEMP DIAG
             hctx->weights_dirty = true;
         }
     }
@@ -4427,6 +4553,15 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         }
     }
     memcpy(data, (const char *)tensor->data + offset, size);
+    ggml_backend_hexagon_buffer_context * gctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
+    if (gctx && gctx->is_ion_buffer && gctx->backend_ctx) {
+        ggml_backend_hexagon_context * hctx = gctx->backend_ctx;
+        const char * dp   = (const char *)tensor->data + offset;
+        const char * base = (const char *)hctx->rpc_mempool;
+        if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
+            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)size, 2); // TEMP DIAG
+        }
+    }
     GGML_UNUSED(buffer);
 }
 
@@ -4446,16 +4581,32 @@ static void ggml_backend_hexagon_buffer_clear(ggml_backend_buffer_t buffer, uint
 }
 
 static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    GGML_UNUSED(buffer);
     for (size_t copy = 0; copy < n_copies; copy++) {
         memcpy((char *)tensor->data + offset + copy * stride_tensor, (const char *)data + copy * stride_data, size);
+    }
+    ggml_backend_hexagon_buffer_context * bctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
+    if (bctx && bctx->is_ion_buffer && bctx->backend_ctx) {
+        ggml_backend_hexagon_context * hctx = bctx->backend_ctx;
+        const char * dp   = (const char *)tensor->data + offset;
+        const char * base = (const char *)hctx->rpc_mempool;
+        if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
+            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)(size * n_copies), 3); // TEMP DIAG
+        }
     }
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    GGML_UNUSED(buffer);
     for (size_t copy = 0; copy < n_copies; copy++) {
         memcpy((char *)data + copy * stride_data, (const char *)tensor->data + offset + copy * stride_tensor, size);
+    }
+    ggml_backend_hexagon_buffer_context * bctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
+    if (bctx && bctx->is_ion_buffer && bctx->backend_ctx) {
+        ggml_backend_hexagon_context * hctx = bctx->backend_ctx;
+        const char * dp   = (const char *)tensor->data + offset;
+        const char * base = (const char *)hctx->rpc_mempool;
+        if (dp >= base && dp < base + (ptrdiff_t)hctx->rpc_mempool_len) {
+            hctx->record_race(tensor->name, (uint32_t)(dp - base), (uint32_t)(size * n_copies), 4); // TEMP DIAG
+        }
     }
 }
 
@@ -4713,6 +4864,241 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
     GGMLHEXAGON_LOG_DEBUG("leave %s", __func__ );
 }
 
+// ---- pipeline worker (pipeline_mode) ----
+// Runs on a dedicated AP thread. Executes the blocking FastRPC invoke and all
+// post-invoke work (Phase 7.5 civac, Phase 8 copy-back, temp region free) so
+// the main thread can return to the scheduler and prepare the next graph
+// while the DSP is still busy with the current one.
+void ggml_backend_hexagon_context::pipeline_worker_loop() {
+    for (;;) {
+        std::unique_ptr<hexagon_pipeline_task> task;
+        {
+            std::unique_lock<std::mutex> lock(pipeline_mutex);
+            pipeline_cv.wait(lock, [&] { return pipeline_stop || !pipeline_queue.empty(); });
+            if (pipeline_stop && pipeline_queue.empty()) {
+                return;
+            }
+            task = std::move(pipeline_queue.front());
+            pipeline_queue.pop_front();
+            pipeline_busy = true;
+        }
+
+        const char * ion_base = (const char *)rpc_mempool;
+        const size_t ion_size = rpc_mempool_len;
+        const uint32_t n_ops     = task->n_ops;
+        const uint32_t n_tensors = task->n_tensors;
+        const std::vector<ggml_tensor *> & tensor_src = *task->tensor_src;
+        const std::vector<hex_op_desc>   & hex_ops    = *task->hex_ops;
+        const int hidx = task->hist_slot;
+
+        // same ion_sync_mode decoding as the main-side Phase 6.5
+        const bool do_dc_cvac  = (g_hexagon_appcfg.ion_sync_mode != 1);
+        const bool do_ion_sync = (g_hexagon_appcfg.ion_sync_mode != 2);
+
+        // Test D: floor offset diagnostic
+        {
+            uint32_t first_pm_off = task->pending_mirrors.empty() ? 0u : task->pending_mirrors[0].mirror_offset;
+            uint32_t first_pm_len = task->pending_mirrors.empty() ? 0u : task->pending_mirrors[0].copy_len;
+            uint64_t floor_abs = (uint64_t)rpc_mempool + this->pipeline_floor_base
+                               + (task->seq & 1) * this->pipeline_floor_size;
+            GGMLHEXAGON_LOG_ALWAYS("[FLOOR-CHECK-WORKER] seq=%lu floor_id=%lu pm_count=%u pm[0].off=0x%x pm[0].len=%u floor_abs=0x%llx",
+                                   (unsigned long)task->seq,
+                                   (unsigned long)(task->seq & 1),
+                                   (unsigned)task->pending_mirrors.size(),
+                                   first_pm_off, first_pm_len,
+                                   (unsigned long long)floor_abs);
+        }
+
+        // ---- Phase 6.7: deferred heap->ION mirror copies ----
+        // Sources come from the task-owned heap_snapshot (captured on the
+        // main thread in Phase 6), never from live ggml heap tensors: the
+        // main thread may already be overwriting/freeing the next graph's
+        // inputs while this copy runs.
+        for (const auto & pm : task->pending_mirrors) {
+            const char * src = (pm.snapshot_off >= 0)
+                ? task->heap_snapshot.data() + pm.snapshot_off
+                : (const char *)pm.original_data + pm.src_off;
+            memcpy((char *)rpc_mempool + pm.mirror_offset, src, pm.copy_len);
+        }
+
+        // Phase 6.5, deferred from the main thread: it only computed the
+        // dirty ranges (pure software); all cache maintenance runs here,
+        // serialized after the previous task's invoke, so it cannot race
+        // in-flight DSP DMA on the other ION floor. The pending-mirror
+        // flush covers the Phase 6.7 copies above (their bytes were still
+        // in AP cache when the main-side ranges were computed).
+        if (do_dc_cvac) {
+            for (const auto & r : task->flush_ranges) {
+                cpu_dcache_flush_range(this, 0, (char *)rpc_mempool + r.first, r.second - r.first);
+            }
+            for (const auto & pm : task->pending_mirrors) {
+                cpu_dcache_flush_range(this, 0, (char *)rpc_mempool + pm.mirror_offset, pm.copy_len);
+            }
+        }
+        if (do_ion_sync && rpc_mempool_handle > 0) {
+            // WRITE-direction whole-pool sync (clean/writeback only, never
+            // discards): safe for the other floor the main thread is writing,
+            // and required - without it the DSP reads stale descriptor/mirror
+            // bytes still sitting in AP cache (ion_sync_mode=1 skips DC CVAC).
+            ion_sync_for_direction(rpc_mempool_handle, 1);
+        }
+
+        // ---- Phase 7: blocking FastRPC invoke ----
+        int64_t t_p7_pre = ggml_time_us();
+        int hexagon_error = ggml_dsp_execute_batch(ggmlop_handle, task->batch_offset, task->total_desc_size);
+        int64_t t_p7_post = ggml_time_us();
+        if (AEE_SUCCESS != hexagon_error) {
+            GGMLHEXAGON_LOG_WARN("pipeline: ggml_dsp_execute_batch failed: 0x%x", hexagon_error);
+        }
+        int64_t t_p7 = t_p7_post - t_p7_pre;
+        cumulative_p7_us        += t_p7;
+        p7_hist[hidx]            = t_p7;
+        cum_p7_dsp_exec_us      += t_p7;
+        p7_dsp_exec_hist[hidx]   = t_p7;
+        // includes worker queue latency on top of the old AP-side setup cost
+        int64_t p7_rpc_setup = t_p7_pre - task->t_p65_end;
+        cum_p7_rpc_setup_us     += p7_rpc_setup;
+        p7_rpc_setup_hist[hidx]  = p7_rpc_setup;
+        if (min_p7_us == 0 || t_p7 < min_p7_us) min_p7_us = t_p7;
+        if (t_p7 > max_p7_us)                   max_p7_us = t_p7;
+
+        // ---- Phase 7.5: invalidate CPU cache for DSP-written ION regions ----
+        int64_t t_civac = ggml_time_us();
+        if (hexagon_error == AEE_SUCCESS) {
+            // no whole-pool READ invalidate (ion_sync_for_direction(fd, 0)):
+            // it discards AP dirty lines without writeback, including the next
+            // task's descriptors the main thread is writing on the other ION
+            // floor right now; the DSP would execute stale descriptor bytes.
+            // Invalidate only what the AP reads after this task:
+            //   (a) mirror regions - read by the Phase 8 copy-back below;
+            //   (b) all ION-resident dst tensors - a split output may still be
+            //       used as a src inside this batch, so no leaf filter: the AP
+            //       can read any dst via get_tensor (split copies, logits).
+            uint32_t inval_bytes = 0;
+            for (const auto & m : task->mirrors) {
+                uint32_t start = m.mirror_offset & ~63u;
+                uint32_t end   = (m.mirror_offset + m.data_len + 63u) & ~63u;
+                cpu_dcache_inval_range(this, 0, (const char *)rpc_mempool + start, end - start);
+                inval_bytes += end - start;
+            }
+            {
+                for (uint32_t oi = 0; oi < n_ops; oi++) {
+                    uint32_t dst_idx = hex_ops[oi].dst_idx[0];
+                    if (dst_idx >= n_tensors) continue;
+                    ggml_tensor * dst_t = tensor_src[dst_idx];
+                    if (!dst_t || !dst_t->data) continue;
+                    const char * dp = (const char *)dst_t->data;
+                    if (dp < ion_base || dp >= ion_base + (ptrdiff_t)ion_size) continue;
+                    uint32_t dst_off = (uint32_t)(dp - ion_base);
+                    uint32_t dst_len = (uint32_t)ggml_nbytes(dst_t);
+                    uint32_t start   = dst_off & ~63u;
+                    uint32_t end     = (dst_off + dst_len + 63u) & ~63u;
+                    cpu_dcache_inval_range(this, 0, (const char *)rpc_mempool + start, end - start);
+                    inval_bytes += end - start;
+                }
+            }
+            GGMLHEXAGON_LOG_DEBUG("pipeline: phase7.5 targeted DC CIVAC (%u bytes)", inval_bytes);
+        }
+        {
+            int64_t civac_us = ggml_time_us() - t_civac;
+            cum_p7_civac_us     += civac_us;
+            p7_civac_hist[hidx]  = civac_us;
+        }
+
+        // ---- Phase 8: copy-back mirrored results to heap ----
+        int64_t t_p8_pre = ggml_time_us();
+        if (hexagon_error == AEE_SUCCESS && !task->mirrors.empty()) {
+            std::unordered_map<void *, std::pair<uint32_t, uint32_t>> copyback_map;
+            for (const auto & m : task->mirrors) {
+                auto it = copyback_map.find(m.original_data);
+                if (it == copyback_map.end()) {
+                    copyback_map[m.original_data] = {m.mirror_offset, m.data_len};
+                } else {
+                    if (m.data_len > it->second.second) {
+                        it->second.second = m.data_len;
+                    }
+                }
+            }
+            for (const auto & kv : copyback_map) {
+                memcpy(kv.first, (const char *)rpc_mempool + kv.second.first, kv.second.second);
+            }
+        }
+        {
+            int64_t t_p8 = ggml_time_us() - t_p8_pre;
+            cum_p8_us     += t_p8;
+            p8_hist[hidx]  = t_p8;
+        }
+
+        // free this task's temporary ION regions (mirrors, batch descriptor)
+        {
+            std::lock_guard<std::mutex> regions_lock(ion_regions_mutex);
+            for (size_t ri : task->temp_region_indices) {
+                ion_regions[ri].in_use = false;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(pipeline_mutex);
+            pipeline_busy     = false;
+            pipeline_done_seq = task->seq;
+            pipeline_inflight.fetch_sub(1, std::memory_order_release); // TEMP DIAG
+        }
+        pipeline_cv.notify_all();
+    }
+}
+
+void ggml_backend_hexagon_context::pipeline_start() {
+    if (pipeline_started) {
+        return;
+    }
+    pipeline_stop = false;
+    pipeline_thread = std::thread(&ggml_backend_hexagon_context::pipeline_worker_loop, this);
+    pipeline_started = true;
+    GGMLHEXAGON_LOG_ALWAYS("[PIPELINE] AP worker thread started (2 ION floors, overlap AP prep with DSP exec)");
+}
+
+// main thread: before preparing graph with seq S, wait until the worker has
+// completed task S-2 so this call's ION floor (parity of S) is no longer in use
+void ggml_backend_hexagon_context::pipeline_wait_submit() {
+    const uint64_t S = pipeline_seq;
+    if (S < 2) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(pipeline_mutex);
+    // TEMP DIAG depth-1 bisect: serialize submissions (no task overlap) to
+    // determine whether the garble comes from the worker machinery itself or
+    // from the 2-in-flight interaction. Revert to "<= 1" after the experiment.
+    pipeline_cv.wait(lock, [&] {
+        return pipeline_queue.size() + (pipeline_busy ? 1 : 0) <= 0;
+    });
+}
+
+// ggml_backend synchronize iface: drain all outstanding DSP work
+void ggml_backend_hexagon_context::pipeline_wait_idle() {
+    if (!pipeline_started) {
+        return;
+    }
+    sync_calls.fetch_add(1, std::memory_order_relaxed);
+    if (pipeline_inflight.load(std::memory_order_relaxed) > 0) {
+        sync_waits.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::unique_lock<std::mutex> lock(pipeline_mutex);
+    pipeline_cv.wait(lock, [&] { return pipeline_queue.empty() && !pipeline_busy; });
+
+    // TEMP DIAG: dump race records once the pipeline is fully drained
+    int n = race_log_n.exchange(0, std::memory_order_relaxed);
+    if (n > 0) {
+        GGMLHEXAGON_LOG_ALWAYS("[RACE-PROBE] %d AP-side ION accesses while DSP in flight (sync_calls=%llu sync_waits=%llu):",
+                               n, (unsigned long long)sync_calls.load(), (unsigned long long)sync_waits.load());
+        const char * op_names[] = {"set", "memset", "get", "set_2d", "get_2d"};
+        for (int i = 0; i < n; i++) {
+            race_rec & r = race_log[i];
+            GGMLHEXAGON_LOG_ALWAYS("  [%02d] op=%s name=%s ion_off=0x%x len=%u in_flight=%u",
+                                   i, op_names[r.op], r.name, r.ion_off, r.len, r.in_flight);
+        }
+    }
+}
+
 // ION-based op-batch - packs all ops into ION shared memory,
 // passes only (offset, size) via FastRPC as doorbell.
 // avoids FastRPC scatter-gather limits entirely.
@@ -4767,6 +5153,27 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     if (!ctx->rpc_mempool || ctx->rpc_mempool_len == 0) {
         GGMLHEXAGON_LOG_WARN("special: no ION mempool, falling back to per-op");
         return result;  // let scheduler use per-op path
+    }
+
+    // pipeline mode: an AP worker thread runs the blocking FastRPC invoke and
+    // the post-invoke phases, so this call returns right after Phase 6.5 and
+    // the next graph's AP prep overlaps DSP execution. The ION temp area is
+    // split into 2 floors (selected by call-seq parity) so the in-flight
+    // graph's mirrors/descriptors are never overwritten by the next graph.
+    const bool use_pipeline = (g_hexagon_appcfg.pipeline_mode != 0);
+    if (use_pipeline) {
+        ctx->pipeline_start();       // no-op after the first call
+        ctx->pipeline_wait_submit(); // wait until this call's floor is free
+        if (!ctx->pipeline_floor_set) {
+            ctx->pipeline_floor_base = ctx->rpc_mempool_usage;
+            ctx->pipeline_floor_size = (ctx->rpc_mempool_len - ctx->rpc_mempool_usage) / 2;
+            ctx->pipeline_floor_set  = true;
+            GGMLHEXAGON_LOG_ALWAYS("[PIPELINE] ION floors: base=%zu floor_size=%zu MB",
+                                   ctx->pipeline_floor_base, ctx->pipeline_floor_size / (1024 * 1024));
+        }
+        ctx->rpc_mempool_usage = ctx->pipeline_floor_base
+                               + (ctx->pipeline_seq & 1) * ctx->pipeline_floor_size;
+        saved_mempool_usage  = ctx->rpc_mempool_usage;
     }
 
     const char * ion_base = (const char *)ctx->rpc_mempool;
@@ -5325,13 +5732,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // data. Fix: allocate a separate dst mirror for in-place ops so that
     // Phase 6.5 only flushes the src0 mirror, and the dst mirror is never
     // flushed (CPU cache has no stale data for it).
-    struct ion_mirror {
-        int32_t  tensor_idx;
-        void *   original_data;
-        uint32_t mirror_offset;
-        uint32_t data_len;
-    };
     std::vector<ion_mirror> mirrors;
+    std::vector<ion_mirror> pending_mirrors;   // pipeline mode: deferred heap->ION copies
+    std::vector<char> heap_snapshot;           // pipeline mode: owned copy of deferred mirror sources
 
     // Step 1: Collect unique data pointers and max sizes
     struct buffer_mirror_info {
@@ -5389,10 +5792,20 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         mirror_region.offset = aligned_offset;
         mirror_region.size   = mirror_size;
         mirror_region.in_use = true;
-        ctx->ion_regions.push_back(mirror_region);
-        temp_region_indices.push_back(ctx->ion_regions.size() - 1);
+        {
+            // pipeline mode: the worker frees regions concurrently
+            std::lock_guard<std::mutex> regions_lock(ctx->ion_regions_mutex);
+            ctx->ion_regions.push_back(mirror_region);
+            temp_region_indices.push_back(ctx->ion_regions.size() - 1);
+        }
 
-        memcpy(ion_buf, data_ptr, mirror_size);
+        if (!use_pipeline) {
+            memcpy(ion_buf, data_ptr, mirror_size);
+        }
+        // pipeline mode: defer the heap->ION copy to the worker (pending_mirrors)
+        // so every heap-tensor access is serialized on one thread. A copy here
+        // on the main thread raced with the previous task's Phase 8 copy-back
+        // on the same tensor (mirror read vs copy-back write -> torn data).
 
         info.mirror_offset = moff;
         info.allocated = true;
@@ -5422,6 +5835,21 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         m.original_data = t->data;
         m.mirror_offset = it->second.mirror_offset;
         m.data_len      = (uint32_t)ggml_nbytes(t);
+        m.src_off       = (uint32_t)((const char *)it->first - (const char *)t->data);
+        m.copy_len      = 0;
+        m.snapshot_off  = -1;
+        if (use_pipeline) {
+            m.copy_len = it->second.max_data_len;
+            // defer the heap->ION copy to the worker (Phase 6.7), which reads
+            // the live heap tensor directly. The worker is FIFO-serialized, so
+            // the previous task's Phase 8 copy-back (heap write) always runs
+            // before this task's Phase 6.7 (heap read): no main-thread heap
+            // access here means no read/write race on shared heap tensors.
+            // (A main-thread snapshot here raced with the worker's Phase 8
+            // copy-back and re-introduced the garble it was meant to fix.)
+            m.snapshot_off = -1;
+            pending_mirrors.push_back(m);
+        }
         mirrors.push_back(m);
     }
 
@@ -5494,6 +5922,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         GGMLHEXAGON_LOG_ERROR("ion-batch: mempool full for batch desc (%zu bytes at offset %zu)",
                               total_desc_size, batch_offset_aligned);
         // Free temporary mirror regions before returning
+        std::lock_guard<std::mutex> regions_lock(ctx->ion_regions_mutex);
         for (size_t ri : temp_region_indices) {
             ctx->ion_regions[ri].in_use = false;
         }
@@ -5507,8 +5936,12 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     batch_region.offset = batch_offset_aligned;
     batch_region.size   = total_desc_size;
     batch_region.in_use = true;
-    ctx->ion_regions.push_back(batch_region);
-    temp_region_indices.push_back(ctx->ion_regions.size() - 1);
+    {
+        // pipeline mode: the worker frees regions concurrently
+        std::lock_guard<std::mutex> regions_lock(ctx->ion_regions_mutex);
+        ctx->ion_regions.push_back(batch_region);
+        temp_region_indices.push_back(ctx->ion_regions.size() - 1);
+    }
 
     t_p5 = t_prev; t_prev = ggml_time_us(); ctx->cum_p5_us += t_prev - t_p5;
     PERF_RECORD(t_prev - t_p5, ctx->p5_hist);
@@ -5632,6 +6065,11 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     t_p6 = ggml_time_us() - t_prev; t_prev = ggml_time_us();
     PERF_RECORD(t_p6, ctx->p6_hist);
     // Flush CPU cache to DRAM so DSP can read AP-written data.
+    // Pipeline mode: the main thread only computes the dirty ranges (pure
+    // software, no cache maintenance); the DC CVAC / ion_sync itself runs on
+    // the worker, serialized after the previous task's DSP execution, so it
+    // cannot race in-flight DSP DMA on the other ION floor.
+    std::vector<std::pair<uint32_t, uint32_t>> deferred_flush_ranges;
     {
         // Collect per-tensor dirty ranges and flush them individually (merged).
         // A single continuous [min, max] range would also flush the holes
@@ -5655,7 +6093,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         // for the whole ION pool. The scan work is pure overhead in this
         // mode (the collected ranges are never used to drive a DC CVAC).
         if (!do_dc_cvac) {
-            if (do_ion_sync) {
+            // pipeline: ion_sync deferred to the worker (see above)
+            if (do_ion_sync && !use_pipeline) {
                 int ion_fd = ctx->rpc_mempool_handle;
                 if (ion_fd > 0) ion_sync_for_direction(ion_fd, 1);
             }
@@ -5721,7 +6160,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
         uint32_t flush_bytes = 0;
         uint32_t n_flush     = 0;
-        if (do_dc_cvac && !ranges.empty()) {
+        if (!ranges.empty()) {
             std::sort(ranges.begin(), ranges.end());
             // Merge overlapping/adjacent ranges. Merge gap = 1 cache line (64B):
             // flushing a tiny gap is cheaper than issuing a second flush call.
@@ -5732,21 +6171,30 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 if (ranges[i].first <= cur_end + merge_gap) {
                     if (ranges[i].second > cur_end) cur_end = ranges[i].second;
                 } else {
-                    cpu_dcache_flush_range(ctx, 0,
-                        (char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
+                    if (use_pipeline) {
+                        deferred_flush_ranges.push_back({cur_start, cur_end});
+                    } else {
+                        cpu_dcache_flush_range(ctx, 0,
+                            (char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
+                    }
                     flush_bytes += cur_end - cur_start;
                     n_flush++;
                     cur_start = ranges[i].first;
                     cur_end   = ranges[i].second;
                 }
             }
-            cpu_dcache_flush_range(ctx, 0,
-                (char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
+            if (use_pipeline) {
+                deferred_flush_ranges.push_back({cur_start, cur_end});
+            } else {
+                cpu_dcache_flush_range(ctx, 0,
+                    (char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
+            }
             flush_bytes += cur_end - cur_start;
             n_flush++;
         }
         // Also try DMA_BUF_IOCTL_SYNC as extra safeguard
-        if (do_ion_sync) {
+        // (pipeline: ion_sync deferred to the worker, see above)
+        if (do_ion_sync && !use_pipeline) {
             int ion_fd = ctx->rpc_mempool_handle;
             if (ion_fd > 0) ion_sync_for_direction(ion_fd, 1);
         }
@@ -5771,8 +6219,61 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // n_ops_hist: record at FastRPC dispatch time (most relevant for p7 breakdown)
     ctx->n_ops_hist[ctx->perf_hist_idx] = (int32_t)n_ops;
 
+    int hexagon_error = AEE_SUCCESS;
+    if (use_pipeline) {
+        // hand the blocking invoke + post-invoke phases (7/7.5/8) to the
+        // worker thread; the main thread falls through to the tail accounting
+        // and returns, so the scheduler can prepare the next graph while the
+        // DSP is still executing this one.
+        auto task = std::make_unique<hexagon_pipeline_task>();
+        task->seq             = ctx->pipeline_seq;
+        task->batch_offset    = batch_offset;
+        task->total_desc_size = total_desc_size;
+        task->n_ops           = n_ops;
+        task->n_tensors       = n_tensors;
+        task->hist_slot       = ctx->perf_hist_idx;
+        task->t_p65_end       = t_prev;
+        // always take owned copies: a cache-miss insert on the next call can
+        // rehash cgraph_cache and invalidate references held by this in-flight
+        // task (worker would read dangling descriptor vectors)
+        task->tensor_src_own = tensor_src;
+        task->hex_ops_own    = hex_ops;
+        task->tensor_src     = &task->tensor_src_own;
+        task->hex_ops        = &task->hex_ops_own;
+        task->mirror_offset       = std::move(local_mirror_offset);
+        task->mirrors             = std::move(mirrors);
+        task->pending_mirrors     = std::move(pending_mirrors);
+        task->heap_snapshot       = std::move(heap_snapshot);
+        task->temp_region_indices = std::move(temp_region_indices);
+        task->flush_ranges        = std::move(deferred_flush_ranges);
+        ctx->pipeline_seq++;
+        // Test D: floor offset diagnostic (log BEFORE moving task into queue)
+        {
+            const auto & pm_ref = task->pending_mirrors;
+            uint32_t first_pm_off = pm_ref.empty() ? 0u : pm_ref[0].mirror_offset;
+            uint32_t first_pm_len = pm_ref.empty() ? 0u : pm_ref[0].copy_len;
+            uint64_t floor_abs = (uint64_t)ctx->rpc_mempool + ctx->pipeline_floor_base
+                               + (task->seq & 1) * ctx->pipeline_floor_size;
+            GGMLHEXAGON_LOG_ALWAYS("[FLOOR-CHECK-MAIN] seq=%lu floor_id=%lu pm_count=%u pm[0].off=0x%x pm[0].len=%u batch_off=0x%x floor_abs=0x%llx",
+                                   (unsigned long)task->seq,
+                                   (unsigned long)(task->seq & 1),
+                                   (unsigned)pm_ref.size(),
+                                   first_pm_off, first_pm_len,
+                                   batch_offset,
+                                   (unsigned long long)floor_abs);
+        }
+        {
+            std::lock_guard<std::mutex> lock(ctx->pipeline_mutex);
+            ctx->pipeline_queue.push_back(std::move(task));
+            ctx->pipeline_inflight.fetch_add(1, std::memory_order_release); // TEMP DIAG
+        }
+        ctx->pipeline_cv.notify_one();
+        // real p7/p75/p8 values are recorded by the worker thread
+        t_p7 = 0; t_p75 = 0; t_p8 = 0;
+    } else {
+
     int64_t t_p7_pre = ggml_time_us();
-    int hexagon_error = ggml_dsp_execute_batch(ctx->ggmlop_handle, batch_offset, total_desc_size);
+    hexagon_error = ggml_dsp_execute_batch(ctx->ggmlop_handle, batch_offset, total_desc_size);
     int64_t t_p7_post = ggml_time_us();
 
     if (AEE_SUCCESS != hexagon_error) {
@@ -5927,8 +6428,13 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     for (size_t ri : temp_region_indices) {
         ctx->ion_regions[ri].in_use = false;
     }
-    t_p8 = ggml_time_us() - t_prev;
-    PERF_RECORD(t_p8, ctx->p8_hist);
+    }  // end else (synchronous path)
+
+    // worker thread records the real p8 in pipeline mode
+    if (!use_pipeline) {
+        t_p8 = ggml_time_us() - t_prev;
+        PERF_RECORD(t_p8, ctx->p8_hist);
+    }
     int64_t end_time = ggml_time_us();
     int64_t graph_dur = end_time - begin_time;
     // (cumulative_p7_us is already updated at the end of the Phase 7 invoke()
@@ -5975,7 +6481,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     ctx->cum_p6_us  += t_p6;
     ctx->cum_p65_us += t_p65;
     ctx->cum_p8_us  += t_p8;
-    // per-call min/max
+    // per-call min/max (worker thread tracks the real p7 in pipeline mode)
+    if (!use_pipeline) {
     if (ctx->min_p7_us == 0 || t_p7 < ctx->min_p7_us)    ctx->min_p7_us = t_p7;
     if (t_p7 > ctx->max_p7_us)                            ctx->max_p7_us = t_p7;
     {
@@ -5988,6 +6495,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             ctx->max_rpc_overhead_us = rpc_overhead;
         }
         ctx->sum_rpc_overhead_us += rpc_overhead;
+    }
     }
     if (ctx->min_graph_us == 0 || graph_dur < ctx->min_graph_us) ctx->min_graph_us = graph_dur;
     if (graph_dur > ctx->max_graph_us) {
@@ -6316,6 +6824,13 @@ static struct ggml_backend_device_i ggml_backend_hexagon_device_interface = {
         /* .event_synchronize    = */ nullptr,
 };
 
+// llama.cpp / ggml sched call ggml_backend_synchronize before reading output
+// tensors or copying across backends; it must drain all outstanding DSP work.
+static void ggmlhexagon_backend_synchronize(ggml_backend_t backend) {
+    ggml_backend_hexagon_context * ctx = (ggml_backend_hexagon_context *)backend->context;
+    ctx->pipeline_wait_idle();
+}
+
 static ggml_backend_i ggml_backend_hexagon_interface = {
         /* .get_name                = */ ggml_backend_hexagon_name,
         /* .free                    = */ ggml_backend_hexagon_free,
@@ -6324,7 +6839,7 @@ static ggml_backend_i ggml_backend_hexagon_interface = {
         /* .set_tensor_2d_async     = */ nullptr,
         /* .get_tensor_2d_async     = */ nullptr,
         /* .cpy_tensor_async        = */ nullptr,
-        /* .synchronize             = */ nullptr,
+        /* .synchronize             = */ ggmlhexagon_backend_synchronize,
         /* .graph_plan_create       = */ nullptr,
         /* .graph_plan_free         = */ nullptr,
         /* .graph_plan_update       = */ nullptr,
