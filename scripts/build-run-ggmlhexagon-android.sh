@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
 #
-# This single-source file is part of JZ's ggml-hexagon.
-# 2024--2026 The ggml authors
-# GitHub:  https://github.com/zhouwg/ggml-hexagon
-# Any copies or derivative works of this file shall preserve the above attribution information,
-# including the copyright notice and the GitHub repository URL.
-#
 # this script will setup local dev envs automatically and docker is not needed for purpose of simplify workflow.
 #
 # this script is AI Agent friendly and verified with Trae AI Agent.
@@ -26,7 +20,6 @@ PROJECT_HOME_PATH=`pwd`
 PROJECT_ROOT_PATH=${PROJECT_HOME_PATH}
 HOST_CPU_COUNTS=`cat /proc/cpuinfo | grep "processor" | wc | awk '{print int($1)}'`
 
-VERBOSE=OFF
 VERBOSE=ON
 
 #running path on Android phone
@@ -88,14 +81,8 @@ HTP_ARCH_VERSION=${HTP_ARCH_VERSIONS%% *}
 #1.12 GiB, will be downloadded automatically via this script when running this script at the first time
 GGUF_MODEL_NAME=/sdcard/qwen1_5-1_8b-chat-q4_0.gguf
 
-#1.2 GiB
-GGUF_MODEL_NAME=/sdcard/Qwen3.5-2B-Q4_0.gguf
-
 #1.2 GiB, will be downloadded automatically via this script when running this script at the first time
 GGUF_MODEL_NAME=/sdcard/Qwen3.5-2B-Q4_0.gguf
-
-#737 MiB
-GGUF_MODEL_NAME=/sdcard/llama-3.2-1B-Q4_0.gguf
 
 #2.9 GiB, will be downloadded automatically via this script when running this script at the first time
 GGUF_MODEL_NAME=/sdcard/gemma-4-E2B-it-Q4_0.gguf
@@ -103,19 +90,15 @@ GGUF_MODEL_NAME=/sdcard/gemma-4-E2B-it-Q4_0.gguf
 # Model aliases for quick testing of multiple models
 # Usage: ./scripts/build-run-ggmlhexagon-android.sh run_llamacli <alias>
 #   qwen3       -> Qwen3.5-2B-Q4_0.gguf
-#   qwen3-mtp   -> Qwen3.5-2B-MTP-Q4_0.gguf
 #   gemma4      -> gemma-4-E2B-it-Q4_0.gguf
 #   qwen1       -> qwen1_5-1_8b-chat-q4_0.gguf
-#   llama3      -> llama-3.2-1B-Q4_0.gguf
 #   (default)   -> gemma-4-E2B-it-Q4_0.gguf
 function resolve_model_name()
 {
     case "$1" in
         qwen3)      echo "/sdcard/Qwen3.5-2B-Q4_0.gguf" ;;
-        qwen3-mtp)  echo "/sdcard/Qwen3.5-2B-MTP-Q4_0.gguf" ;;
         gemma4)     echo "/sdcard/gemma-4-E2B-it-Q4_0.gguf" ;;
         qwen1)      echo "/sdcard/qwen1_5-1_8b-chat-q4_0.gguf" ;;
-        llama3)     echo "/sdcard/llama-3.2-1B-Q4_0.gguf" ;;
         *)          echo "" ; return 1 ;;
     esac
 }
@@ -123,7 +106,6 @@ function resolve_model_name()
 PROMPT_STRING="Hello, good morning, you are a powerful domain expert and know many things, now pls help to introduce the movie Once Upon a Time in America briefly, pls pay attention short then 1000 words\n"
 
 #unified command-line parameters used during inference testing for fair performance comparison of PP and TG across Qualcomm's ggml-hexagon and JZ's ggml-hexagon
-#running_params=" -ngl 99 -t 6 -n 256 --no-warmup --load-mode none --poll 1000 --cpu-mask 0xfc --cpu-strict 1 --ctx-size 8192 --ubatch-size 1024 -fa on"
 running_params=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on --jinja -st"
 
 ######## part-3: utilities and functions ########
@@ -213,7 +195,6 @@ function check_android_phone()
 }
 
 
-#TODO:refine this function
 function check_and_download_hexagon_sdk()
 {
     is_hexagon_llvm_exist=1
@@ -392,7 +373,7 @@ function build_arm64
     #ARMv8.7a+i8mm CPU tuning flags, moved here from CMakeLists.txt to keep it aligned with upstream master
     local arm_cpu_flags="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE"
 
-    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=ON -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DGGML_HEXAGON_JZ=ON -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH} -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_PATH} -DHTP_ARCH_VERSION=${HTP_ARCH_VERSION} -DCMAKE_C_FLAGS="${arm_cpu_flags}" -DCMAKE_CXX_FLAGS="${arm_cpu_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE} -DGGML_USE_HEXAGON=ON
+    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=ON -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DGGML_HEXAGON_JZ=ON -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH} -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_PATH} -DHTP_ARCH_VERSION=${HTP_ARCH_VERSION} -DCMAKE_C_FLAGS="${arm_cpu_flags}" -DCMAKE_CXX_FLAGS="${arm_cpu_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE} -DGGML_USE_HEXAGON=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF
     cd ${LOCAL_BUILD_DIR}
     make -j${HOST_CPU_COUNTS}
     #cmake POST_BUILD now builds all 4 DSP skels (v73/v75/v79/v81) in one pass; no script-side extras needed
@@ -427,35 +408,6 @@ function build_arm64
     cd -
 }
 
-
-#build JZ's ggml-hexagon backend in debug mode
-function build_arm64_debug
-{
-    build_idl
-
-    #make AI Agent happy
-    export CCACHE_DIR=${PROJECT_ROOT_PATH}/.ccache
-
-    #ARMv8.7a+i8mm CPU tuning flags, moved here from CMakeLists.txt to keep it aligned with upstream master
-    local arm_cpu_flags="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE"
-
-    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Debug -DGGML_OPENMP=OFF -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=ON -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DGGML_HEXAGON_JZ=ON -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH} -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_PATH} -DHTP_ARCH_VERSION=${HTP_ARCH_VERSION} -DCMAKE_C_FLAGS="${arm_cpu_flags}" -DCMAKE_CXX_FLAGS="${arm_cpu_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE} -DGGML_USE_HEXAGON=ON
-    cd ${LOCAL_BUILD_DIR}
-    make -j${HOST_CPU_COUNTS}
-    #cmake POST_BUILD now builds all 4 DSP skels (v73/v75/v79/v81) in one pass; no script-side extras needed
-    #build_extra_dsp_skels debug
-    #upload the new libggmldsp-skel.so on device side
-    prepare_ggmldsp
-    #push AP-side libs too (keep stub/skel in sync, see build_arm64 for rationale)
-    update_ggml_libs
-    commit_so_file_md5 ${LOCAL_BUILD_DIR}/bin/libggml-cpu.so
-    if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so ]; then
-        commit_so_file_md5 ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so
-    fi
-    show_pwd
-
-    cd -
-}
 
 #build Qualcomm's ggml-hexagon backend for performance comparison
 function build_arm64_qcom
@@ -497,24 +449,6 @@ function build_arm64_qcom
 }
 
 
-#build Android CPU-only reference (no ggml-hexagon) for correctness check and troubleshooting trick issues
-function build_armcpu()
-{
-    export CCACHE_DIR=${PROJECT_ROOT_PATH}/.ccache_cpu
-
-    #ARMv8.7a+i8mm CPU tuning flags, moved here from CMakeLists.txt to keep it aligned with upstream master
-    local arm_cpu_flags="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE"
-
-    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=OFF -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DCMAKE_C_FLAGS="${arm_cpu_flags}" -DCMAKE_CXX_FLAGS="${arm_cpu_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE}
-    cd ${LOCAL_BUILD_DIR}
-    make -j${HOST_CPU_COUNTS}
-    #remove stale hexagon artifacts from previous hexagon builds to ensure CPU-only runtime
-    rm -f ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so
-    rm -f ${LOCAL_BUILD_DIR}/bin/libggmldsp-skel-*.so
-    show_pwd
-}
-
-
 function remove_temp_dir()
 {
     if [ -d ${LOCAL_BUILD_DIR} ]; then
@@ -540,18 +474,6 @@ function build_ggml_hexagon()
     remove_temp_dir
     rm -f ${LOCAL_BUILD_DIR}/.ab_test_runtime
     build_arm64
-}
-
-
-function build_ggml_hexagon_debug()
-{
-    show_pwd
-    check_and_download_ndk
-    check_and_download_opencl_sdk
-    check_and_download_hexagon_sdk
-    dump_vars
-    remove_temp_dir
-    build_arm64_debug
 }
 
 
@@ -892,7 +814,6 @@ function prepare_run_on_phone()
     adb shell "rm -f /data/local/tmp/${program}.farf"
     adb shell "touch /data/local/tmp/${program}.farf"
     adb shell "echo 0x1c > /data/local/tmp/${program}.farf"
-    #observe cDSP's log with debug build:./scripts/build-run-android.sh build_debug
     #adb logcat  | grep -iE "CDSP0"
 }
 
@@ -1088,330 +1009,23 @@ function run_abtest()
 }
 
 
-function run_ubatchtest()
-{
-    # Update ubatch-size values for a given model.
-    # Usage: run_ubatchtest [model_alias] [ubatch_sizes_csv]
-    #   model_alias    default: gemma4
-    #   ubatch_sizes   default: 32,64,128,512,1024
-    local model_alias="gemma4"
-    local ubatch_sizes=(8 16 22 32 64 128 512 1024)
-    local save_params="${running_params}"
-
-    if [ $# -ge 1 ] && [ "$1" != "help" ] && [ "$1" != "-h" ]; then
-        if [ -n "$(resolve_model_name "$1")" ]; then
-            model_alias="$1"
-        else
-            echo "ERROR: unknown model alias '$1'. Valid: qwen3, gemma4, qwen1, llama3"
-            return 1
-        fi
-    fi
-    if [ $# -ge 2 ] && [ -n "$2" ]; then
-        IFS=',' read -ra ubatch_sizes <<< "$2"
-    fi
-
-    local model_path=$(resolve_model_name "${model_alias}")
-    [ -z "${model_path}" ] && { echo "ERROR: bad model"; return 1; }
-
-    # ensure libs are on phone
-    prepare_run_on_phone llama-completion
-
-    local stamp=$(date +%Y%m%d-%H%M%S)
-    local combined_log="ubatchtest_${model_alias}_${stamp}.log"
-
-    echo "==================================================" | tee "${combined_log}"
-    echo "  ubatch sweep: model=${model_alias}" | tee -a "${combined_log}"
-    echo "  sizes: ${ubatch_sizes[*]}" | tee -a "${combined_log}"
-    echo "  combined log: ${combined_log}" | tee -a "${combined_log}"
-    echo "==================================================" | tee -a "${combined_log}"
-
-    # per-ubatch metrics, accumulated in-memory
-    declare -A pp_tps tg_tps tot_ms graphs unused_cnt
-    local total=${#ubatch_sizes[@]}
-    local count=0
-
-    # temp file for parsing: stream via tee so user sees output in real-time,
-    # then read the temp file after the stream ends to extract metrics
-    local tmpf
-    tmpf=$(mktemp /tmp/ubatchtest.XXXXXX.log)
-    # shellcheck disable=SC2064
-    trap "rm -f '${tmpf}'" RETURN
-
-    # ---------- Phase 1: raw runs (stream to terminal + combined + temp) ----------
-    for ub in "${ubatch_sizes[@]}"; do
-        count=$(( count + 1 ))
-        echo "" | tee -a "${combined_log}"
-        echo "--- [${count}/${total}] ubatch=${ub} ---" | tee -a "${combined_log}"
-
-        # override --ubatch-size: strip old, append new
-        local new_params
-        new_params=$(echo "${save_params}" | sed -E 's/--ubatch-size[[:space:]]+[0-9]+//')
-        new_params="${new_params} --ubatch-size ${ub}"
-        running_params="${new_params}"
-
-        # print the actual command for reproducibility (captured by tee)
-        echo "CMD: cd ${REMOTE_PATH} && export LD_LIBRARY_PATH=${REMOTE_PATH} && ${REMOTE_PATH}/llama-completion ${running_params} -m ${model_path} -p \"${PROMPT_STRING}\"" | tee -a "${combined_log}"
-
-        # stream adb output in real-time: terminal <- tmpf <- combined_log
-        # First tee writes to tmpf (full capture for later parsing) and forwards to stdout.
-        # Second tee appends to combined_log and forwards to stdout.
-        # Both tees must keep their stdout -> terminal sees the stream live.
-        # Do NOT redirect the second tee's stdout to /dev/null: that would
-        # swallow the terminal stream (the bug we just fixed).
-        adb shell "cd ${REMOTE_PATH} \
-                  && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-                  && ${REMOTE_PATH}/llama-completion ${running_params} -m ${model_path} -p \"${PROMPT_STRING}\"" 2>&1 \
-            | tee "${tmpf}" \
-            | tee -a "${combined_log}"
-
-        # parse from temp file (after stream ends; full content available)
-        # Anchor to "common_perf_print:" prefix to avoid matching model output
-        pp_tps[$ub]=$(grep "common_perf_print:.*prompt eval time" "${tmpf}" | tail -1 \
-            | grep -oE '[0-9.]+ tokens per second' | head -1 | awk '{print $1}')
-        tg_tps[$ub]=$(grep "common_perf_print:.*eval time" "${tmpf}" | grep "runs" | tail -1 \
-            | grep -oE '[0-9.]+ tokens per second' | head -1 | awk '{print $1}')
-        tot_ms[$ub]=$(grep "common_perf_print:.*total time" "${tmpf}" | tail -1 \
-            | sed -E 's/.*=\s*([0-9.]+) ms.*/\1/')
-        unused_cnt[$ub]=$(grep -c '<unused' "${tmpf}")
-        # line format: "...I common_perf_print:    graphs reused =        253"
-        # field 5="reused", field 6="=", field 7="253" -> want $(i+2)
-        graphs[$ub]=$(awk '/common_perf_print:.*graphs reused/ { for (i=1; i<=NF; i++) if ($i == "reused") { print $(i+2); exit } }' "${tmpf}")
-
-        # truncate temp for next iteration (so grep on next ubatch is clean)
-        : > "${tmpf}"
-    done
-
-    # trap will clean up tmpf on function return
-    running_params="${save_params}"
-
-    # ---------- Phase 2: print summary from in-memory arrays ----------
-    echo "" | tee -a "${combined_log}"
-    echo "==================================================" | tee -a "${combined_log}"
-    echo "  SUMMARY (parsed in-place during phase 1)" | tee -a "${combined_log}"
-    echo "==================================================" | tee -a "${combined_log}"
-    printf "%-7s  %-8s  %-8s  %-10s  %-7s  %-7s\n" \
-        "ubatch" "PP_tps" "TG_tps" "total_ms" "unused" "graphs" | tee -a "${combined_log}"
-
-    for ub in "${ubatch_sizes[@]}"; do
-        printf "%-7s  %-8s  %-8s  %-10s  %-7s  %-7s\n" \
-            "${ub}" "${pp_tps[$ub]:-N/A}" "${tg_tps[$ub]:-N/A}" "${tot_ms[$ub]:-N/A}" \
-            "${unused_cnt[$ub]:-0}" "${graphs[$ub]:-N/A}" | tee -a "${combined_log}"
-    done
-
-    echo "==================================================" | tee -a "${combined_log}"
-    echo "  done. combined log: ${combined_log}" | tee -a "${combined_log}"
-    echo "==================================================" | tee -a "${combined_log}"
-}
-
-
-function run_ubatchtest_all()
-{
-    # Batch ubatch sweep across 5 models x 5 ubatches = 25 tests.
-    # No arguments. Similar in spirit to run_llamacli_all.
-    #local models=("gemma4" "qwen3" "qwen3-mtp" "qwen1" "llama3")
-    local models=("gemma4" "qwen3" "qwen1")
-    local ubatch_sizes=(32 64 128 512 1024)
-
-    # re-join ubatch sizes back into a comma-separated string for run_ubatchtest
-    local ubatch_csv
-    ubatch_csv=$(IFS=,; echo "${ubatch_sizes[*]}")
-
-    local total_models=${#models[@]}
-    local total_ubatches=${#ubatch_sizes[@]}
-    local total_tests=$(( total_models * total_ubatches ))
-    local count=0
-
-    echo "=============================================="
-    echo "  Batch ubatch sweep:"
-    echo "    ${total_models} models x ${total_ubatches} ubatches = ${total_tests} tests"
-    echo "    models:    ${models[*]}"
-    echo "    ubatches:  ${ubatch_sizes[*]}"
-    echo "  Log capture example:"
-    echo "    $0 run_ubatchtest_all 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
-    echo "=============================================="
-
-    for model in "${models[@]}"; do
-        count=$(( count + 1 ))
-        echo ""
-        echo "=== [${count}/${total_models}] model=${model} ==="
-        run_ubatchtest "${model}" "${ubatch_csv}"
-    done
-
-    echo ""
-    echo "=============================================="
-    echo "  Batch ubatch sweep complete: ${total_tests} tests done"
-    echo "=============================================="
-}
-
-
-function run_threadsafety()
-{
-    prepare_run_on_phone test-thread-safety
-
-    echo "${REMOTE_PATH}/test-thread-safety -np 2 -m ${GGUF_MODEL_NAME} -p \"hello,world\" -n 256 -ngl 99 "
-    adb shell "cd ${REMOTE_PATH} \
-               && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-               && ${REMOTE_PATH}/test-thread-safety -np 1 -m ${GGUF_MODEL_NAME} -p \"hello,world\" -n 256 -ngl 99 "
-
-}
-
-
-function run_test-ops()
-{
-    prog_name=test-backend-ops
-    prepare_run_on_phone ${prog_name}
-
-    echo "adb shell \"cd ${REMOTE_PATH} \
-               && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-               && ${REMOTE_PATH}/${prog_name} test\""
-
-
-    adb shell "cd ${REMOTE_PATH} \
-               && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-               && ${REMOTE_PATH}/${prog_name} test"
-
-}
-
-
-function run_test-op()
-{
-    prog_name=test-backend-ops
-    prog_param="-o ${opname}"
-    prepare_run_on_phone ${prog_name}
-
-    echo "adb shell cd ${REMOTE_PATH} \
-               && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-               && ${REMOTE_PATH}/${prog_name} test ${prog_param}"
-
-    echo "\n"
-    adb shell "cd ${REMOTE_PATH} \
-               && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-               && ${REMOTE_PATH}/${prog_name} test ${prog_param}"
-
-}
-
-
-function run_perf-op()
-{
-    prog_name=test-backend-ops
-    prepare_run_on_phone ${prog_name}
-
-    echo "adb shell cd ${REMOTE_PATH} \
-               && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-               && ${REMOTE_PATH}/${prog_name} perf -o ${opname}"
-
-    echo "\n"
-    adb shell "cd ${REMOTE_PATH} \
-               && export LD_LIBRARY_PATH=${REMOTE_PATH} \
-               && ${REMOTE_PATH}/${prog_name} perf -o ${opname}"
-
-}
-
-
-function print_oplist()
-{
-oplist="DUP
-    ADD
-    ADD1
-    ACC
-    SUB
-    MUL
-    DIV
-    SQR
-    SQRT
-    LOG
-    SIN
-    COS
-    SUM
-    SUM_ROWS
-    MEAN
-    ARGMAX
-    COUNT_EQUAL
-    REPEAT
-    REPEAT_BACK
-    CONCAT
-    SILU_BACK
-    NORM
-    RMS_NORM
-    RMS_NORM_BACK
-    GROUP_NORM
-
-    MUL_MAT
-    MUL_MAT_ID
-    OUT_PROD
-
-    SCALE
-    SET
-    CPY
-    CONT
-    RESHAPE
-    VIEW
-    PERMUTE
-    TRANSPOSE
-    GET_ROWS
-    GET_ROWS_BACK
-    DIAG
-    DIAG_MASK_INF
-    DIAG_MASK_ZERO
-    SOFT_MAX
-    SOFT_MAX_BACK
-    ROPE
-    ROPE_BACK
-    CLAMP
-    CONV_TRANSPOSE_1D
-    IM2COL
-    IM2COL_BACK
-    CONV_TRANSPOSE_2D
-    POOL_1D
-    POOL_2D
-    POOL_2D_BACK
-    UPSCALE
-    PAD
-    PAD_REFLECT_1D
-    ARANGE
-    TIMESTEP_EMBEDDING
-    ARGSORT
-    LEAKY_RELU
-
-    FLASH_ATTN_EXT
-    FLASH_ATTN_BACK
-    SSM_CONV
-    SSM_SCAN
-    WIN_PART
-    WIN_UNPART
-    GET_REL_POS
-    ADD_REL_POS
-    RWKV_WKV6
-    GATED_LINEAR_ATTN"
-
-echo "opname list: "
-echo ${oplist}
-}
-
-
 function show_usage()
 {
     echo -e "\n"
     echo "Usage:"
     echo "  $0 help"
-    echo "  $0 print_oplist"
     echo "  $0 update_ggml_libs  (push AP-side libs only from bin/ to device; no DSP skels, no backend switch)"
     echo "  $0 update_jz_libs   (push JZ runtime .so from out/ab-test/ to device)"
     echo "  $0 update_qcom_libs (push QCOM runtime .so from out/ab-test/ to device)"
 
     echo "  $0 build        (build JZ's ggml-hexagon backend)"
-    echo "  $0 build_debug  (build JZ's ggml-hexagon backend in debug mode)"
     echo "  $0 build_qcom   (build Qualcomm's ggml-hexagon backend for performance comparison)"
-    echo "  $0 build_armcpu (build Android CPU-only reference for correctness check and troulbeshooting trick issues)"
     echo "  $0 clean"
 
-    echo "  $0 run_testops"
-    echo "  $0 run_testop     ADD/MUL_MAT/FLASH_ATTN_EXT (verify accuracy    of ADD/MUL_MAT)"
-    echo "  $0 run_perfop     ADD/MUL_MAT/FLASH_ATTN_EXT (verify performance of ADD/MUL_MAT)"
     echo "  $0 run_llamacli"
     echo "  $0 run_llamabench"
 
-    echo "  $0 run_llamacli_all     (batch test 5 models = 5 tests)"
+    echo "  $0 run_llamacli_all     (batch test 3 models = 3 tests)"
     echo "    Log capture example:"
     echo "      $0 run_llamacli_all 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
@@ -1422,8 +1036,9 @@ function show_usage()
     echo "    model_alias:  default gemma4"
     echo "    Examples:"
     echo "      $0 run_abtest                      # 3 rounds, gemma4"
-    echo "      $0 run_abtest 5                    # 5 rounds, gemma4"
+    echo "      $0 run_abtest 5 gemma4             # 5 rounds, gemma4"
     echo "      $0 run_abtest 3 qwen3              # 3 rounds, qwen3"
+    echo "      $0 run_abtest 3 qwen1              # 3 rounds, qwen1"
     echo "    Log capture example:"
     echo "      $0 run_abtest 2>&1 | tee log_abtest_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
@@ -1438,26 +1053,6 @@ function show_usage()
     echo "    $0 run_llamacli qwen3        # test qwen3"
     echo "    $0 run_llamacli gemma4       # test gemma4"
     echo -e "\n"
-
-    echo "  $0 run_ubatchtest  [model_alias] [ubatch_csv]"
-    echo "    Sweep --ubatch-size values, dump raw per-ubatch logs (no in-shell parsing)."
-    echo "    model_alias:  gemma4 (default) | qwen3 | qwen3-mtp | qwen1 | llama3"
-    echo "    ubatch_csv:   32,64,128,512,1024 (default)"
-    echo "    Examples:"
-    echo "      $0 run_ubatchtest                          # gemma4 + 32/64/128/512/1024"
-    echo "      $0 run_ubatchtest qwen3                    # qwen3  + 32/64/128/512/1024"
-    echo "      $0 run_ubatchtest qwen3 32,128,512         # qwen3  + 32/128/512"
-    echo "      $0 run_ubatchtest qwen3 64                 # qwen3  + 64"
-    echo "    Log capture example:"
-    echo "      $0 run_ubatchtest 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
-    echo -e "\n"
-
-    echo "  $0 run_ubatchtest_all"
-    echo "    Batch ubatch sweep across 5 models x 5 ubatches = 25 tests."
-    echo "    models:    gemma4, qwen3, qwen1"
-    echo "    ubatches:  32, 64, 128, 512, 1024"
-    echo "    Log capture example:"
-    echo "      $0 run_ubatchtest_all 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
 }
 
 
@@ -1482,9 +1077,6 @@ elif [ $# == 1 ]; then
     elif [ "$1" == "help" ]; then
         show_usage
         exit 1
-    elif [ "$1" == "print_oplist" ]; then
-        print_oplist
-        exit 1
     elif [ "$1" == "update_ggml_libs" ]; then
         update_ggml_libs
         exit 1
@@ -1497,20 +1089,11 @@ elif [ $# == 1 ]; then
     elif [ "$1" == "build" ]; then
         build_ggml_hexagon
         exit 0
-    elif [ "$1" == "build_debug" ]; then
-        build_ggml_hexagon_debug
-        exit 0
     elif [ "$1" == "build_qcom" ]; then
         build_ggml_hexagon_qcom
         exit 0
-    elif [ "$1" == "build_armcpu" ]; then
-        build_armcpu
-        exit 0
     elif [ "$1" == "clean" ]; then
         remove_temp_dir
-        exit 0
-    elif [ "$1" == "run_testops" ]; then
-        run_test-ops
         exit 0
     elif [ "$1" == "run_llamacli" ]; then
         run_llamacli
@@ -1524,41 +1107,18 @@ elif [ $# == 1 ]; then
     elif [ "$1" == "run_abtest" ]; then
         run_abtest
         exit 0
-    elif [ "$1" == "run_ubatchtest" ]; then
-        run_ubatchtest
-        exit 0
-    elif [ "$1" == "run_ubatchtest_all" ]; then
-        run_ubatchtest_all
-        exit 0
     else
         show_usage
         exit 1
     fi
 elif [ $# == 2 ]; then
-#TODO: check opname in oplist
-#opname can be found via print_oplist:
-
-    if [ "$1" == "run_testop" ]; then
-        opname=$2
-        run_test-op
-        exit 0
-    elif [ "$1" == "run_perfop" ]; then
-        opname=$2
-        run_perf-op
-        exit 0
-    elif [ "$1" == "run_llamacli" ]; then
+    if [ "$1" == "run_llamacli" ]; then
         if [ -z "$(resolve_model_name "$2")" ]; then
             echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3, gemma4, qwen1, llama3"
             show_usage
             exit 1
         fi
         run_llamacli "$2"
-        exit 0
-    elif [ "$1" == "run_threadsafety" ]; then
-        run_threadsafety
-        exit 0
-    elif [ "$1" == "run_ubatchtest" ]; then
-        run_ubatchtest "$2"
         exit 0
     elif [ "$1" == "run_abtest" ]; then
         run_abtest "$2"
@@ -1568,24 +1128,13 @@ elif [ $# == 2 ]; then
         exit 1
     fi
 elif [ $# == 3 ]; then
-    if [ "$1" == "run_perfop" ]; then
-        opname=$2
-        run_perf-op
-        exit 0
-    elif [ "$1" == "run_testop" ]; then
-        opname=$2
-        run_test-op
-        exit 0
-    elif [ "$1" == "run_llamacli" ]; then
+    if [ "$1" == "run_llamacli" ]; then
         if [ -z "$(resolve_model_name "$2")" ]; then
             echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3, gemma4, qwen1, llama3"
             show_usage
             exit 1
         fi
         run_llamacli "$2"
-        exit 0
-    elif [ "$1" == "run_ubatchtest" ]; then
-        run_ubatchtest "$2" "$3"
         exit 0
     elif [ "$1" == "run_abtest" ]; then
         run_abtest "$2" "$3"

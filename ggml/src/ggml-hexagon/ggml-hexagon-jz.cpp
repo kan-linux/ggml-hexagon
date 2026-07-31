@@ -1,10 +1,4 @@
 /*
- * This single-source file is part of JZ's ggml-hexagon.
- * 2024--2026 The ggml authors
- * GitHub:  https://github.com/zhouwg/ggml-hexagon
- * Any copies or derivative works of this file shall preserve the above attribution information,
- * including the copyright notice and the GitHub repository URL.
- *
  * this file has 8 sections:
  * section-1  forward declarations, global vars, macros
  * section-2  data structures
@@ -15,7 +9,6 @@
  * section-7  Qualcomm compatibility layer
  * section-8  backend implementation
  *
- * GitHub:   - https://github.com/zhouwg/ggml-hexagon
  */
 #include <stdio.h>
 #include <stdlib.h>

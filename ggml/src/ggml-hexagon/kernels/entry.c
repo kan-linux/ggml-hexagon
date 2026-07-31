@@ -1,11 +1,3 @@
-/*
- * This single-source file is part of JZ's ggml-hexagon.
- * 2024--2026 The ggml authors
- * GitHub:  https://github.com/zhouwg/ggml-hexagon
- * Any copies or derivative works of this file shall preserve the above attribution information,
- * including the copyright notice and the GitHub repository URL.
- *
- */
 #include <stdio.h>
 #include <stdarg.h>
 
