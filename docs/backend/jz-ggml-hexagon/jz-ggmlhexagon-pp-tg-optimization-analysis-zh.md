@@ -836,6 +836,98 @@ Table-8 揭示 3.8x 退化的根因：MUL_MAT_FFN 在 HVX fused 路径下单 op 
 
 ***
 
+### 5.8 后续可探索方向 (按预期收益排序)
+
+承接 5.6 第 2 条结论 (`PP 优化的正确方向是 HMX-aware fused kernel`)，以及 5.6 第 3 条保留的 `n_qkv_skip_cum_hmx` / `n_pair_skip_cum_hmx` 计数器监控指标，本节在 `feature/qwen1_optimize` 分支上做了两轮实验验证后，给出后续 4 个突破性方向的优先级排序与定量分析。
+
+#### 5.8.1 根因再分析: Qwen1.5-1.8B QKV 0% 融合
+
+5.4.3 节统计的 `mul_mat coverage` 显示 Qwen1.5-1.8B 的关键瓶颈:
+
+| 指标 | 当前值 | 含义 |
+|---|---|---|
+| total MUL_MAT | 169 | 24 层 x 7 matmul 总量 (Q/K/V/O/FFN gate/up/down) |
+| hmx=165 (97.6%) | 165 | 其中 165 个 HMX-eligible，走 3x 独立 MUL_MAT |
+| qkv_fused | 0 (0.0%) | 0 次 QKV 融合成功 (理想 24 次) |
+| ffn_fused | 1 (1.2%) | 1 次 FFN 融合成功 (理想 24 次) |
+| mm_add_fused | 119 (70.4%) | 119 次 MUL_MAT+ADD 融合 (接近上限) |
+| qkv_skip_hmx | 0 | 0 次因 HMX eligibility 拒绝 |
+| pair_skip_hmx | 23 | 23 次 FFN pair 因 HMX eligibility 拒绝 |
+
+`qkv_fused=0` 与 `qkv_skip_hmx=0` 的组合定位根因: `is_mergeable_mul_mat()` (ggml-hexagon-jz.cpp:2385-2394) 要求 `!mm_is_hmx_eligible(t)` 才允许进入融合候选。Qwen1.5-1.8B 的 Q/K/V MUL_MAT 全部是 HMX-eligible (Q4_0 + 标准 shape)，永远被 `is_mergeable_mul_mat` 拒之门外。当前 fused QKV (op_matmul_qkv，matmul-ops.c:3562) 是 HVX 实现，无法利用 HMX 加速，所以即使强制融合，HVX 3x 路径也不会比 HMX 3x 更快。这与 5.3.2 节 `force_opfusion_in_pp=1` 的实验结论 (HVX 融合 PP 慢 3.8x) 一致。
+
+#### 5.8.2 Plan A 实验证伪: HVX vs HMX FLASH_ATTN 在 M=51 几乎无差异
+
+承接 4.1.3 节 "HMX-aware FLASH_ATTN_EXT kernel" 方向，在 `feature/qwen1_optimize` 分支上实施 patch：新增 cfg `fa_hmx_min_kv_blocks=3` (默认)，当 `n_kv_blocks < 3` 时回退 HVX 路径。预期 FLASH_ATTN_EXT 786 us/call 降至 500 us/call (PP +6-10%)。
+
+实测 (Qwen1.5-1.8B PP-only batch#1，源文件 `log_qwen1_optimization_20260807.txt`):
+
+| 指标 | Baseline (HMX) | Plan A (HVX) | Delta |
+|---|---|---|---|
+| batch-wall | 90778 us | 90511 us | -267 us (-0.3%) |
+| op-sum | 47147 us | 46913 us | -234 us (-0.5%) |
+| FLASH_ATTN_EXT avg | 786 us | 778 us | -8 us (-1.0%) |
+| MUL_MAT | 11146 us | 11056 us | -90 us |
+| a-inv | 19167 us (1754 MB) | 19143 us (1754 MB) | -24 us |
+
+patch 编译验证: `strings libggml-hexagon.so | grep fa_hmx` 返回 3 个匹配，`/data/local/tmp/ggml-hexagon.cfg` 中 `fa_hmx_min_kv_blocks = 3` 已正确部署。
+
+结论: **HVX 6 线程与 HMX 单线程在 n_kv_blocks=1 的小规模 prefill 场景下耗时几乎相同** (差异 <1%)。两者都受限于 DMA 数据移动 + HVX softmax + o_store epilogue，HMX vs HVX 的计算差异不显著。该 patch 不应合并到主分支。
+
+#### 5.8.3 后续 4 个突破性方向 (按预期收益排序)
+
+| 优先级 | 方向 | 当前开销 | 预期节省 | PP 收益 | 风险 |
+|---|---|---|---|---|---|
+| P0 | A. HMX fused QKV (Q+K+V 单 HMX call) | 3x MUL_MAT 占用 | 2400-4800 us | +2.6-5.3% | 中高 (新 kernel) |
+| P0 | B. bulk flush 异步化 (与下一 batch 重叠) | bulk=15145 us | 4500-7500 us | +5-8% | 中高 (新 thread) |
+| P1 | C. HMX fused FFN (gate+up 单 HMX call) | 2x MUL_MAT 占用 | 1200-2400 us | +1.3-2.6% | 中 (参考 A) |
+| P1 | D. a-inv 跨 batch dedup | a-inv=19167 us | 800-1500 us | +1-1.6% | 中 |
+
+**A. HMX fused QKV (P0 突破方向)**:
+
+- 实施: 在 `matmul-ops.c` 添加 `op_matmul_hmx_qkv`，复用 HMX systolic 阵列在 1 个 DSP call 中计算 Q/K/V 三个 matmul
+- 关键决策点 (来自 5.6 第 2 条): 3 个权重矩阵的 VTCM 复用策略 + M=large 时 HMX 8x8 阵列利用
+- 节省机制: 2 个 op 的 per-op overhead (Q setup / VTCM alloc / weight load / output write)，每个 op overhead ~50-100 us
+- 24 层 x 2 = 2400-4800 us 节省，PP 收益 +2.6-5.3%
+- 同步收益: Q/K/V 三个 output 从 3 个独立 dst 合并到 1 个 fused dst，**减少 a-inv 总量** (FLASH_ATTN 读 Q/K/V 时只 invalidate 1 个 tensor 而非 3 个)
+- 风险: 新 kernel 需验证正确性，参考 QCOM `htp/matmul-ops.c` 中 HMX-aware QKV 实现 (若存在)
+
+**B. bulk flush 异步化 (P0 突破方向)**:
+
+- 现状: `bulk_flush_all()` (entry.c:2413-2415) 在所有 op 完成后**阻塞**执行 15145 us，期间 DSP thread idle
+- 实施: 新增 1 个 DSP worker thread 负责 flush，main batch 线程与 flush 线程并行
+- 时序: batch N 完成后, flush 线程立即开始 flush batch N 的 dst range; 同时 AP 侧准备 batch N+1 的 descriptor (hdr/pre 阶段)
+- 同步点: batch N+1 的第一个 op 读取 dst 之前，需确保 batch N 的 flush 完成
+- 节省: 15145 us 中 30-50% 可与下一 batch 重叠，理论省 4500-7500 us
+- 风险: 需要新增 DSP thread + 跨 batch 同步原语，可能影响后续读取的 cache coherency
+- 参考: 5.7 节保留的 `dsp-ctx.h` `bulk_flush_ranges` 数组已包含 sort + merge 逻辑，异步化只需把 `bulk_flush_all()` 从主线程移到 worker thread
+
+**C. HMX fused FFN (P1 方向)**:
+
+- 实施: 类似 A，但融合 2 个 MUL_MAT (ffn_gate, ffn_up) 为 1 个 HMX call
+- 当前覆盖率: ffn_fused=1/24 (1.2%)，与 QKV 同样的 `!mm_is_hmx_eligible` gate 限制
+- 节省: 24 层 x 1 op overhead = 1200-2400 us
+- 风险: 中，参考 A 的实现
+- 可与 A 同步实施: `op_matmul_hmx_qkv` 和 `op_matmul_hmx_ffn` 共享 HMX matmul 基础设施
+
+**D. a-inv 跨 batch dedup (P1 方向)**:
+
+- 现状: a-inv=19167 us / 1754 MB per batch (非 op 开销最大项)
+- 1754 MB / 24 layer / 51 token = 1.43 MB per layer per token, 主要是 per-token unique activation
+- 实施: 类似 `weight_inval_check_and_mark` (entry.c:334-362) 的 per-batch dedup, 添加 `act_inval_check_and_mark` 跨 batch tracking
+- 假设: 同一 tensor 跨 batch 复用率 30%, 节省 ~24% = 800-1500 us
+- 风险: 中，跨 batch 跟踪需要考虑 L2 容量 (128KB) 和 tensor 生命周期
+- 前提: 必须先确认 1754 MB 的 24% 重复率假设成立 (需 AP 侧打点验证)
+
+#### 5.8.4 优先级排序依据
+
+P0 方向 (A + B) 合计理论节省 6900-12300 us = PP +7.6-13.6%，符合 `4.5 路线图` 中"PP 优化第二优先级"的潜在收益空间。P1 方向 (C + D) 合计 2000-3900 us = PP +2.2-4.3%，作为 P0 实施完成后的后续优化。
+
+实施顺序建议: A -> C -> B -> D。前两个 (A + C) 共用 HMX fused kernel 基础设施，先实施可积累经验。B 涉及新 DSP thread + 同步原语，复杂度最高，但潜在收益最大 (PP +5-8%)。D 风险最低 (复用现有 weight_inval 模式)，但收益受限于重复率假设验证。
+
+注意: 本节 4 个方向均在 `feature/qwen1_optimize` 分支探索，**不应直接合并到主分支 `self-build-jz`**，需 5 模型 CI 验证无回归 + 主分支 baseline 对比后再议。
+
+
 ## 参考文档
 
 1. [ion-mempool-vs-perbuffer-analysis-20260713.md](file:///home/zhouwg/develop/ggml-hexagon/docs/backend/jz-ggml-hexagon/ion-mempool-vs-perbuffer-analysis-20260713.md) - ION mempool vs per-buffer 模式对比分析，量化 JZ 净优势公式与 PP/TG 性能差异归因。
@@ -851,6 +943,7 @@ Table-8 揭示 3.8x 退化的根因：MUL_MAT_FFN 在 HVX fused 路径下单 op 
 - 第四章结构整理: 删除 4.2.1 + 4.3.2 (实际为同一实验的 DSP 端 + AP 侧配套组件, 文档分拆造成"两个独立方案"错觉); 新增 4.4.5 作为合并澄清与已关闭项; 同步重编号 4.2-4.4 子节 (4.x -> 4.x.y, 与第五章多级编号风格对齐)
 - 第四章代码核验与路线图: 多处代码核验修正 (FastRPC 实测替换历史值 ~89us、DDR 带宽、fusion 状态、bit1 跳过方向等); 4.5 路线图精简为时间线; "核心转变"段显式区分"潜在收益优先级"与"执行优先级"两个维度
 - 跨章节变动: 全文档 unicode 箭头/乘号清理 (符合 AGENTS.md); 4.6 dspqueue 描述从"通信机制"改为"执行调度模型"; 第五章新增 Table-6/7/8 + 5.3.3 对比分析 + 参考文档章节
+- 第五章新增 5.8 后续可探索方向 (MiniMax-M3): Plan A 实验证伪诊断 (HVX vs HMX FLASH_ATTN 在 M=51 几乎无差异) + 根因再分析 (is_mergeable_mul_mat 拒 HMX eligible 导致 QKV 0% 融合) + 4 个突破性方向优先级 (HMX fused QKV/bulk flush 异步化/HMX fused FFN/a-inv 跨 batch dedup)
 
 ### 2026-08-06
 

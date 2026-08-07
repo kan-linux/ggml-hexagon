@@ -1720,6 +1720,8 @@ function show_usage()
     echo "      adb logcat | grep --line-buffered -iE '(OP-PROF.*batch#1 |QKV skip|FFN skip|mul_mat coverage|hmx eligibility)' | tee log_pp_only_\$(date +%Y%m%d-%H%M%S).txt"
     echo "    Or capture both PP+TG for comparison:"
     echo "      adb logcat | grep --line-buffered OP-PROF | tee log_pp_only_\$(date +%Y%m%d-%H%M%S).txt"
+    echo "    Or capture both all:"
+    echo "      adb logcat -d -v threadtime > log_pathc_v2_$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
 
     echo "  $0 run_abtest  [rounds] [model_alias]"
