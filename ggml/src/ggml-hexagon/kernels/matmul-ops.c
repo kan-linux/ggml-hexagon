@@ -3706,6 +3706,78 @@ int op_matmul_qkv(struct htp_ops_context * octx) {
     return HTP_STATUS_OK;
 }
 
+// Helper for HMX-aware fused QKV: issue a single HMX 2D matmul (W*x -> dst) for a
+// given weight and dst pair. Solves VTCM and chunk params locally so the same
+// helper handles Wk, Wv, Wq which have different ne[1] (output dim) sizes.
+static int hmx_mm_op_matmul_one(struct htp_ops_context * octx,
+                                const struct htp_tensor * restrict w,
+                                const struct htp_tensor * restrict x,
+                                const struct htp_tensor * restrict dst) {
+    const int wtype = (int) w->type;
+    const int k     = (int) w->ne[0];
+    const int n     = (int) w->ne[1];
+    const int m_total    = (int) x->ne[1];
+    const int act_stride = (int)(x->nb[1] / sizeof(float));
+
+    const int n_threads = (int) octx->n_threads;
+
+    const uint32_t ne00_padded = hex_round_up((uint32_t) k, 128);
+    const uint32_t ne01_padded = hex_round_up((uint32_t) w->ne[1], 128);
+    const uint32_t ne11        = (uint32_t)(x->ne[1] * x->ne[2] * x->ne[3]);
+    const uint32_t ne11_padded = hex_round_up(ne11, 128);
+    const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
+
+    const size_t vtcm_budget = octx->ctx->vtcm_size;
+    size_t m_chunk = 0, n_chunk = 0, vtcm_size = 0;
+    int    act_threads = 0;
+    if (!htp_mm_hmx_solve_2d_params(
+            wtype, ne00_padded, ne11, ne01_padded, ne11_padded, ne11,
+            n_threads, /*pipeline=*/false, /*is_matmul_id=*/false, aligned_tile_size,
+            vtcm_budget, &m_chunk, &n_chunk, &act_threads, &vtcm_size)) {
+        FARF(ERROR, "hmx_mm_op_matmul_one: htp_mm_hmx_solve_2d_params failed (k=%d n=%d m=%d)\n", k, n, m_total);
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    struct fastdiv_values div_n_act_threads = init_fastdiv_values((uint32_t) act_threads);
+    struct fastdiv_values div_ne00_padded   = init_fastdiv_values(ne00_padded);
+
+    const int ret = hmx_mm_2d_f32(
+        octx->ctx,
+        (float *) dst->data, NULL, (float *) x->data, (const uint8_t *) w->data,
+        m_total, k, n, act_stride, (int) w->nb[1], wtype, (int) x->ne[0],
+        (int)(dst->nb[1] / sizeof(float)), 0, (int) dst->ne[0],
+        m_chunk, n_chunk, /*pipeline=*/false, n_threads, act_threads,
+        &div_n_act_threads, &div_ne00_padded,
+        htp_mm_get_weight_tile_size(wtype), aligned_tile_size, vtcm_size
+    );
+    if (ret != 0) {
+        FARF(ERROR, "hmx_mm_op_matmul_one: hmx_mm_2d_f32 failed (ret=%d, k=%d, n=%d)\n", ret, k, n);
+        return HTP_STATUS_INTERNAL_ERR;
+    }
+    return HTP_STATUS_OK;
+}
+
+// HMX-aware fused QKV matmul. src/dst layout follows op_matmul_qkv:
+//   src[0] = Wk, src[1] = x, src[2] = Wv, src[3] = Wq
+//   dsts[0] = K,  dsts[1] = V,  dsts[2] = Q
+// Three sequential HMX 2D matmuls (Wk*x->K, Wv*x->V, Wq*x->Q) reusing the
+// same activation. See jz-ggmlhexagon-pp-tg-optimization-analysis-zh.md 5.8.3.
+int op_matmul_qkv_hmx(struct htp_ops_context * octx) {
+    const struct htp_tensor * restrict wk = octx->src[0];
+    const struct htp_tensor * restrict x  = octx->src[1];
+    const struct htp_tensor * restrict wv = octx->src[2];
+    const struct htp_tensor * restrict wq = octx->src[3];
+    const struct htp_tensor * restrict k_dst = octx->dsts[0];
+    const struct htp_tensor * restrict v_dst = octx->dsts[1];
+    const struct htp_tensor * restrict q_dst = octx->dsts[2];
+
+    int ret;
+    if ((ret = hmx_mm_op_matmul_one(octx, wk, x, k_dst)) != 0) return ret;
+    if ((ret = hmx_mm_op_matmul_one(octx, wv, x, v_dst)) != 0) return ret;
+    if ((ret = hmx_mm_op_matmul_one(octx, wq, x, q_dst)) != 0) return ret;
+    return HTP_STATUS_OK;
+}
+
 int op_matmul_ffn(struct htp_ops_context * octx) {
     struct htp_thread_trace * tr = &octx->ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);

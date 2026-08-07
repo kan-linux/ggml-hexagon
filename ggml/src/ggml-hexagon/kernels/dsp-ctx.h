@@ -12,6 +12,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdatomic.h>
+/* qurt_thread.h / qurt_futex.h are DSP SDK headers; they are NOT visible
+ * when dsp-ctx.h is included from host-side ggml-hexagon-jz.cpp. We use
+ * void* for the thread handle and atomic_uint for the futex word so the
+ * struct layout is identical on both sides. entry.c (DSP-side) does the
+ * actual qurt casts. */
 
 #ifdef  __cplusplus
 extern "C" {
@@ -260,9 +266,11 @@ struct dsp_context {
     dsptensor * pre_dt;                     // [DSP_OPT_MAX_TENSORS]
     struct htp_tensor * pre_ht;             // [DSP_OPT_MAX_TENSORS]
     dsp_dst_range_t * prior_dst_ranges;     // [DSP_OPT_MAX_BATCH_DSTS]
-    dsp_dst_range_t * bulk_flush_ranges;    // [DSP_OPT_MAX_BATCH_DSTS]
+    dsp_dst_range_t * bulk_flush_ranges;    // [DSP_OPT_MAX_BATCH_DSTS] (async: producer idx 0 or 1)
+    dsp_dst_range_t * bulk_flush_ranges_b;  // [DSP_OPT_MAX_BATCH_DSTS] (async: drain-side buffer)
     int prior_dst_count;
     int bulk_flush_count;
+    int bulk_flush_count_b;
 
 #if HEX_OP_PROF
     // Per-op profiling (compiled in when HEX_OP_PROF is non-zero)
@@ -288,6 +296,23 @@ struct dsp_context {
     uint64_t nonop_bulk_flush_us;
     uint64_t nonop_queue_us;
 #endif
+
+    // Async bulk flush thread (Path B1). Only used when dsp_cache_mode bit 2 is
+    // on AND enable_async_bulk_flush is non-zero. The thread runs in the
+    // background between batches; main thread returns to AP as soon as the
+    // batch's ops are done. The next batch's execute_batch (or close) waits
+    // for the previous flush to complete before re-using bulk_flush_ranges.
+    // Memory: thread struct + 16 KB stack + 2 dsp_dst_range_t buffers (double
+    // buffered so the next batch can fill one while the flush thread drains
+    // the other). Allocated lazily in ggml_dsp_setclocks when the cfg flag is
+    // set; freed in ggml_dsp_close.
+    int                  enable_async_bulk_flush;
+    void *               async_flush_thread;       /* qurt_thread_t (opaque to host) */
+    void *               async_flush_stack;
+    atomic_uint          async_flush_seqn;     /* producer: ++ each batch */
+    atomic_uint          async_flush_done;     /* consumer: == seqn means done */
+    int                  async_flush_ranges_idx; /* 0 or 1, double-buffer selector */
+    volatile int         async_flush_thread_running;
 };
 
 #ifdef  __cplusplus

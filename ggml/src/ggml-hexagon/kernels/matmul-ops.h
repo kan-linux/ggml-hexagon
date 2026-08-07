@@ -779,4 +779,8 @@ static inline bool htp_mm_hmx_solve_2d_params(
 }
 #endif
 
+// Forward declarations for HMX-aware fused QKV kernel (Step 4-5).
+struct htp_ops_context;
+int op_matmul_qkv_hmx(struct htp_ops_context * octx);
+
 #endif // HTP_MATMUL_OPS_H

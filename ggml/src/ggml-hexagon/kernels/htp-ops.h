@@ -59,6 +59,7 @@ enum htp_op_code {
     HTP_OP_MUL_MAT,
     HTP_OP_MUL_MAT_ID,
     HTP_OP_MUL_MAT_QKV,
+    HTP_OP_MUL_MAT_QKV_HMX,   // Step 1-3: AP-side dispatch stub; kernel handler in Step 4-5
     HTP_OP_MUL_MAT_FFN,
     HTP_OP_MUL_MAT_ADD,
     HTP_OP_RMS_NORM,

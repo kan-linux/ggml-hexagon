@@ -461,63 +461,53 @@ static inline void prior_dst_add(void * base, size_t len, uint32_t tensor_idx,
 
 static inline void bulk_flush_add(void * base, size_t len) {
     if (!base || len == 0) return;
-    if (g_dsp_ctx->bulk_flush_count >= DSP_OPT_MAX_BATCH_DSTS) {
+    int idx = g_dsp_ctx->async_flush_ranges_idx;
+    dsp_dst_range_t * arr = (idx == 0) ? g_dsp_ctx->bulk_flush_ranges : g_dsp_ctx->bulk_flush_ranges_b;
+    int * cnt = (idx == 0) ? &g_dsp_ctx->bulk_flush_count : &g_dsp_ctx->bulk_flush_count_b;
+    if (*cnt >= DSP_OPT_MAX_BATCH_DSTS) {
         /* Overflow: fall back to immediate per-range flush for THIS dst only
          * (degraded perf, but correctness preserved). */
         ggml_dsp_cache_flush_range(base, len);
         return;
     }
-    g_dsp_ctx->bulk_flush_ranges[g_dsp_ctx->bulk_flush_count].base = base;
-    g_dsp_ctx->bulk_flush_ranges[g_dsp_ctx->bulk_flush_count].len  = len;
-    g_dsp_ctx->bulk_flush_count++;
-}
-
-static inline void prior_dst_reset_all(void) {
-    g_dsp_ctx->prior_dst_count = 0;
+    arr[*cnt].base = base;
+    arr[*cnt].len  = len;
+    (*cnt)++;
 }
 
 static inline void bulk_flush_reset_all(void) {
     g_dsp_ctx->bulk_flush_count = 0;
+    g_dsp_ctx->bulk_flush_count_b = 0;
+    /* async_flush_ranges_idx is NOT reset here: it tracks the producer
+     * slot and is only flipped by async_flush_signal_new_batch(). The
+     * async flush thread drains the opposite slot. */
 }
 
-/* Insertion sort (small N typical for batch dst list: 30-50 dsts).
- * Avoids libc qsort dependency and works on 32-bit pointers. */
-static inline void bulk_flush_sort(void) {
-    for (int i = 1; i < g_dsp_ctx->bulk_flush_count; i++) {
-        dsp_dst_range_t cur = g_dsp_ctx->bulk_flush_ranges[i];
+static inline void bulk_flush_sort_for(dsp_dst_range_t * arr, int cnt) {
+    /* Simple insertion sort: bulk_flush_count is typically O(layers) < 200. */
+    for (int i = 1; i < cnt; i++) {
+        dsp_dst_range_t cur = arr[i];
         int j = i - 1;
-        while (j >= 0 &&
-               (uintptr_t)g_dsp_ctx->bulk_flush_ranges[j].base > (uintptr_t)cur.base) {
-            g_dsp_ctx->bulk_flush_ranges[j + 1] = g_dsp_ctx->bulk_flush_ranges[j];
+        while (j >= 0 && (uintptr_t)arr[j].base > (uintptr_t)cur.base) {
+            arr[j + 1] = arr[j];
             j--;
         }
-        g_dsp_ctx->bulk_flush_ranges[j + 1] = cur;
+        arr[j + 1] = cur;
     }
 }
 
-/* Walk sorted list, merge adjacent/overlapping ranges, flush each merged
- * region once. Overlap defined as next_start <= cur_end (1B threshold:
- * touching ranges merge). Flushes in sorted order to preserve ION ordering.
- *
- * Uses ggml_dsp_cache_flush_range_nosync() to avoid one syncht per region;
- * a single syncht is issued at the end so AP reads of the flushed tensors
- * see fresh DRAM. This batch-end consolidation is the only safe place to
- * merge syncht barriers; per-op synchts are still required for the
- * bit-2-disabled fallback path (see ggml_dsp_execute_batch). */
-static inline void bulk_flush_all(void) {
-    if (g_dsp_ctx->bulk_flush_count == 0) return;
-    bulk_flush_sort();
-    void * cur_base = g_dsp_ctx->bulk_flush_ranges[0].base;
-    uintptr_t cur_end = (uintptr_t)cur_base + g_dsp_ctx->bulk_flush_ranges[0].len;
+static inline void bulk_flush_all_for(dsp_dst_range_t * arr, int cnt) {
+    if (cnt == 0) return;
+    bulk_flush_sort_for(arr, cnt);
+    void * cur_base = arr[0].base;
+    uintptr_t cur_end = (uintptr_t)cur_base + arr[0].len;
     int i = 1;
-    while (i < g_dsp_ctx->bulk_flush_count) {
-        void * next_base = g_dsp_ctx->bulk_flush_ranges[i].base;
-        uintptr_t next_end = (uintptr_t)next_base + g_dsp_ctx->bulk_flush_ranges[i].len;
+    while (i < cnt) {
+        void * next_base = arr[i].base;
+        uintptr_t next_end = (uintptr_t)next_base + arr[i].len;
         if ((uintptr_t)next_base <= cur_end) {
-            /* Overlap or adjacent: extend current region */
             if (next_end > cur_end) cur_end = next_end;
         } else {
-            /* Gap: flush [cur_base, cur_end) and start new region */
             ggml_dsp_cache_flush_range_nosync(cur_base, (size_t)(cur_end - (uintptr_t)cur_base));
             cur_base = next_base;
             cur_end  = next_end;
@@ -525,10 +515,115 @@ static inline void bulk_flush_all(void) {
         i++;
     }
     ggml_dsp_cache_flush_range_nosync(cur_base, (size_t)(cur_end - (uintptr_t)cur_base));
-    /* Single syncht covers all merged-region flushes above. AP reads
-     * following this point see consistent DRAM. */
     __asm__ __volatile__("syncht\n" ::: "memory");
 }
+
+static inline void prior_dst_reset_all(void) {
+    g_dsp_ctx->prior_dst_count = 0;
+}
+
+/* Sync wrapper for current (idx=0) buffer. Kept for the bit-2-disabled
+ * path and for any caller that needs an inline flush. */
+static inline void bulk_flush_all(void) {
+    bulk_flush_all_for(g_dsp_ctx->bulk_flush_ranges, g_dsp_ctx->bulk_flush_count);
+}
+
+// =================================================================================================
+// Async bulk flush thread (Path B1)
+// =================================================================================================
+#define JZ_ASYNC_FLUSH_STACK_SIZE (16 * 1024)
+
+static void async_flush_thread_main(void * arg) {
+    (void)arg;
+    unsigned int last_done_seqn = 0;
+    while (g_dsp_ctx->async_flush_thread_running) {
+        unsigned int cur_seqn = atomic_load(&g_dsp_ctx->async_flush_seqn);
+        if (cur_seqn == last_done_seqn) {
+            /* No new work. Wait for producer to bump seqn. */
+            qurt_futex_wait(&g_dsp_ctx->async_flush_seqn, cur_seqn);
+            continue;
+        }
+        /* Drain the buffer opposite to the one the producer is filling. */
+        int drain_idx = 1 - g_dsp_ctx->async_flush_ranges_idx;
+        dsp_dst_range_t * arr = (drain_idx == 0) ? g_dsp_ctx->bulk_flush_ranges
+                                                 : g_dsp_ctx->bulk_flush_ranges_b;
+        int cnt = (drain_idx == 0) ? g_dsp_ctx->bulk_flush_count
+                                   : g_dsp_ctx->bulk_flush_count_b;
+        bulk_flush_all_for(arr, cnt);
+        last_done_seqn = cur_seqn;
+        atomic_store(&g_dsp_ctx->async_flush_done, cur_seqn);
+        qurt_futex_wake(&g_dsp_ctx->async_flush_done, 1);
+    }
+    /* Final drain on exit (best-effort). */
+    int drain_idx = 1 - g_dsp_ctx->async_flush_ranges_idx;
+    dsp_dst_range_t * arr = (drain_idx == 0) ? g_dsp_ctx->bulk_flush_ranges
+                                             : g_dsp_ctx->bulk_flush_ranges_b;
+    int cnt = (drain_idx == 0) ? g_dsp_ctx->bulk_flush_count
+                               : g_dsp_ctx->bulk_flush_count_b;
+    if (cnt > 0) bulk_flush_all_for(arr, cnt);
+    atomic_store(&g_dsp_ctx->async_flush_done, atomic_load(&g_dsp_ctx->async_flush_seqn));
+    qurt_futex_wake(&g_dsp_ctx->async_flush_done, 1);
+}
+
+static int async_flush_thread_start(void) {
+    if (g_dsp_ctx->async_flush_thread_running) return 0;
+    g_dsp_ctx->async_flush_stack = memalign(128, JZ_ASYNC_FLUSH_STACK_SIZE);
+    if (!g_dsp_ctx->async_flush_stack) return -1;
+    atomic_store(&g_dsp_ctx->async_flush_seqn, 0);
+    atomic_store(&g_dsp_ctx->async_flush_done, 0);
+    g_dsp_ctx->async_flush_ranges_idx = 0;
+    g_dsp_ctx->async_flush_thread_running = 1;
+    qurt_thread_attr_t attr;
+    qurt_thread_attr_init(&attr);
+    qurt_thread_attr_set_stack_addr(&attr, g_dsp_ctx->async_flush_stack);
+    qurt_thread_attr_set_stack_size(&attr, JZ_ASYNC_FLUSH_STACK_SIZE);
+    qurt_thread_attr_set_name(&attr, "async-bulk-flush");
+    /* Lower priority than compute threads so it never preempts HVX/HMX work. */
+    int prio = qurt_thread_get_priority(qurt_thread_get_id());
+    if (prio > 1) prio -= 1;
+    qurt_thread_attr_set_priority(&attr, prio);
+    int err = qurt_thread_create((qurt_thread_t *)&g_dsp_ctx->async_flush_thread, &attr,
+                                 async_flush_thread_main, NULL);
+    if (err) {
+        g_dsp_ctx->async_flush_thread_running = 0;
+        free(g_dsp_ctx->async_flush_stack);
+        g_dsp_ctx->async_flush_stack = NULL;
+        FARF(ERROR, "Could not launch async flush thread (err=%d)\n", err);
+        return -1;
+    }
+    return 0;
+}
+
+static void async_flush_thread_stop(void) {
+    if (!g_dsp_ctx->async_flush_thread_running) return;
+    g_dsp_ctx->async_flush_thread_running = 0;
+    /* Nudge the thread out of futex_wait. */
+    atomic_fetch_add(&g_dsp_ctx->async_flush_seqn, 1);
+    qurt_futex_wake(&g_dsp_ctx->async_flush_seqn, 1);
+    qurt_thread_join((unsigned int)(uintptr_t)g_dsp_ctx->async_flush_thread, NULL);
+    if (g_dsp_ctx->async_flush_stack) {
+        free(g_dsp_ctx->async_flush_stack);
+        g_dsp_ctx->async_flush_stack = NULL;
+    }
+}
+
+static inline void async_flush_wait_for_prev(void) {
+    unsigned int cur_seqn = atomic_load(&g_dsp_ctx->async_flush_seqn);
+    while (atomic_load(&g_dsp_ctx->async_flush_done) < cur_seqn) {
+        qurt_futex_wait(&g_dsp_ctx->async_flush_done,
+                        atomic_load(&g_dsp_ctx->async_flush_done));
+    }
+}
+
+static inline void async_flush_signal_new_batch(void) {
+    /* Flip the buffer index for the new batch. The previous index is what
+     * the flush thread will drain. */
+    g_dsp_ctx->async_flush_ranges_idx = 1 - g_dsp_ctx->async_flush_ranges_idx;
+    atomic_fetch_add(&g_dsp_ctx->async_flush_seqn, 1);
+    qurt_futex_wake(&g_dsp_ctx->async_flush_seqn, 1);
+}
+
+
 
 #if HEX_OP_PROF
 static inline void prof_cache_inval_range(void * p, size_t len, int is_weight) {
@@ -775,6 +870,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_MUL_MAT]         = op_matmul,
     [HTP_OP_MUL_MAT_ID]      = op_matmul_id,
     [HTP_OP_MUL_MAT_QKV]     = op_matmul_qkv,
+    [HTP_OP_MUL_MAT_QKV_HMX] = op_matmul_qkv_hmx,
     [HTP_OP_MUL_MAT_FFN]     = op_matmul_ffn,
     [HTP_OP_MUL_MAT_ADD]     = op_matmul,
     [HTP_OP_NORM]            = op_unary,
@@ -920,6 +1016,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_GET_ROWS: *htp_op = HTP_OP_GET_ROWS;   return 0;
         case GGML_OP_SET_ROWS: *htp_op = HTP_OP_SET_ROWS;   return 0;
         case GGML_OP_SUM_ROWS: *htp_op = HTP_OP_SUM_ROWS;   return 0;
+        case GGML_OP_SSM_CONV: *htp_op = HTP_OP_SSM_CONV;   return 0;
         case GGML_OP_CONT:    *htp_op = HTP_OP_CPY;         return 0;
         case GGML_OP_REPEAT:  *htp_op = HTP_OP_REPEAT;       return 0;
         case GGML_OP_NORM:    *htp_op = HTP_OP_NORM;        return 0;
@@ -934,6 +1031,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_FILL:    *htp_op = HTP_OP_FILL;        return 0;
         case GGML_OP_DIAG:    *htp_op = HTP_OP_DIAG;        return 0;
         case GGML_OP_TRI:     *htp_op = HTP_OP_TRI;         return 0;
+        case GGML_OP_SOLVE_TRI: *htp_op = HTP_OP_SOLVE_TRI; return 0;
         case GGML_OP_UNARY: {
             if (!op_params) {
                 FARF(ERROR, "ggml_op_to_htp_op: UNARY missing op_params");
@@ -1441,7 +1539,8 @@ int ggml_dsp_open(const char * uri, remote_handle64 * handle) {
 
     // Allocate large per-session arrays from a single mempool.
     // pre_dt and pre_ht are [DSP_OPT_MAX_TENSORS]; prior_dst_ranges and
-    // bulk_flush_ranges are [DSP_OPT_MAX_BATCH_DSTS].
+    // bulk_flush_ranges are [DSP_OPT_MAX_BATCH_DSTS]. Path B1 adds a second
+    // bulk_flush_ranges buffer for double-buffered async flush.
     {
         size_t pre_dt_sz  = DSP_OPT_MAX_TENSORS * sizeof(dsptensor);
         size_t pre_ht_sz  = DSP_OPT_MAX_TENSORS * sizeof(struct htp_tensor);
@@ -1452,7 +1551,7 @@ int ggml_dsp_open(const char * uri, remote_handle64 * handle) {
         size_t a_pre_ht = (pre_ht_sz + 127) & ~(size_t)127;
         size_t a_prior  = (prior_sz  + 127) & ~(size_t)127;
         size_t a_bulk   = (bulk_sz   + 127) & ~(size_t)127;
-        size_t pool_sz  = a_pre_dt + a_pre_ht + a_prior + a_bulk;
+        size_t pool_sz  = a_pre_dt + a_pre_ht + a_prior + 2 * a_bulk;
 
         ctx->arrays_pool = memalign(128, pool_sz);
         if (!ctx->arrays_pool) {
@@ -1468,7 +1567,8 @@ int ggml_dsp_open(const char * uri, remote_handle64 * handle) {
         ctx->pre_dt            = (dsptensor *)p;            p += a_pre_dt;
         ctx->pre_ht            = (struct htp_tensor *)p;    p += a_pre_ht;
         ctx->prior_dst_ranges  = (dsp_dst_range_t *)p;      p += a_prior;
-        ctx->bulk_flush_ranges = (dsp_dst_range_t *)p;
+        ctx->bulk_flush_ranges = (dsp_dst_range_t *)p;      p += a_bulk;
+        ctx->bulk_flush_ranges_b = (dsp_dst_range_t *)p;
     }
 
     ctx->thread_prio = qurt_thread_get_priority(qurt_thread_get_id());
@@ -1494,6 +1594,8 @@ int ggml_dsp_open(const char * uri, remote_handle64 * handle) {
     ctx->dsp_cache_mode = 0;
     ctx->dsp_cache_trace_bit0 = 0;  // default off; AP pushes via 0xFFFC bit 16
     ctx->dsp_cache_trace_bit1 = 0;  // default off; AP pushes via 0xFFFC bit 17
+    ctx->enable_async_bulk_flush = 0; // default off; AP pushes via 0xFFFC bit 18
+    ctx->async_flush_thread_running = 0;
 
     printf("uri %s\n", uri);
 
@@ -1678,6 +1780,11 @@ int ggml_dsp_close(remote_handle64 handle) {
     struct dsp_context * ctx = (struct dsp_context *)handle;
     if (!ctx) return 0;
     g_dsp_ctx = ctx;
+
+    /* Path B1: stop the async bulk flush thread before freeing any state
+     * it references. The thread does a final drain of the last batch's
+     * ranges on its way out, ensuring no flush is lost. */
+    async_flush_thread_stop();
 
     // Cleanup htp_context resources (work_queue + dma queues).
     // New Qualcomm API (b2dd28a3b): *_queue_free() does not free the backing
@@ -1931,6 +2038,20 @@ AEEResult ggml_dsp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
 
     hap_probe_dsp(handle);
 
+    /* Path B1: always start the async bulk flush thread up-front, even if
+     * enable_async_bulk_flush=0. The flag is set later via 0xFFFC bit 18
+     * (after init_rpcmempool), and we want to avoid paying thread-create
+     * latency on the first batch. When the flag is off, the thread stays
+     * parked in qurt_futex_wait; when on, execute_batch signals it. */
+    {
+        const int started = async_flush_thread_start();
+        if (started != 0) {
+            GGMLHEXAGON_LOG_WARN("async flush thread start failed; will fall back to sync flush");
+        } else {
+            GGMLHEXAGON_LOG_INFO("async bulk flush thread started (16 KB stack, low priority)");
+        }
+    }
+
     GGMLHEXAGON_LOG_DEBUG("leave %s", __func__ );
     return AEE_SUCCESS;
 }
@@ -2025,11 +2146,14 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
      *               Mirrored dsts (flags&0x1) and final outputs always flush.
      *   bit 4 (0x10): reset weight_inval array    - clear first-touch tracking
      *               so new model weights at reused ION addresses get properly
-     *               invalidated after model unload/reload. */
+     *               invalidated after model unload/reload.
+     *   bit 18: enable async bulk flush (Path B1). Pushed at the same 0xFFFC
+     *               as dsp_cache_mode; the flag is sticky for the session. */
     if (batch_size == 0xFFFC) {
         g_dsp_ctx->dsp_cache_mode = batch_offset & 0xFu;
         g_dsp_ctx->dsp_cache_trace_bit0 = (batch_offset >> 16) & 0x1u;
         g_dsp_ctx->dsp_cache_trace_bit1 = (batch_offset >> 17) & 0x1u;
+        g_dsp_ctx->enable_async_bulk_flush = (batch_offset >> 18) & 0x1u;
         if (batch_offset & 0x10u) {
             weight_inval_reset_all();
         }
@@ -2406,12 +2530,26 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
 
     /* bit 2: bulk dst flush. Sort + merge collected ranges, then flush once
      * per merged region. Flushes happen here (after all ops in the batch
-     * finished) so AP reads see fresh DRAM. */
+     * finished) so AP reads see fresh DRAM.
+     *
+     * Path B1 (enable_async_bulk_flush=1): the flush runs in a background
+     * thread, overlapping with the next batch's setup. The previous batch's
+     * flush is waited for at the START of the next execute_batch. The wait
+     * is cheap (typically 0 us) because the flush thread has had the entire
+     * AP-to-DSP fastrpc roundtrip to drain the previous batch's ranges. */
 #if HEX_OP_PROF
     const int64_t prof_bf_t0 = ggml_time_us();
 #endif
     if (g_dsp_ctx->dsp_cache_mode & 0x4) {
-        bulk_flush_all();
+        if (g_dsp_ctx->enable_async_bulk_flush) {
+            /* Wait for any prior async flush, then signal this batch. */
+            async_flush_wait_for_prev();
+            async_flush_signal_new_batch();
+            /* bulk_flush_count(_b) is overwritten by the new batch's calls to
+             * bulk_flush_add(); the prior values were already drained. */
+        } else {
+            bulk_flush_all();
+        }
     }
 #if HEX_OP_PROF
     g_dsp_ctx->nonop_bulk_flush_us += (uint64_t)(ggml_time_us() - prof_bf_t0);
