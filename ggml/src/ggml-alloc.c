@@ -10,6 +10,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
+// TEMP DIAG: GALLOC_DIAG_LOG macro for buffer_id -> tensor name dump
+// REMOVE before upstream PR
+#if defined(__ANDROID__)
+#define GALLOC_DIAG_LOG(fmt, ...) \
+    __android_log_print(ANDROID_LOG_INFO, "ggml-hexagon-GALLOC_DIAG", fmt, ##__VA_ARGS__)
+#else
+#define GALLOC_DIAG_LOG(fmt, ...) \
+    fprintf(stderr, fmt, ##__VA_ARGS__)
+#endif
+
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MAX_FREE_BLOCKS 256
 
@@ -939,6 +953,77 @@ static bool ggml_gallocr_reserve_n_impl(
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
+                }
+            }
+        }
+    }
+
+    // TEMP DIAG: dump buffer_id -> top-5 largest tensor names per buffer.
+    // Summary format to avoid logcat truncation (4002 MiB weight buffer was lost
+    // in per-node dump). REMOVE before upstream PR.
+    {
+        static int dump_count = 0;
+        if (dump_count < 3) {  // print only first 3 calls (model load)
+            dump_count++;
+            GALLOC_DIAG_LOG("\n[GALLOC-DIAG] reserve_n_impl call #%d, graph n_nodes=%d n_leafs=%d\n",
+                    dump_count, graph->n_nodes, graph->n_leafs);
+            for (int i = 0; i < galloc->n_buffers; i++) {
+                size_t buf_size = 0;
+                for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                    buf_size += galloc->buf_tallocs[i]->chunks[c]->max_size;
+                }
+                // Collect all tensors in this buffer_id
+                char names[5][128];
+                size_t sizes[5] = {0};
+                int n_in_buf = 0;
+                // Initialize with smallest placeholders
+                for (int k = 0; k < 5; k++) { names[k][0] = '\0'; }
+                for (int j = 0; j < graph->n_nodes; j++) {
+                    struct hash_node * hn = ggml_gallocr_hash_get(galloc, graph->nodes[j]);
+                    if (hn->buffer_id == i) {
+                        size_t nb = ggml_nbytes(graph->nodes[j]);
+                        n_in_buf++;
+                        // Insert into top-5
+                        for (int k = 0; k < 5; k++) {
+                            if (nb > sizes[k]) {
+                                // Shift down
+                                for (int m = 4; m > k; m--) {
+                                    sizes[m] = sizes[m-1];
+                                    snprintf(names[m], 128, "%s", names[m-1]);
+                                }
+                                sizes[k] = nb;
+                                snprintf(names[k], 128, "%s", graph->nodes[j]->name);
+                                break;
+                            }
+                        }
+                    }
+                }
+                for (int j = 0; j < graph->n_leafs; j++) {
+                    struct hash_node * hn = ggml_gallocr_hash_get(galloc, graph->leafs[j]);
+                    if (hn->buffer_id == i) {
+                        size_t nb = ggml_nbytes(graph->leafs[j]);
+                        n_in_buf++;
+                        for (int k = 0; k < 5; k++) {
+                            if (nb > sizes[k]) {
+                                for (int m = 4; m > k; m--) {
+                                    sizes[m] = sizes[m-1];
+                                    snprintf(names[m], 128, "%s", names[m-1]);
+                                }
+                                sizes[k] = nb;
+                                snprintf(names[k], 128, "%s", graph->leafs[j]->name);
+                                break;
+                            }
+                        }
+                    }
+                }
+                GALLOC_DIAG_LOG("[GALLOC-DIAG]   buffer_id=%d buft=%s size=%.2f MiB n_tensors=%d\n",
+                        i, ggml_backend_buft_name(galloc->bufts[i]),
+                        buf_size / 1024.0 / 1024.0, n_in_buf);
+                for (int k = 0; k < 5; k++) {
+                    if (sizes[k] > 0) {
+                        GALLOC_DIAG_LOG("[GALLOC-DIAG]     top%d: %s (%.2f MiB)\n",
+                                k+1, names[k], sizes[k] / 1024.0 / 1024.0);
+                    }
                 }
             }
         }

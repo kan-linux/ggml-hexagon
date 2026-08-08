@@ -88,11 +88,14 @@ HTP_ARCH_VERSION=${HTP_ARCH_VERSIONS%% *}
 #1.12 GiB, will be downloadded automatically via this script when running this script at the first time
 GGUF_MODEL_NAME=/sdcard/qwen1_5-1_8b-chat-q4_0.gguf
 
-#1.2 GiB
-GGUF_MODEL_NAME=/sdcard/Qwen3.5-2B-Q4_0.gguf
-
 #1.2 GiB, will be downloadded automatically via this script when running this script at the first time
 GGUF_MODEL_NAME=/sdcard/Qwen3.5-2B-Q4_0.gguf
+
+#2.5 GiB, will be downloadded automatically via this script when running this script at the first time
+GGUF_MODEL_NAME=/sdcard/Qwen3.5-4B-Q4_0.gguf
+
+#5.1 GiB, will be downloadded automatically via this script when running this script at the first time
+GGUF_MODEL_NAME=/sdcard/Qwen3.5-9B-Q4_0.gguf
 
 #737 MiB, will be downloadded automatically via this script when running this script at the first time
 GGUF_MODEL_NAME=/sdcard/Llama-3.2-1B-Instruct-Q4_0.gguf
@@ -102,8 +105,10 @@ GGUF_MODEL_NAME=/sdcard/gemma-4-E2B-it-Q4_0.gguf
 
 # Model aliases for quick testing of multiple models
 # Usage: ./scripts/build-run-ggmlhexagon-android.sh run_llamacli <alias>
-#   qwen3       -> Qwen3.5-2B-Q4_0.gguf
-#   gemma4      -> gemma-4-E2B-it-Q4_0.gguf (2.9 GiB, fits entirely in ION mempool)
+#   qwen3-2b    -> Qwen3.5-2B-Q4_0.gguf
+#   qwen3-4b    -> Qwen3.5-4B-Q4_0.gguf
+#   qwen3-9b    -> Qwen3.5-9B-Q4_0.gguf
+#   gemma4-e2b  -> gemma-4-E2B-it-Q4_0.gguf (2.9 GiB, fits entirely in ION mempool)
 #   gemma4-e4b  -> gemma-4-E4B_q4_0-it.gguf (4.9 GiB, triggers mirror/eviction for stress testing)
 #   qwen1       -> qwen1_5-1_8b-chat-q4_0.gguf
 #   llama3      -> Llama-3.2-1B-Instruct-Q4_0.gguf
@@ -111,8 +116,10 @@ GGUF_MODEL_NAME=/sdcard/gemma-4-E2B-it-Q4_0.gguf
 function resolve_model_name()
 {
     case "$1" in
-        qwen3)      echo "/sdcard/Qwen3.5-2B-Q4_0.gguf" ;;
-        gemma4)     echo "/sdcard/gemma-4-E2B-it-Q4_0.gguf" ;;
+        qwen3-2b)   echo "/sdcard/Qwen3.5-2B-Q4_0.gguf" ;;
+        qwen3-4b)   echo "/sdcard/Qwen3.5-4B-Q4_0.gguf" ;;
+        qwen3-9b)   echo "/sdcard/Qwen3.5-9B-Q4_0.gguf" ;;
+        gemma4-e2b) echo "/sdcard/gemma-4-E2B-it-Q4_0.gguf" ;;
         gemma4-e4b) echo "/sdcard/gemma-4-E4B_q4_0-it.gguf" ;;
         qwen1)      echo "/sdcard/qwen1_5-1_8b-chat-q4_0.gguf" ;;
         llama3)     echo "/sdcard/Llama-3.2-1B-Instruct-Q4_0.gguf" ;;
@@ -650,6 +657,12 @@ function check_prebuilt_models()
     #1.2 GiB
     check_and_download_model Qwen3.5-2B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_0.gguf
 
+    #2.58 GiB
+    check_and_download_model Qwen3.5-4B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_0.gguf
+
+    #5.1 GiB
+    check_and_download_model Qwen3.5-9B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf
+
     #2.9 GiB
     check_and_download_model gemma-4-E2B-it-Q4_0.gguf     https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf
 
@@ -975,7 +988,7 @@ function run_llamacli()
         model_name="$1"
         model_path=$(resolve_model_name "$model_name")
         if [ -z "$model_path" ]; then
-            echo "ERROR: unknown model alias '$model_name'. Valid aliases: qwen3, gemma4, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$model_name'. Valid aliases: qwen3-2b, qwen3-4b, qwen3-9b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
             exit 1
         fi
     else
@@ -1016,7 +1029,7 @@ function run_llamabench()
 
 function run_llamacli_all()
 {
-    local models=("gemma4" "qwen3" "qwen1" "llama3" "gemma4-e4b")
+    local models=("gemma4-e2b" "qwen3-2b" "qwen3-4b" "qwen3-9b" "qwen1" "llama3" "gemma4-e4b")
 
     local total=${#models[@]}
     local count=0
@@ -1079,7 +1092,7 @@ function run_pp_only()
     # With HEX_OP_PROF_DUMP_INTERVAL=1 in entry.c, every batch triggers
     # a dump, so one run is enough to capture the PP profile.
     # Usage: run_pp_only [model_alias] [round_count]
-    #   model_alias: default gemma4 (gemma-4-E2B-it-Q4_0.gguf)
+    #   model_alias: default gemma4-e2b-e2b (gemma-4-E2B-it-Q4_0.gguf)
     #   round_count: default 1 (more rounds only needed if data looks noisy)
     local model_name=""
     local model_path=""
@@ -1088,7 +1101,7 @@ function run_pp_only()
         model_name="$1"
         model_path=$(resolve_model_name "$model_name")
         if [ -z "$model_path" ]; then
-            echo "ERROR: unknown model alias '$model_name'. Valid aliases: qwen3, gemma4, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$model_name'. Valid aliases: qwen3-2b, qwen3-4b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
             exit 1
         fi
     else
@@ -1124,12 +1137,12 @@ function run_abtest()
     # Requires out/ab-test/ populated (run 'build' then 'build_qcom' first).
     # Usage: run_abtest [rounds] [model_alias]
     #   rounds:      default 3
-    #   model_alias: default gemma4
+    #   model_alias: default gemma4-e2b
     #
     # Example:
     #   $0 run_abtest
     #   $0 run_abtest 5
-    #   $0 run_abtest 3 qwen3
+    #   $0 run_abtest 3 qwen3-2b
     #   $0 run_abtest 2>&1 | tee log_abtest_$(date +%Y%m%d-%H%M%S).txt
 
     local rounds=3
@@ -1143,7 +1156,7 @@ function run_abtest()
         local model_alias="$2"
         model_path=$(resolve_model_name "$model_alias")
         if [ -z "$model_path" ]; then
-            echo "ERROR: unknown model alias '$model_alias'. Valid aliases: qwen3, gemma4, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$model_alias'. Valid aliases: qwen3-2b, qwen3-4b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
             exit 1
         fi
     fi
@@ -1284,7 +1297,7 @@ function run_abtest()
 
 function run_abtest_all()
 {
-    # Run AB test across all 5 supported models.
+    # Run AB test across all 6 supported models.
     # Usage: run_abtest_all [rounds]
     #   rounds: default 3
     #
@@ -1298,8 +1311,8 @@ function run_abtest_all()
         rounds=$1
     fi
 
-    local all_models="qwen3 gemma4 gemma4-e4b qwen1 llama3"
-    local total=5
+    local all_models="qwen3-2b qwen3-4b qwen3-9b gemma4-e2b gemma4-e4b qwen1 llama3"
+    local total=6
     local idx=0
 
     for model_alias in ${all_models}; do
@@ -1321,14 +1334,14 @@ function run_abtest_all()
 
 function run_force_opfusion_in_pp_all()
 {
-    # Automated 5-model force_opfusion_in_pp=0 baseline verification.
+    # Automated 6-model force_opfusion_in_pp=0 baseline verification.
     # Captures two logs per model with unified naming:
     #   log_forceopfusioninpp_<model>_<ts>_terminal.txt  - llama-completion stdout (PP/TG tok/s)
     #   log_forceopfusioninpp_<model>_<ts>_logcat.txt    - adb logcat | grep OP-PROF/QKV/FFN
     # Usage:
     #   $0 run_force_opfusion_in_pp_all
 
-    local models=("gemma4" "qwen3" "qwen1" "llama3" "gemma4-e4b")
+    local models=("gemma4-e2b" "qwen3-2b" "qwen3-4b" "qwen1" "llama3" "gemma4-e4b")
     local total=${#models[@]}
     local count=0
 
@@ -1377,9 +1390,9 @@ function run_ubatchtest()
 {
     # Update ubatch-size values for a given model.
     # Usage: run_ubatchtest [model_alias] [ubatch_sizes_csv]
-    #   model_alias    default: gemma4
+    #   model_alias    default: gemma4-e2b
     #   ubatch_sizes   default: 32,64,128,512,1024
-    local model_alias="gemma4"
+    local model_alias="gemma4-e2b"
     local ubatch_sizes=(8 16 22 32 64 128 512 1024)
     local save_params="${running_params}"
 
@@ -1387,7 +1400,7 @@ function run_ubatchtest()
         if [ -n "$(resolve_model_name "$1")" ]; then
             model_alias="$1"
         else
-            echo "ERROR: unknown model alias '$1'. Valid: qwen3, gemma4, qwen1, llama3, gemma4-e4b"
+            echo "ERROR: unknown model alias '$1'. Valid: qwen3-2b, qwen3-4b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
             return 1
         fi
     fi
@@ -1495,9 +1508,9 @@ function run_ubatchtest()
 
 function run_ubatchtest_all()
 {
-    # Batch ubatch sweep across 5 models x 5 ubatches = 25 tests.
+    # Batch ubatch sweep across 6 models x 5 ubatches = 30 tests.
     # No arguments. Similar in spirit to run_llamacli_all.
-    local models=("gemma4" "qwen3" "qwen1" "llama3" "gemma4-e4b")
+    local models=("gemma4-e2b" "qwen3-2b" "qwen3-4b" "qwen1" "llama3" "gemma4-e4b")
     local ubatch_sizes=(32 64 128 512 1024)
 
     # re-join ubatch sizes back into a comma-separated string for run_ubatchtest
@@ -1593,6 +1606,647 @@ function run_perf-op()
                && export LD_LIBRARY_PATH=${REMOTE_PATH} \
                && ${REMOTE_PATH}/${prog_name} perf -o ${opname}"
 
+}
+
+
+# 5.8.4-F: qwen1 TG root cause profiling.
+# Runs qwen1 (24L, MHA 1:1) and gemma4-e2b (35L, GQA 8:1) TG with HEX_OP_PROF=1
+# (every batch dumped). Validates three hypotheses for qwen1's TG loss
+# (-28.8% vs QCOM, only TG loss in 6-model set):
+#   H1 FLASH_ATTN: MHA KV reads 8x GQA, dominant if MHA-specific
+#   H2 lm-head:   Q6_K->Q4_0 repack matvec bandwidth sub-expected
+#   H3 KV inval:  per-token invalidation overhead on MHA's larger K/V
+# Reference for comparison: §3.6 gemma4-e2b TG profile.
+# Per-model logs are kept separate so the per-op comparison table is clean.
+function run_qwen1_tg_prof()
+{
+    # ensure libs are on phone
+    prepare_run_on_phone llama-completion
+
+    # ensure latest cfg (enable_async_bulk_flush, etc.) is on the phone
+    update_cfg
+
+    local stamp=$(date +%Y%m%d-%H%M%S)
+    local base="qwen1_tg_prof_${stamp}"
+    local summary_log="${base}_summary.log"
+    local qwen1_log="${base}_qwen1.log"
+    local gemma4_log="${base}_gemma4.log"
+
+    # Force M=1 for both PP and TG so profile is pure single-token.
+    # (default --ubatch-size 64 mixes 1 PP batch + 256 TG batches;
+    #  ubatch=1 makes the entire run M=1, eliminating PP contamination.)
+    # -no-cnv: disable conversation mode. With -st + --jinja + user prompt,
+    #   llama-completion emits "User-specified prompt will pre-start conversation"
+    #   and the chat model immediately outputs [end of text] after 1 token,
+    #   truncating TG to 1 step. We don't need chat semantics for perf testing.
+    # Note: must be -no-cnv (single dash), not --no-cnv; see common/arg.cpp:1835.
+    local save_params="${running_params}"
+    running_params=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 1 --batch-size 1 --poll 1000 --no-warmup --load-mode none -fa on --jinja -no-cnv -st"
+
+    # ---------------------------------------------------------------------
+    # Header
+    # ---------------------------------------------------------------------
+    {
+        echo "=========================================="
+        echo "  5.8.4-F: qwen1 TG root cause profiling"
+        echo "  Date: ${stamp}"
+        echo "  Settings: M=1 (ubatch=1, batch=1), n_predict=256, ctx=8192"
+        echo "  HEX_OP_PROF=1, HEX_OP_PROF_DUMP_INTERVAL=1 (per-batch dump)"
+        echo "  Hypotheses: H1 FLASH_ATTN (MHA 1:1, KV 8x GQA),"
+        echo "              H2 lm-head matvec bandwidth,"
+        echo "              H3 per-token KV invalidation"
+        echo "  Per-model logs:"
+        echo "    ${qwen1_log}"
+        echo "    ${gemma4_log}"
+        echo "  This summary: ${summary_log}"
+        echo "=========================================="
+    } | tee "${summary_log}"
+
+    # ---------------------------------------------------------------------
+    # Run both models. MHA qwen1 = test, GQA gemma4-e2b = reference (§3.6).
+    # Each model writes to its own log so OP-PROF extraction is per-model.
+    # OP-PROF lines come from DSP via FARF -> logcat.
+    # We use adb logcat -d (one-shot dump) AFTER each run, not background
+    # streaming, to avoid the kill/wait hang trap on pipeline PID reaping.
+    # OP-PROF is cumulative; the final dump contains full data.
+    # ---------------------------------------------------------------------
+    for model in qwen1 gemma4-e2b; do
+        local model_path=$(resolve_model_name "${model}")
+        [ -z "${model_path}" ] && { echo "ERROR: bad model ${model}"; running_params="${save_params}"; return 1; }
+        local model_log="${base}_${model}.log"
+        local model_logcat="${base}_${model}_logcat.log"
+
+        {
+            echo "=========================================="
+            echo "  Model: ${model} (${model_path})"
+            echo "  CMD: adb shell \"cd ${REMOTE_PATH} && export LD_LIBRARY_PATH=${REMOTE_PATH} && ${REMOTE_PATH}/llama-completion ${running_params} -m ${model_path} -p \\\"${PROMPT_STRING}\\\"\""
+            echo "  Logcat dump: ${model_logcat}"
+            echo "=========================================="
+        } | tee "${model_log}"
+
+        # Clear logcat ring buffer so the post-run dump only sees this run.
+        adb logcat -c 2>/dev/null || true
+
+        # Run inference on phone (synchronous, blocks until completion).
+        adb shell "cd ${REMOTE_PATH} \
+                  && export LD_LIBRARY_PATH=${REMOTE_PATH} \
+                  && ${REMOTE_PATH}/llama-completion ${running_params} \
+                       -m ${model_path} \
+                       -p \"${PROMPT_STRING}\"" 2>&1 \
+            | tee -a "${model_log}"
+
+        # One-shot dump the entire logcat ring buffer. Filter to OP-PROF lines.
+        # Use '|| true' to avoid set -e abort on adb logcat -d transient errors.
+        adb logcat -d 2>/dev/null \
+            | grep -iE '(OP-PROF|OP-PROF-NONOP|OP-PROF-LAYER)' \
+            > "${model_logcat}" || true
+    done
+
+    running_params="${save_params}"
+
+    # ---------------------------------------------------------------------
+    # Per-op profile extraction (per model, sorted by cum us desc).
+    # OP-PROF format (entry.c dump_op_prof):
+    #   [OP-PROF] <tag> op=<NAME> cum=<N> us count=<N> avg=<N> min=<N> max=<N> us
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Per-op profile (cum us, descending, top 20)"
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+
+    for model in qwen1 gemma4-e2b; do
+        local model_logcat="${base}_${model}_logcat.log"
+        {
+            echo ""
+            echo "--- ${model} per-op profile (cum us, descending) ---"
+            # Reformat: prepend cum value, sort numerically desc, strip cum column.
+            grep "OP-PROF" "${model_logcat}" \
+                | grep -oE 'op=[A-Z_0-9]+ cum=[0-9]+ us count=[0-9]+ avg=[0-9]+ min=[0-9]+ max=[0-9]+' \
+                | sed -E 's/.* cum=([0-9]+) us.*/\1 &/' \
+                | sort -k1 -n -r \
+                | sed -E 's/^[0-9]+ //' \
+                | head -20
+        } | tee -a "${summary_log}"
+    done
+
+    # ---------------------------------------------------------------------
+    # Per-batch non-op overhead (hdr, pre, w-inv, a-inv, dst, bulk, queue).
+    # Dumped on the same cadence as OP-PROF (HEX_OP_PROF_DUMP_INTERVAL=1).
+    # Average the last 5 dumps for stability (initial DSP warmup is noisy).
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Per-batch non-op overhead (us/batch, last 5 dumps)"
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+
+    for model in qwen1 gemma4-e2b; do
+        local model_logcat="${base}_${model}_logcat.log"
+        {
+            echo ""
+            echo "--- ${model} per-batch non-op overhead (last 5 dumps) ---"
+            # OP-PROF-NONOP: hdr=NNN pre=NNN w-inv=NNN(NMB) a-inv=NNN(NMB) dst=NNN bulk=NNN queue=NNN
+            grep "OP-PROF-NONOP" "${model_logcat}" \
+                | grep -oE 'hdr=[0-9]+ pre=[0-9]+ w-inv=[0-9]+\([0-9]+MB\) a-inv=[0-9]+\([0-9]+MB\) dst=[0-9]+ bulk=[0-9]+ queue=[0-9]+' \
+                | tail -5
+        } | tee -a "${summary_log}"
+    done
+
+    # ---------------------------------------------------------------------
+    # dump_perf_stats summary (cumulative p10, civac, etc.) for cross-ref.
+    # We grep both model logs and concatenate, tagged by model.
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  dump_perf_stats summary (per model)"
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+
+    for model in qwen1 gemma4-e2b; do
+        local model_log="${base}_${model}.log"
+        {
+            echo ""
+            echo "--- ${model} dump_perf_stats ---"
+            awk '/ggmlhexagon_dump_perf_stats/ {flag=1; print; next}
+                 /^---/ {flag=0}
+                 flag {print}' "${model_log}"
+        } | tee -a "${summary_log}"
+    done
+
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Done."
+        echo "  Share these 5 files for analysis:"
+        echo "    ${summary_log}      (per-op comparison + non-op overhead + dump_perf_stats)"
+        echo "    ${qwen1_log}        (qwen1 terminal output)"
+        echo "    ${gemma4_log}       (gemma4 terminal output)"
+        echo "    ${base}_qwen1_logcat.log  (qwen1 raw OP-PROF stream from DSP)"
+        echo "    ${base}_gemma4_logcat.log (gemma4 raw OP-PROF stream from DSP)"
+        echo "  Next: per-op comparison for H1 (FLASH_ATTN), H2 (lm-head), H3 (KV inval)."
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+}
+
+function run_qwen3_9b_tg_prof()
+{
+    # ensure libs are on phone
+    prepare_run_on_phone llama-completion
+
+    # ensure latest cfg (enable_async_bulk_flush, etc.) is on the phone
+    update_cfg
+
+    local stamp=$(date +%Y%m%d-%H%M%S)
+    local base="qwen3_9b_tg_prof_${stamp}"
+    local summary_log="${base}_summary.log"
+    local qwen3_9b_log="${base}_qwen3-9b.log"
+    local gemma4_log="${base}_gemma4-e2b.log"
+
+    # Force M=1 for both PP and TG so profile is pure single-token.
+    # (default --ubatch-size 64 mixes 1 PP batch + 256 TG batches;
+    #  ubatch=1 makes the entire run M=1, eliminating PP contamination.)
+    # -no-cnv: disable conversation mode. With -st + --jinja + user prompt,
+    #   llama-completion emits "User-specified prompt will pre-start conversation"
+    #   and the chat model immediately outputs [end of text] after 1 token,
+    #   truncating TG to 1 step. We don't need chat semantics for perf testing.
+    # Note: must be -no-cnv (single dash), not --no-cnv; see common/arg.cpp:1835.
+    # 9B is GQA, not MHA, so this run compares GQA-vs-GQA (9B vs gemma4-e2b).
+    # Use the same M=1 settings as run_qwen1_tg_prof for direct comparison.
+    local save_params="${running_params}"
+    running_params=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 1 --batch-size 1 --poll 1000 --no-warmup --load-mode none -fa on --jinja -no-cnv -st"
+
+    # ---------------------------------------------------------------------
+    # Header
+    # ---------------------------------------------------------------------
+    {
+        echo "=========================================="
+        echo "  5.8.5-F2: qwen3.5-9B TG 5x gap root cause profiling"
+        echo "  Date: ${stamp}"
+        echo "  Settings: M=1 (ubatch=1, batch=1), n_predict=256, ctx=8192"
+        echo "  HEX_OP_PROF=1, HEX_OP_PROF_DUMP_INTERVAL=1 (per-batch dump)"
+        echo "  Reference: QCOM PP=135 tok/s, TG=7 tok/s;"
+        echo "             JZ current PP=23.9 tok/s, TG=1.32 tok/s (5x gap)"
+        echo "  Hypotheses (9B-specific, GQA + 5x params vs qwen1):"
+        echo "    H1 graph split (batch_calls >> 256 = missing op or frag)"
+        echo "    H2 missing op (specific op not registered, slow fallback)"
+        echo "    H3 a-inv explosion (5x more params = 5x more activation)"
+        echo "  Per-model logs:"
+        echo "    ${qwen3_9b_log}"
+        echo "    ${gemma4_log}"
+        echo "  This summary: ${summary_log}"
+        echo "=========================================="
+    } | tee "${summary_log}"
+
+    # ---------------------------------------------------------------------
+    # Run models. qwen3.5-9B = test (GQA 4:1, 40 layers, 9B params),
+    # gemma4-e2b = GQA reference (GQA 8:1, 35 layers, 2B params).
+    # Same DSP-side OP-PROF stream via logcat as run_qwen1_tg_prof.
+    # 9B model size: 5.4 GB Q4_0, will stress mempool; mempool size
+    # must be at least 6 GB on phone or run will fail at model load.
+    # ---------------------------------------------------------------------
+    for model in qwen3-9b gemma4-e2b; do
+        local model_path=$(resolve_model_name "${model}")
+        [ -z "${model_path}" ] && { echo "ERROR: bad model ${model}"; running_params="${save_params}"; return 1; }
+        local model_log="${base}_${model}.log"
+        local model_logcat="${base}_${model}_logcat.log"
+
+        {
+            echo "=========================================="
+            echo "  Model: ${model} (${model_path})"
+            echo "  CMD: adb shell \"cd ${REMOTE_PATH} && export LD_LIBRARY_PATH=${REMOTE_PATH} && ${REMOTE_PATH}/llama-completion ${running_params} -m ${model_path} -p \\\"${PROMPT_STRING}\\\"\""
+            echo "  Logcat dump: ${model_logcat}"
+            echo "=========================================="
+        } | tee "${model_log}"
+
+        # Clear logcat ring buffer so the post-run dump only sees this run.
+        adb logcat -c 2>/dev/null || true
+
+        # Run inference on phone (synchronous, blocks until completion).
+        adb shell "cd ${REMOTE_PATH} \
+                  && export LD_LIBRARY_PATH=${REMOTE_PATH} \
+                  && ${REMOTE_PATH}/llama-completion ${running_params} \
+                       -m ${model_path} \
+                       -p \"${PROMPT_STRING}\"" 2>&1 \
+            | tee -a "${model_log}"
+
+        # One-shot dump the entire logcat ring buffer. Filter to OP-PROF lines.
+        # Use '|| true' to avoid set -e abort on adb logcat -d transient errors.
+        adb logcat -d 2>/dev/null \
+            | grep -iE '(OP-PROF|OP-PROF-NONOP|OP-PROF-LAYER)' \
+            > "${model_logcat}" || true
+    done
+
+    running_params="${save_params}"
+
+    # ---------------------------------------------------------------------
+    # Per-op profile extraction (per model, sorted by cum us desc).
+    # OP-PROF format (entry.c dump_op_prof):
+    #   [OP-PROF] <tag> op=<NAME> cum=<N> us count=<N> avg=<N> min=<N> max=<N> us
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Per-op profile (cum us, descending, top 20)"
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+
+    for model in qwen3-9b gemma4-e2b; do
+        local model_logcat="${base}_${model}_logcat.log"
+        {
+            echo ""
+            echo "--- ${model} per-op profile (cum us, descending) ---"
+            grep "OP-PROF" "${model_logcat}" \
+                | grep -oE 'op=[A-Z_0-9]+ cum=[0-9]+ us count=[0-9]+ avg=[0-9]+ min=[0-9]+ max=[0-9]+' \
+                | sed -E 's/.* cum=([0-9]+) us.*/\1 &/' \
+                | sort -k1 -n -r \
+                | sed -E 's/^[0-9]+ //' \
+                | head -20
+        } | tee -a "${summary_log}"
+    done
+
+    # ---------------------------------------------------------------------
+    # Per-batch non-op overhead (hdr, pre, w-inv, a-inv, dst, bulk, queue).
+    # Dumped on the same cadence as OP-PROF (HEX_OP_PROF_DUMP_INTERVAL=1).
+    # Average the last 5 dumps for stability (initial DSP warmup is noisy).
+    # For 9B, watch a-inv MB and bulk MB carefully: 5x more params vs qwen1
+    # means activation footprint and dst flush cost both scale ~5x.
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Per-batch non-op overhead (us/batch, last 5 dumps)"
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+
+    for model in qwen3-9b gemma4-e2b; do
+        local model_logcat="${base}_${model}_logcat.log"
+        {
+            echo ""
+            echo "--- ${model} per-batch non-op overhead (last 5 dumps) ---"
+            grep "OP-PROF-NONOP" "${model_logcat}" \
+                | grep -oE 'hdr=[0-9]+ pre=[0-9]+ w-inv=[0-9]+\([0-9]+MB\) a-inv=[0-9]+\([0-9]+MB\) dst=[0-9]+ bulk=[0-9]+ queue=[0-9]+' \
+                | tail -5
+        } | tee -a "${summary_log}"
+    done
+
+    # ---------------------------------------------------------------------
+    # dump_perf_stats summary (cumulative p10, civac, etc.) for cross-ref.
+    # Key signal: batch_calls. 256 = no graph split (good).
+    # >1000 = still has missing-op splits (H1 confirmed).
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  dump_perf_stats summary (per model)"
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+
+    for model in qwen3-9b gemma4-e2b; do
+        local model_log="${base}_${model}.log"
+        {
+            echo ""
+            echo "--- ${model} dump_perf_stats ---"
+            awk '/ggmlhexagon_dump_perf_stats/ {flag=1; print; next}
+                 /^---/ {flag=0}
+                 flag {print}' "${model_log}"
+        } | tee -a "${summary_log}"
+    done
+
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Done."
+        echo "  Share these 5 files for analysis:"
+        echo "    ${summary_log}            (per-op comparison + non-op overhead + dump_perf_stats)"
+        echo "    ${qwen3_9b_log}           (qwen3.5-9B terminal output)"
+        echo "    ${gemma4_log}             (gemma4-e2b terminal output)"
+        echo "    ${base}_qwen3-9b_logcat.log  (qwen3.5-9B raw OP-PROF stream from DSP)"
+        echo "    ${base}_gemma4-e2b_logcat.log (gemma4-e2b raw OP-PROF stream from DSP)"
+        echo "  Next: per-op comparison for H1 (graph split / missing op), H2 (a-inv),"
+        echo "        H3 (lm-head / matvec bandwidth)."
+        echo "  Compare with qwen1_tg_prof (Table-19/20/21/22) to estimate 5x gap origin."
+        echo "=========================================="
+    } | tee -a "${summary_log}"
+}
+
+# ============================================================
+# run_qwen3_9b_only : 5.8.5-F2 9B cgraph dump (debug)
+#
+# Minimal run of qwen3.5-9B only. Skips gemma4-e2b and the perf-comparison
+# summary. Purpose: capture all ~7450 CGRAPH-DUMP one-liners + 25 unique
+# === GRAPH === blocks to a single logcat file, so we can identify which op
+# causes the 25-way graph split. Prereq: [cdsp] dump_cgraph = 2 in
+# scripts/ggml-hexagon.cfg. Output: qwen3_9b_cgraph_<ts>_logcat.log.
+# ============================================================
+function run_qwen3_9b_only()
+{
+    prepare_run_on_phone llama-completion
+    update_cfg
+
+    local stamp=$(date +%Y%m%d-%H%M%S)
+    local base="qwen3_9b_cgraph_${stamp}"
+    local log_file="${base}.log"
+    local logcat_file="${base}_logcat.log"
+
+    local save_params="${running_params}"
+    # Same M=1 + n_predict=256 + ctx=8192 as run_qwen3_9b_tg_prof.
+    running_params=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 1 --batch-size 1 --poll 1000 --no-warmup --load-mode none -fa on --jinja -no-cnv -st"
+
+    local model="qwen3-9b"
+    local model_path=$(resolve_model_name "${model}")
+    if [ -z "${model_path}" ]; then
+        echo "ERROR: unknown model alias '${model}'"
+        running_params="${save_params}"
+        return 1
+    fi
+
+    {
+        echo "=========================================="
+        echo "  5.8.5-F2: qwen3.5-9B cgraph dump (minimal)"
+        echo "  Date: ${stamp}"
+        echo "  Model: ${model} (${model_path})"
+        echo "  Settings: M=1 (ubatch=1, batch=1), n_predict=256, ctx=8192"
+        echo "  Req: scripts/ggml-hexagon.cfg has [cdsp] dump_cgraph = 2"
+        echo "  Output:"
+        echo "    ${log_file}      (qwen3-9B terminal output)"
+        echo "    ${logcat_file}   (CGRAPH-DUMP one-liners + 25 unique === GRAPH === blocks)"
+        echo "  Next: identify which op causes 25-way graph split; fix missing"
+        echo "        AP validator (cf. 3.7 / 6.2 SOLVE_TRI / SSM_CONV pattern)."
+        echo "=========================================="
+    } | tee "${log_file}"
+
+    # Clear logcat so the dump captures only this run.
+    adb logcat -c 2>/dev/null || true
+
+    # Run inference on phone (synchronous, blocks until completion).
+    adb shell "cd ${REMOTE_PATH} \
+              && export LD_LIBRARY_PATH=${REMOTE_PATH} \
+              && ${REMOTE_PATH}/llama-completion ${running_params} \
+                   -m ${model_path} \
+                   -p \"${PROMPT_STRING}\"" 2>&1 \
+        | tee -a "${log_file}"
+
+    # One-shot dump the entire logcat ring buffer. Filter to CGRAPH-DUMP +
+    # full === GRAPH === blocks.
+    adb logcat -d 2>/dev/null \
+        | grep -iE 'CGRAPH-DUMP|=== GRAPH|ggml_op' \
+        | tee "${logcat_file}"
+
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Done. ${logcat_file} captured."
+        echo ""
+        echo "  Quick analysis commands:"
+        echo "    # 25 unique (first, last, n) triples (top 25):"
+        echo "    grep CGRAPH-DUMP ${logcat_file} | grep -oE 'nodes=[0-9]+ first=[A-Z_]+ last=[A-Z_]+' | sort | uniq -c | sort -rn | head -25"
+        echo ""
+        echo "    # count cache misses (expect ~25 = unique shapes):"
+        echo "    grep -c 'CGRAPH-DUMP.*MISS' ${logcat_file}"
+        echo ""
+        echo "    # count full cgraph dumps (expect 25):"
+        echo "    grep -c '=== GRAPH' ${logcat_file}"
+        echo "=========================================="
+    } | tee -a "${log_file}"
+
+    running_params="${save_params}"
+}
+
+# H1 + H2 verification: sweep ctx_size to compare MHA (qwen1) vs GQA
+# (gemma4-e2b 8:1) on FLASH_ATTN and lm-head op costs.
+#
+# H1 (FLASH_ATTN): MHA reads 2*n_embd*2B = 8 KB per token per layer from K/V
+# cache vs GQA 8:1's 1 KB. Expectation if H1 holds: qwen1 FLASH_ATTN avg
+# grows ~8x faster with ctx than gemma4-e2b's.
+#
+# H2 (lm-head matvec): qwen1 lm-head = 151936 * 1536 * Q4_0 = 116 MB,
+# gemma4-e2b lm-head ~ 196 MB. Effective DRAM bandwidth on 8 Elite = ~64 GB/s
+# (LPDDR5x 5300 MT/s), so theoretical lm-head floor is ~1.8-3.1 ms/token.
+# Compare actual vs theoretical; if actual << theoretical, kernel is
+# bandwidth-bound and DSP-side DRAM prefetch could help.
+function run_flash_lmhead_prof()
+{
+    prepare_run_on_phone llama-completion
+    update_cfg
+
+    local stamp=$(date +%Y%m%d-%H%M%S)
+    local base="h1h2_prof_${stamp}"
+    local summary_log="${base}_summary.log"
+    # 3 ctx points: short (1K), mid (4K), long (16K) — enough to see linear
+    # vs sublinear growth. 32K omitted (qwen1 K/V ~24*1KB*32K = 768MB would
+    # pressure mempool, trigger mirrors, confound measurement).
+    local ctxs="1024 4096 16384"
+    local models="qwen1 gemma4-e2b"
+
+    local save_params="${running_params}"
+    # M=1 (ubatch=1, batch=1) for pure single-token TG profile, same as
+    # run_qwen1_tg_prof. -no-cnv (single dash) avoids chat-mode truncation.
+    running_params=" -ngl 99 -t 6 -n 256 --ubatch-size 1 --batch-size 1 --poll 1000 --no-warmup --load-mode none -fa on --jinja -no-cnv -st"
+
+    {
+        echo "=========================================="
+        echo "  5.8.4-F: H1 (FLASH_ATTN) + H2 (lm-head) ctx sweep"
+        echo "  Date: ${stamp}"
+        echo "  Settings: M=1 (ubatch=1, batch=1), n_predict=256, ctx sweep: ${ctxs}"
+        echo "  HEX_OP_PROF=1, HEX_OP_PROF_DUMP_INTERVAL=1 (per-batch dump)"
+        echo "  Hypotheses:"
+        echo "    H1: MHA 1:1 KV 8x GQA 8:1, FLASH_ATTN avg grows ~8x faster with ctx"
+        echo "    H2: lm-head matvec actual DRAM bandwidth vs theoretical ~64 GB/s"
+        echo "  Per-run files: ${base}_<model>_ctx<N>*.log (6 files + 6 logcat dumps)"
+        echo "  This summary: ${summary_log}"
+        echo "=========================================="
+    } | tee "${summary_log}"
+
+    # ---------------------------------------------------------------------
+    # 6 runs: each (model, ctx) writes its own log + logcat dump. Same
+    # adb logcat -d post-dump pattern as run_qwen1_tg_prof to avoid the
+    # kill/wait hang trap on background pipeline PID reaping.
+    # ---------------------------------------------------------------------
+    for ctx in ${ctxs}; do
+        for model in ${models}; do
+            local model_path=$(resolve_model_name "${model}")
+            [ -z "${model_path}" ] && { echo "ERROR: bad model ${model}"; running_params="${save_params}"; return 1; }
+            local run_log="${base}_${model}_ctx${ctx}.log"
+            local run_logcat="${base}_${model}_ctx${ctx}_logcat.log"
+
+            {
+                echo ""
+                echo "=========================================="
+                echo "  Run: ${model} ctx=${ctx}"
+                echo "  Logcat dump: ${run_logcat}"
+                echo "=========================================="
+            } | tee -a "${summary_log}"
+
+            adb logcat -c 2>/dev/null || true
+
+            adb shell "cd ${REMOTE_PATH}                       && export LD_LIBRARY_PATH=${REMOTE_PATH}                       && ${REMOTE_PATH}/llama-completion ${running_params} --ctx-size ${ctx}                            -m ${model_path}                            -p \"${PROMPT_STRING}\"" 2>&1                 | tee "${run_log}"
+
+            adb logcat -d 2>/dev/null                 | grep -iE '(OP-PROF|OP-PROF-NONOP|OP-PROF-LAYER)'                 > "${run_logcat}" || true
+        done
+    done
+
+    running_params="${save_params}"
+
+    # ---------------------------------------------------------------------
+    # H1 extraction: FLASH_ATTN avg us per batch, per (model, ctx).
+    # Op tag is FLASH_ATTN (entry.c HEX_OP_PROF dump for GGML_OP_FLASH_ATTN).
+    # If tag differs, the grep falls back to a broad match and the avg
+    # column is left blank (then ratio printed as "n/a").
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  H1: FLASH_ATTN avg us per batch (M=1 TG, varies with ctx)"
+        echo "  Expected if H1 holds: qwen1 grows ~8x faster than gemma4"
+        echo "=========================================="
+        printf "  %-10s %-12s %-12s %-12s %-12s\n" "ctx" "qwen1 avg" "gemma4 avg" "qwen1/gemma4" "verdict"
+        for ctx in ${ctxs}; do
+            local q1_avg=$(grep "OP-PROF" "${base}_qwen1_ctx${ctx}_logcat.log"                           | grep -oE 'op=FLASH_ATTN[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                           | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+            local g4_avg=$(grep "OP-PROF" "${base}_gemma4_ctx${ctx}_logcat.log"                           | grep -oE 'op=FLASH_ATTN[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                           | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+            local ratio="n/a"
+            local verdict="n/a"
+            if [ -n "${q1_avg}" ] && [ -n "${g4_avg}" ] && [ "${g4_avg}" -gt 0 ]; then
+                ratio=$(awk -v q="${q1_avg}" -v g="${g4_avg}" 'BEGIN { printf "%.2f", q/g }')
+                # H1 verdict: qwen1 should be larger and grow faster
+                verdict="qwen1_larger"
+            fi
+            printf "  %-10s %-12s %-12s %-12s %-12s\n" "${ctx}" "${q1_avg:-n/a}" "${g4_avg:-n/a}" "${ratio}" "${verdict}"
+        done
+
+        # H1 growth analysis: compare slope from ctx=1024 to ctx=16384
+        echo ""
+        echo "  H1 growth: ratio of (avg at ctx=16384) / (avg at ctx=1024)"
+        echo "  Expected if H1 holds: qwen1 ratio >> gemma4 ratio (MHA linear, GQA sublinear)"
+        local q1_first=$(grep "OP-PROF" "${base}_qwen1_ctx1024_logcat.log"                        | grep -oE 'op=FLASH_ATTN[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                        | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+        local q1_last=$(grep "OP-PROF" "${base}_qwen1_ctx16384_logcat.log"                       | grep -oE 'op=FLASH_ATTN[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                       | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+        local g4_first=$(grep "OP-PROF" "${base}_gemma4_ctx1024_logcat.log"                        | grep -oE 'op=FLASH_ATTN[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                        | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+        local g4_last=$(grep "OP-PROF" "${base}_gemma4_ctx16384_logcat.log"                       | grep -oE 'op=FLASH_ATTN[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                       | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+        if [ -n "${q1_first}" ] && [ -n "${q1_last}" ] && [ "${q1_first}" -gt 0 ]; then
+            local q1_growth=$(awk -v a="${q1_first}" -v b="${q1_last}" 'BEGIN { printf "%.2f", b/a }')
+            echo "    qwen1   growth: ${q1_growth}x  (1024->16384)"
+        else
+            echo "    qwen1   growth: n/a"
+        fi
+        if [ -n "${g4_first}" ] && [ -n "${g4_last}" ] && [ "${g4_first}" -gt 0 ]; then
+            local g4_growth=$(awk -v a="${g4_first}" -v b="${g4_last}" 'BEGIN { printf "%.2f", b/a }')
+            echo "    gemma4  growth: ${g4_growth}x  (1024->16384)"
+        else
+            echo "    gemma4  growth: n/a"
+        fi
+    } | tee -a "${summary_log}"
+
+    # ---------------------------------------------------------------------
+    # H2 extraction: lm-head op (last layer matvec to vocab). Op tag is
+    # MUL_MAT with the weight being the embedding/lm_head matrix. We
+    # grep broadly for MUL_MAT plus identify the lm-head by being the
+    # last matvec of the per-layer sequence (we just report any MUL_MAT
+    # with the largest single-tensor weight as a proxy; the per-op
+    # profile sorts by cum us so lm-head should be visible at top).
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  H2: lm-head matvec avg us per batch (M=1 TG)"
+        echo "  Expected: qwen1 lm-head ~116 MB, gemma4 ~196 MB; theoretical"
+        echo "  DRAM-bound floor at ~64 GB/s = 1.8-3.1 ms/token"
+        echo "=========================================="
+        printf "  %-10s %-12s %-12s %-12s %-15s %-15s\n" "ctx" "qwen1 avg" "gemma4 avg" "qwen1 GB/s" "gemma4 GB/s"
+        for ctx in ${ctxs}; do
+            local q1_avg=$(grep "OP-PROF" "${base}_qwen1_ctx${ctx}_logcat.log"                           | grep -oE 'op=MUL_MAT[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                           | sort -t= -k5 -n -r | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+            local g4_avg=$(grep "OP-PROF" "${base}_gemma4_ctx${ctx}_logcat.log"                           | grep -oE 'op=MUL_MAT[^ ]* cum=[0-9]+ us count=[0-9]+ avg=[0-9]+'                           | sort -t= -k5 -n -r | head -1 | grep -oE 'avg=[0-9]+' | cut -d= -f2)
+            # qwen1 lm-head bytes = 151936 * 1536 * 0.5 (Q4_0) = 116.7 MB
+            # gemma4-e2b lm-head bytes ~ 256000 * 1536 * 0.5 = 196.6 MB
+            local q1_bw="n/a"
+            local g4_bw="n/a"
+            if [ -n "${q1_avg}" ] && [ "${q1_avg}" -gt 0 ]; then
+                q1_bw=$(awk -v us="${q1_avg}" 'BEGIN { printf "%.2f", 116.7 * 1024 / us }')
+            fi
+            if [ -n "${g4_avg}" ] && [ "${g4_avg}" -gt 0 ]; then
+                g4_bw=$(awk -v us="${g4_avg}" 'BEGIN { printf "%.2f", 196.6 * 1024 / us }')
+            fi
+            printf "  %-10s %-12s %-12s %-12s %-15s\n" "${ctx}" "${q1_avg:-n/a}" "${g4_avg:-n/a}" "${q1_bw}" "${g4_bw}"
+        done
+        echo ""
+        echo "  H2 verdict: theoretical DRAM peak on 8 Elite = ~64 GB/s"
+        echo "  If actual << theoretical, lm-head is DRAM-bound and not DSP-limited"
+    } | tee -a "${summary_log}"
+
+    # ---------------------------------------------------------------------
+    # Non-op overhead reference (for cross-checking H3 in case H1+H2
+    # turn out to be small — confirms whether 1588MB a-inv is the real
+    # bottleneck or not).
+    # ---------------------------------------------------------------------
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Reference: a-inv us/batch at each ctx (last 5 dumps)"
+        echo "=========================================="
+        for ctx in ${ctxs}; do
+            for model in ${models}; do
+                echo ""
+                echo "--- ${model} ctx=${ctx} a-inv (last 5 dumps) ---"
+                grep "OP-PROF-NONOP" "${base}_${model}_ctx${ctx}_logcat.log"                     | grep -oE 'a-inv=[0-9]+\([0-9]+MB\)'                     | tail -5
+            done
+        done
+    } | tee -a "${summary_log}"
+
+    {
+        echo ""
+        echo "=========================================="
+        echo "  Done."
+        echo "  Share these 13 files for analysis:"
+        echo "    ${summary_log}  (H1 + H2 cross-ctx comparison)"
+        echo "    ${base}_qwen1_ctx{1024,4096,16384}.log (3 qwen1 terminal outputs)"
+        echo "    ${base}_gemma4_ctx{1024,4096,16384}.log (3 gemma4 terminal outputs)"
+        echo "    ${base}_<model>_ctx<N>_logcat.log (6 raw OP-PROF dumps)"
+        echo "  Next: verify H1 (qwen1 FLASH_ATTN growth > gemma4) +"
+        echo "        H2 (lm-head actual DRAM BW vs ~64 GB/s theoretical)"
+        echo "=========================================="
+    } | tee -a "${summary_log}"
 }
 
 
@@ -1701,7 +2355,7 @@ function show_usage()
     echo "  $0 run_llamacli"
     echo "  $0 run_llamabench"
 
-    echo "  $0 run_llamacli_all     (batch test 5 models = 5 tests)"
+    echo "  $0 run_llamacli_all     (batch test 6 models = 6 tests)"
     echo "    Log capture example:"
     echo "      $0 run_llamacli_all 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
@@ -1711,11 +2365,11 @@ function show_usage()
     echo "    -n 0 exits before processing the prompt. -n 1 gives 1 PP batch"
     echo "    (the prompt) + 1 TG batch; OP-PROF dump 'batch#1' is the PP graph."
     echo "    With HEX_OP_PROF_DUMP_INTERVAL=1, one run = one full batch dump."
-    echo "    model_alias:  default gemma4"
+    echo "    model_alias:  default gemma4-e2b"
     echo "    round_count:  default 1 (raise only if data looks noisy)"
     echo "    Examples:"
-    echo "      $0 run_pp_only              # 1 PP run on gemma4"
-    echo "      $0 run_pp_only qwen3 3      # 3 PP runs on qwen3"
+    echo "      $0 run_pp_only              # 1 PP run on gemma4-e2b"
+    echo "      $0 run_pp_only qwen3-2b 3   # 3 PP runs on qwen3-2b"
     echo "    Log capture example (run in another terminal; batch#1 = PP data):"
     echo "      adb logcat | grep --line-buffered -iE '(OP-PROF.*batch#1 |QKV skip|FFN skip|mul_mat coverage|hmx eligibility)' | tee log_pp_only_\$(date +%Y%m%d-%H%M%S).txt"
     echo "    Or capture both PP+TG for comparison:"
@@ -1727,24 +2381,44 @@ function show_usage()
     echo "  $0 run_abtest  [rounds] [model_alias]"
     echo "    JZ vs QCOM performance comparison (requires 'build' then 'build_qcom' first)."
     echo "    rounds:       default 3"
-    echo "    model_alias:  default gemma4"
+    echo "    model_alias:  default gemma4-e2b"
     echo "    Examples:"
-    echo "      $0 run_abtest                      # 3 rounds, gemma4"
-    echo "      $0 run_abtest 5                    # 5 rounds, gemma4"
-    echo "      $0 run_abtest 3 qwen3              # 3 rounds, qwen3"
+    echo "      $0 run_abtest                      # 3 rounds, gemma4-e2b"
+    echo "      $0 run_abtest 5                    # 5 rounds, gemma4-e2b"
+    echo "      $0 run_abtest 3 qwen3-2b           # 3 rounds, qwen3-2b"
     echo "    Log capture example:"
     echo "      $0 run_abtest 2>&1 | tee log_abtest_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
 
     echo "  $0 run_abtest_all [rounds]"
-    echo "    Batch AB test across all 5 models (qwen3, gemma4, gemma4-e4b, qwen1, llama3)."
+    echo "    Batch AB test across all 6 models (qwen3-2b, qwen3-4b, qwen3-9b, gemma4-e2b, gemma4-e4b, qwen1, llama3)."
     echo "    rounds: default 3"
     echo "    Log capture example:"
     echo "      $0 run_abtest_all 2>&1 | tee log_abtest_all_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
 
+    echo "  $0 run_qwen1_tg_prof"
+    echo "    Kimi-K3 5.8.4-F: qwen1 TG root cause profiling."
+    echo "    Forces M=1 (ubatch=1, batch=1) for pure single-token TG with HEX_OP_PROF=1."
+    echo "    Runs qwen1 (MHA 1:1) vs gemma4-e2b (GQA 8:1) to validate three hypotheses:"
+    echo "      H1 FLASH_ATTN: MHA KV reads 8x GQA, dominant if MHA-specific"
+    echo "      H2 lm-head:    Q6_K/Q4_0 repack matvec bandwidth sub-expected"
+    echo "      H3 KV inval:   per-token invalidation overhead on MHA's larger K/V"
+    echo "    Output: qwen1_tg_prof_<timestamp>.log with per-op cum and non-op overhead."
+    echo -e "\n"
+
+    echo "  $0 run_qwen3_9b_tg_prof"
+    echo "    5.8.5-F2: qwen3.5-9B TG 5x gap root cause profiling."
+    echo "    Same M=1 + HEX_OP_PROF=1 setup as run_qwen1_tg_prof, but tests qwen3.5-9B (GQA 4:1,"
+    echo "    40 layers, 9B params) against gemma4-e2b (GQA 8:1, 35 layers, 2B params) as a"
+    echo "    GVA-vs-GVA reference. Targets the 5x PP/TG gap with QCOM (PP 23.9 vs 135, TG 1.32 vs 7)."
+    echo "    Hypotheses: H1 graph split (batch_calls >> 256), H2 missing op (specific op falls"
+    echo "    back to slow path), H3 a-inv explosion (5x more params = 5x more activation)."
+    echo "    Output: qwen3_9b_tg_prof_<timestamp>.log with per-op cum and non-op overhead."
+    echo -e "\n"
+
     echo "  $0 run_force_opfusion_in_pp_all"
-    echo "    Batch force_opfusion_in_pp=0 baseline verification across 5 models."
+    echo "    Batch force_opfusion_in_pp=0 baseline verification across 6 models."
     echo "    Per model: 1 llama-completion run + logcat capture in background."
     echo "    Outputs 2 logs per model with unified naming:"
     echo "      log_forceopfusioninpp_<model>_<ts>_terminal.txt"
@@ -1753,15 +2427,18 @@ function show_usage()
 
     echo "  $0 run_llamacli   [model_alias]"
     echo "  Model aliases for run_llamacli:"
-    echo "    qwen3         -> Qwen3.5-2B-Q4_0.gguf"
-    echo "    gemma4        -> gemma-4-E2B-it-Q4_0.gguf (2.9 GiB)"
+    echo "    qwen3-2b      -> Qwen3.5-2B-Q4_0.gguf"
+    echo "    qwen3-4b      -> Qwen3.5-4B-Q4_0.gguf"
+    echo "    qwen3-9b      -> Qwen3.5-9B-Q4_0.gguf"
+    echo "    gemma4-e2b    -> gemma-4-E2B-it-Q4_0.gguf (2.9 GiB)"
     echo "    gemma4-e4b    -> gemma-4-E4B_q4_0-it.gguf (4.9 GiB, stress test for mirror/eviction)"
     echo "    qwen1         -> qwen1_5-1_8b-chat-q4_0.gguf"
+    echo "    llama3        -> Llama-3.2-1B-Instruct-Q4_0.gguf"
     echo "    (default)     -> gemma-4-E2B-it-Q4_0.gguf"
     echo "  Examples:"
-    echo "    $0 run_llamacli qwen3        # test qwen3"
-    echo "    $0 run_llamacli gemma4       # test gemma4"
-    echo "    $0 run_llamacli gemma4-e4b   # test gemma4-E4B (mirror stress test)"
+    echo "    $0 run_llamacli qwen3-2b     # test qwen3-2b"
+    echo "    $0 run_llamacli gemma4-e2b   # test gemma4-e2b"
+    echo "    $0 run_llamacli gemma4-e4b   # test gemma4-e4b (mirror stress test)"
     echo -e "\n"
 
     echo "  $0 run_stresstest"
@@ -1774,20 +2451,31 @@ function show_usage()
 
     echo "  $0 run_ubatchtest  [model_alias] [ubatch_csv]"
     echo "    Sweep --ubatch-size values, dump raw per-ubatch logs (no in-shell parsing)."
-    echo "    model_alias:  gemma4 (default) | qwen3 | gemma4-e4b | qwen1 | llama3"
+    echo "    model_alias:  gemma4-e2b (default) | qwen3-2b | qwen3-4b | gemma4-e4b | qwen1 | llama3"
     echo "    ubatch_csv:   32,64,128,512,1024 (default)"
     echo "    Examples:"
-    echo "      $0 run_ubatchtest                          # gemma4 + 32/64/128/512/1024"
-    echo "      $0 run_ubatchtest qwen3                    # qwen3  + 32/64/128/512/1024"
-    echo "      $0 run_ubatchtest qwen3 32,128,512         # qwen3  + 32/128/512"
-    echo "      $0 run_ubatchtest qwen3 64                 # qwen3  + 64"
+    echo "      $0 run_ubatchtest                          # gemma4-e2b + 32/64/128/512/1024"
+    echo "      $0 run_ubatchtest qwen3-2b                 # qwen3-2b + 32/64/128/512/1024"
+    echo "      $0 run_ubatchtest qwen3-2b 32,128,512      # qwen3-2b + 32/128/512"
+    echo "      $0 run_ubatchtest qwen3-2b 64              # qwen3-2b + 64"
     echo "    Log capture example:"
     echo "      $0 run_ubatchtest 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
+
+    echo "  $0 run_flash_lmhead_prof"
+    echo "    Sweep ctx_size to verify H1 (FLASH_ATTN MHA vs GQA growth) and"
+    echo "    H2 (lm-head matvec actual DRAM bandwidth vs ~64 GB/s peak)."
+    echo "    Runs 6 tests: qwen1 + gemma4-e2b crossed with ctx in {1024, 4096, 16384}."
+    echo "    Each (model, ctx) writes its own log + logcat dump; summary"
+    echo "    extracts FLASH_ATTN avg us and top MUL_MAT (proxy for lm-head)"
+    echo "    per (model, ctx) plus growth ratio and DRAM bandwidth estimate."
+    echo "    Note: HEX_OP_PROF must be enabled at build (default on)."
+    echo "    Log capture example:"
+    echo "      $0 run_flash_lmhead_prof 2>&1 | tee log_h1h2_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
 
     echo "  $0 run_ubatchtest_all"
-    echo "    Batch ubatch sweep across 5 models x 5 ubatches = 25 tests."
-    echo "    models:    gemma4, qwen3, qwen1"
+    echo "    Batch ubatch sweep across 6 models x 5 ubatches = 30 tests."
+    echo "    models:    gemma4-e2b, qwen3-2b, qwen3-4b, qwen1, llama3, gemma4-e4b"
     echo "    ubatches:  32, 64, 128, 512, 1024"
     echo "    Log capture example:"
     echo "      $0 run_ubatchtest_all 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
@@ -1878,6 +2566,17 @@ elif [ $# == 1 ]; then
     elif [ "$1" == "run_ubatchtest_all" ]; then
         run_ubatchtest_all
         exit 0
+    elif [ "$1" == "run_qwen1_tg_prof" ]; then
+        run_qwen1_tg_prof
+        exit 0
+    elif [ "$1" == "run_qwen3_9b_tg_prof" ]; then
+        run_qwen3_9b_tg_prof
+    elif [ "$1" == "run_qwen3_9b_only" ]; then
+        run_qwen3_9b_only
+        exit 0
+    elif [ "$1" == "run_flash_lmhead_prof" ]; then
+        run_flash_lmhead_prof
+        exit 0
     else
         show_usage
         exit 1
@@ -1896,7 +2595,7 @@ elif [ $# == 2 ]; then
         exit 0
     elif [ "$1" == "run_llamacli" ]; then
         if [ -z "$(resolve_model_name "$2")" ]; then
-            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3, gemma4, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3-2b, qwen3-4b, qwen3-9b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
             show_usage
             exit 1
         fi
@@ -1904,7 +2603,7 @@ elif [ $# == 2 ]; then
         exit 0
     elif [ "$1" == "run_pp_only" ]; then
         if [ -n "$2" ] && [ -z "$(resolve_model_name "$2")" ]; then
-            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3, gemma4, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3-2b, qwen3-4b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
             show_usage
             exit 1
         fi
@@ -1937,7 +2636,7 @@ elif [ $# == 3 ]; then
         exit 0
     elif [ "$1" == "run_llamacli" ]; then
         if [ -z "$(resolve_model_name "$2")" ]; then
-            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3, gemma4, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3-2b, qwen3-4b, qwen3-9b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
             show_usage
             exit 1
         fi

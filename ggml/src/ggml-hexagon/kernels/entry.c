@@ -63,6 +63,7 @@
 #endif
 
 #define GGMLHEXAGON_LOG_INFO(...)       ggml_log_always(GGMLHEXAGON_LOG_LEVEL_DEBUG, __FILE__, __FUNCTION__, __LINE__, __VA_ARGS__)
+#define GGMLHEXAGON_LOG_ALWAYS(...)     ggml_log_always(GGMLHEXAGON_LOG_LEVEL_DEBUG, __FILE__, __FUNCTION__, __LINE__, __VA_ARGS__)
 
 #define GGMLHEXAGON_LOG_ERROR(...)      ggml_log_always(GGMLHEXAGON_LOG_LEVEL_DEBUG, __FILE__, __FUNCTION__, __LINE__, __VA_ARGS__)
 
@@ -88,15 +89,18 @@
                 }                                                                               \
             }                                                                                   \
         } else {                                                                                \
-            /* Activation tensor: bit 1 check */                                                \
+            /* Activation tensor: bit 1 check, then Path-B3 a-inv bitmap */                     \
             if ((g_dsp_ctx->dsp_cache_mode & 0x2) &&                                            \
                 prior_dst_contains_src((tensor_idx), (dt_ptr)->data, (dt_ptr)->data_len)) {     \
                 if (g_dsp_ctx->dsp_cache_trace_bit1) {                                          \
                     GGMLHEXAGON_LOG_INFO("[DSP-CACHE-TRACE-BIT1] op=%u src=%d SKIP ptr=%p len=0x%x (cache_mode=0x%x)",              \
                                          (op_i), (int)(src_idx), (dt_ptr)->data, (dt_ptr)->data_len, g_dsp_ctx->dsp_cache_mode);    \
                 }                                                                               \
+            } else if (dsp_a_inv_bitmap_all_set((dt_ptr)->data, (dt_ptr)->data_len)) {         \
+                /* Path-B3: all pages invalidated in a prior batch, skip */                     \
             } else {                                                                            \
                 prof_cache_inval_range((dt_ptr)->data, (dt_ptr)->data_len, 0);                  \
+                dsp_a_inv_bitmap_set_pages((dt_ptr)->data, (dt_ptr)->data_len);                 \
                 if (g_dsp_ctx->dsp_cache_trace_bit1) {                                          \
                     GGMLHEXAGON_LOG_INFO("[DSP-CACHE-TRACE-BIT1] op=%u src=%d INVAL ptr=%p len=0x%x (cache_mode=0x%x)",             \
                                          (op_i), (int)(src_idx), (dt_ptr)->data, (dt_ptr)->data_len, g_dsp_ctx->dsp_cache_mode);    \
@@ -388,6 +392,86 @@ static inline void weight_inval_unmark(const void * ptr) {
             hi = mid - 1;
         }
     }
+}
+
+/* Path-B3: DSP-side a-inv bitmap. Per-page invalidated-bit map sized to
+ * mempool_dsp_size; bit set = page L2 invalidated, bit cleared = DSP wrote
+ * to that page since last invalidate. Persists across batches; reset on
+ * 0xFFFC bit 4 (model reload). Same class of bug as async_bulk_flush:
+ * clear the page in the dst write path or DSP will read stale L2 lines. */
+static inline void dsp_a_inv_bitmap_init(void) {
+    if (g_dsp_ctx->a_inv_bitmap_bits) return;  /* already allocated */
+    size_t bytes = g_dsp_ctx->mempool_dsp_size >> 12;  /* pages */
+    if (bytes == 0) return;
+    g_dsp_ctx->a_inv_bitmap_num_pages = bytes;
+    g_dsp_ctx->a_inv_bitmap_bits = (uint64_t *)calloc((bytes + 63) >> 6, sizeof(uint64_t));
+    GGMLHEXAGON_LOG_ALWAYS("[DSP-A-INV-BITMAP] init: %zu pages (%zu MB) bitmap=%zu KB",
+                           bytes, g_dsp_ctx->mempool_dsp_size / (1024 * 1024),
+                           ((bytes + 63) >> 6) * 8 / 1024);
+}
+
+static inline void dsp_a_inv_bitmap_reset(void) {
+    if (g_dsp_ctx->a_inv_bitmap_bits) {
+        memset(g_dsp_ctx->a_inv_bitmap_bits, 0,
+               ((g_dsp_ctx->a_inv_bitmap_num_pages + 63) >> 6) * sizeof(uint64_t));
+        GGMLHEXAGON_LOG_ALWAYS("[DSP-A-INV-BITMAP] reset (model reload)");
+    }
+}
+
+/* Mark all 4 KB pages covered by [p, p+len) as invalidated (set bits).
+ * Skips pages outside the mempool. */
+static inline void dsp_a_inv_bitmap_set_pages(const void * p, size_t len) {
+    if (!g_dsp_ctx->enable_dsp_a_inv_bitmap || !g_dsp_ctx->a_inv_bitmap_bits) return;
+    if (!p || len == 0) return;
+    uintptr_t base = (uintptr_t)g_dsp_ctx->mempool_dsp_base;
+    if ((uintptr_t)p < base) return;
+    size_t off = (size_t)((uintptr_t)p - base);
+    if (off >= g_dsp_ctx->mempool_dsp_size) return;
+    size_t end = off + len;
+    if (end > g_dsp_ctx->mempool_dsp_size) end = g_dsp_ctx->mempool_dsp_size;
+    size_t pg_start = off >> 12;
+    size_t pg_end   = (end + 0xFFFu) >> 12;
+    if (pg_end > g_dsp_ctx->a_inv_bitmap_num_pages) pg_end = g_dsp_ctx->a_inv_bitmap_num_pages;
+    for (size_t i = pg_start; i < pg_end; i++) {
+        g_dsp_ctx->a_inv_bitmap_bits[i >> 6] |= (1ULL << (i & 63));
+    }
+}
+
+/* Mark all 4 KB pages covered by [p, p+len) as DSP-written (clear bits). */
+static inline void dsp_a_inv_bitmap_clear_pages(const void * p, size_t len) {
+    if (!g_dsp_ctx->enable_dsp_a_inv_bitmap || !g_dsp_ctx->a_inv_bitmap_bits) return;
+    if (!p || len == 0) return;
+    uintptr_t base = (uintptr_t)g_dsp_ctx->mempool_dsp_base;
+    if ((uintptr_t)p < base) return;
+    size_t off = (size_t)((uintptr_t)p - base);
+    if (off >= g_dsp_ctx->mempool_dsp_size) return;
+    size_t end = off + len;
+    if (end > g_dsp_ctx->mempool_dsp_size) end = g_dsp_ctx->mempool_dsp_size;
+    size_t pg_start = off >> 12;
+    size_t pg_end   = (end + 0xFFFu) >> 12;
+    if (pg_end > g_dsp_ctx->a_inv_bitmap_num_pages) pg_end = g_dsp_ctx->a_inv_bitmap_num_pages;
+    for (size_t i = pg_start; i < pg_end; i++) {
+        g_dsp_ctx->a_inv_bitmap_bits[i >> 6] &= ~(1ULL << (i & 63));
+    }
+}
+
+/* True iff every 4 KB page in [p, p+len) is currently set (invalidated). */
+static inline int dsp_a_inv_bitmap_all_set(const void * p, size_t len) {
+    if (!g_dsp_ctx->enable_dsp_a_inv_bitmap || !g_dsp_ctx->a_inv_bitmap_bits) return 0;
+    if (!p || len == 0) return 0;
+    uintptr_t base = (uintptr_t)g_dsp_ctx->mempool_dsp_base;
+    if ((uintptr_t)p < base) return 0;
+    size_t off = (size_t)((uintptr_t)p - base);
+    if (off >= g_dsp_ctx->mempool_dsp_size) return 0;
+    size_t end = off + len;
+    if (end > g_dsp_ctx->mempool_dsp_size) end = g_dsp_ctx->mempool_dsp_size;
+    size_t pg_start = off >> 12;
+    size_t pg_end   = (end + 0xFFFu) >> 12;
+    if (pg_end > g_dsp_ctx->a_inv_bitmap_num_pages) pg_end = g_dsp_ctx->a_inv_bitmap_num_pages;
+    for (size_t i = pg_start; i < pg_end; i++) {
+        if (!((g_dsp_ctx->a_inv_bitmap_bits[i >> 6] >> (i & 63)) & 1u)) return 0;
+    }
+    return 1;
 }
 
 /* DSP-side cache optimization: prior_dst tracking (bit 1) + bulk flush (bit 2).
@@ -1595,6 +1679,7 @@ int ggml_dsp_open(const char * uri, remote_handle64 * handle) {
     ctx->dsp_cache_trace_bit0 = 0;  // default off; AP pushes via 0xFFFC bit 16
     ctx->dsp_cache_trace_bit1 = 0;  // default off; AP pushes via 0xFFFC bit 17
     ctx->enable_async_bulk_flush = 0; // default off; AP pushes via 0xFFFC bit 18
+    ctx->enable_first_touch_w_inv_loading = 0; // default off; AP pushes via 0xFFFC bit 20
     ctx->async_flush_thread_running = 0;
 
     printf("uri %s\n", uri);
@@ -2131,6 +2216,10 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
      *   bit   4    : reset weight_inval first-touch array (model reload)
      *   bit  16    : dsp_cache_trace_bit0 (1 = emit [DSP-CACHE-TRACE-BIT0] per bit 0 decision)
      *   bit  17    : dsp_cache_trace_bit1 (1 = emit [DSP-CACHE-TRACE-BIT1] per bit 1 decision)
+     *   bit  18    : enable_async_bulk_flush (Path B1, sticky)
+     *   bit  19    : enable_dsp_a_inv_bitmap (Path B3, sticky)
+     *   bit  20    : enable_first_touch_w_inv_loading (Path G, sticky) — when
+     *                 1, accept 0xFFFD bulk first-touch pre-inval list
      * Pushed by AP at ggmlhexagon_init_cdsp() time. Bit definitions:
      *   bit 0 (0x1): first-touch weight bitmap    - INVAL_SRC_IF_NEEDED skips
      *               dcinva for repack weights (flags==2) once invalidated.
@@ -2148,16 +2237,24 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
      *               so new model weights at reused ION addresses get properly
      *               invalidated after model unload/reload.
      *   bit 18: enable async bulk flush (Path B1). Pushed at the same 0xFFFC
-     *               as dsp_cache_mode; the flag is sticky for the session. */
+     *               as dsp_cache_mode; the flag is sticky for the session.
+     *   bit 19: enable DSP a-inv bitmap (Path B3). Pushed at the same 0xFFFC
+     *               as dsp_cache_mode; the flag is sticky for the session.
+     *   bit 20: enable first-touch w-inv loading (Path G). Pushed at the same
+     *               0xFFFC; when 1, accept 0xFFFD bulk pre-inval list. */
     if (batch_size == 0xFFFC) {
         g_dsp_ctx->dsp_cache_mode = batch_offset & 0xFu;
         g_dsp_ctx->dsp_cache_trace_bit0 = (batch_offset >> 16) & 0x1u;
         g_dsp_ctx->dsp_cache_trace_bit1 = (batch_offset >> 17) & 0x1u;
         g_dsp_ctx->enable_async_bulk_flush = (batch_offset >> 18) & 0x1u;
+        g_dsp_ctx->enable_dsp_a_inv_bitmap = (batch_offset >> 19) & 0x1u;
+        g_dsp_ctx->enable_first_touch_w_inv_loading = (batch_offset >> 20) & 0x1u;
+        dsp_a_inv_bitmap_init();  /* lazy alloc from mempool_dsp_size */
         if (batch_offset & 0x10u) {
             weight_inval_reset_all();
+            dsp_a_inv_bitmap_reset();
         }
-        GGMLHEXAGON_LOG_INFO("[DSP-CACHE-MODE] dsp_cache_mode=0x%x (bit0=first-touch=%d bit1=prior-dst=%d bit2=bulk-flush=%d bit3=selective=%d bit4=reset-inval=%d) trace0=%d trace1=%d",
+        GGMLHEXAGON_LOG_INFO("[DSP-CACHE-MODE] dsp_cache_mode=0x%x (bit0=first-touch=%d bit1=prior-dst=%d bit2=bulk-flush=%d bit3=selective=%d bit4=reset-inval=%d) trace0=%d trace1=%d async-flush=%d a-inv-bitmap=%d w-inv-loading=%d",
                              g_dsp_ctx->dsp_cache_mode,
                              (g_dsp_ctx->dsp_cache_mode & 0x1) ? 1 : 0,
                              (g_dsp_ctx->dsp_cache_mode & 0x2) ? 1 : 0,
@@ -2165,7 +2262,105 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
                              (g_dsp_ctx->dsp_cache_mode & 0x8) ? 1 : 0,
                              (batch_offset & 0x10u) ? 1 : 0,
                              g_dsp_ctx->dsp_cache_trace_bit0,
-                             g_dsp_ctx->dsp_cache_trace_bit1);
+                             g_dsp_ctx->dsp_cache_trace_bit1,
+                             g_dsp_ctx->enable_async_bulk_flush,
+                             g_dsp_ctx->enable_dsp_a_inv_bitmap,
+                             g_dsp_ctx->enable_first_touch_w_inv_loading);
+        return AEE_SUCCESS;
+    }
+
+    /* Path-G bulk first-touch weight pre-inval: batch_size == 0xFFFD.
+     * batch_offset = 4 KB page offset of the list region header in mempool.
+     * The list region layout: [4-byte n_entries header][N entries x 16 bytes].
+     *   entry: { uint64_t ptr (offset from mempool base, NOT a virtual
+     *           address); uint32_t len; uint32_t reserved }.
+     * DSP reconstructs the DSP virtual address as base + ptr. n_entries is
+     * read from the mempool header (not packed into batch_offset) so the
+     * full 32-bit page_offset can address any 4 KB-aligned position in the
+     * mempool (up to 16 TB), instead of being capped to 256 MB.
+     *
+     * Behavior: for each entry, dcinva the range and add the ptr to
+     * weight_inval_ptrs[] so the first PP batch sees them as already
+     * invalidated and skips per-op dcinva. This moves the first-touch dcinva
+     * cost from "first PP batch" to "model load time", improving TTFT.
+     *
+     * Gated on enable_first_touch_w_inv_loading (sticky, set via 0xFFFC bit 20).
+     * No-op if 0: legacy lazy first-touch behavior is preserved. */
+    if (batch_size == 0xFFFD) {
+        if (!g_dsp_ctx->enable_first_touch_w_inv_loading) {
+            GGMLHEXAGON_LOG_WARN("[DSP-W-PREINVAL] 0xFFFD received but enable_first_touch_w_inv_loading=0, ignored");
+            return AEE_SUCCESS;
+        }
+        // batch_offset is a full 32-bit 4KB page offset (no truncation).
+        const uint32_t page_offset = batch_offset;
+        const size_t   byte_offset = (size_t)page_offset << 12;
+        if (byte_offset >= g_dsp_ctx->mempool_dsp_size) {
+            GGMLHEXAGON_LOG_WARN("[DSP-W-PREINVAL] invalid 0xFFFD payload: page_offset=0x%x (byte_offset=0x%zx)",
+                                 page_offset, byte_offset);
+            return AEE_EBADPARM;
+        }
+        typedef struct __attribute__((packed)) {
+            uint64_t ptr;       // offset from mempool base
+            uint32_t len;
+            uint32_t reserved;
+        } w_pre_inval_entry_t;
+        // dcinva the header (4 bytes) so DSP sees the fresh n_entries
+        ggml_dsp_cache_inval_range((void *)(uintptr_t)(base + byte_offset), sizeof(uint32_t));
+        const uint32_t n_entries = *(const uint32_t *)(base + byte_offset);
+        if (n_entries == 0 || n_entries > 4096) {
+            GGMLHEXAGON_LOG_WARN("[DSP-W-PREINVAL] invalid n_entries=%u", n_entries);
+            return AEE_EBADPARM;
+        }
+        const size_t header_bytes       = sizeof(uint32_t);
+        const size_t entries_byte_off   = byte_offset + header_bytes;
+        const size_t list_payload_bytes = (size_t)n_entries * sizeof(w_pre_inval_entry_t);
+        if (entries_byte_off + list_payload_bytes > g_dsp_ctx->mempool_dsp_size) {
+            GGMLHEXAGON_LOG_WARN("[DSP-W-PREINVAL] list region exceeds mempool: byte_offset=0x%zx + list_payload_bytes=0x%zx > mempool_dsp_size=0x%zx",
+                                 entries_byte_off, list_payload_bytes, g_dsp_ctx->mempool_dsp_size);
+            return AEE_EBADPARM;
+        }
+        const w_pre_inval_entry_t * entries =
+            (const w_pre_inval_entry_t *)(base + entries_byte_off);
+        // dcinva the entry list region (AP flushed it via DC CVAC before the call)
+        ggml_dsp_cache_inval_range((void *)(uintptr_t)(base + entries_byte_off), list_payload_bytes);
+        // Coalesce all entry ranges into a single bounding dcinva. Per-entry
+        // dcinva is line-by-line and costs ~5-10 ns/line, so doing it N times
+        // is O(total_bytes) regardless of N. Bounding-range dcinva is the
+        // same cost but only one dcinva call (syncht barrier etc). The L2
+        // invalidation is identical because the underlying cache lines are
+        // the same set. The only downside is dcinva-ing pages that contain
+        // no weight data (holes between weight tensors), but those pages
+        // are typically also touched by the first PP batch anyway, so the
+        // extra invalidations are no-ops.
+        size_t min_off = SIZE_MAX;
+        size_t max_end = 0;
+        for (uint32_t i = 0; i < n_entries; i++) {
+            const size_t off = (size_t)entries[i].ptr;
+            const size_t l   = (size_t)entries[i].len;
+            if (l == 0 || off >= g_dsp_ctx->mempool_dsp_size) continue;
+            if (off < min_off)        min_off = off;
+            if (off + l > max_end)    max_end = off + l;
+        }
+        uint64_t total_bytes = 0;
+        int64_t  t0 = ggml_time_us();
+        if (min_off < max_end) {
+            ggml_dsp_cache_inval_range((void *)(uintptr_t)(base + min_off),
+                                       max_end - min_off);
+            total_bytes = max_end - min_off;
+        }
+        // Add each entry's ptr to weight_inval_ptrs[] (no dcinva here, the
+        // bounding dcinva above already covered all the cache lines).
+        for (uint32_t i = 0; i < n_entries; i++) {
+            const size_t off = (size_t)entries[i].ptr;
+            const void * p   = (const void *)(uintptr_t)(base + off);
+            const size_t l   = (size_t)entries[i].len;
+            if (l == 0 || off >= g_dsp_ctx->mempool_dsp_size) continue;
+            weight_inval_check_and_mark(p);
+        }
+        const int64_t dt = ggml_time_us() - t0;
+        GGMLHEXAGON_LOG_INFO("[DSP-W-PREINVAL] dcinva %llu MiB (%u ranges merged into 1 bounding range), in %lld us",
+                             (unsigned long long)(total_bytes / (1024 * 1024)),
+                             n_entries, (long long)dt);
         return AEE_SUCCESS;
     }
 
@@ -2501,6 +2696,11 @@ AEEResult ggml_dsp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
             if (g_dsp_ctx->dsp_cache_mode & 0x1) {
                 weight_inval_unmark(g_dsp_ctx->dst_dt_buf[k].data);
             }
+            /* Path-B3: DSP just wrote here, mark pages as stale so the
+             * next src-read must re-invalidate. Covers ion_sync-only
+             * (ion_sync_mode=1) path too where DC CVAC is skipped. */
+            dsp_a_inv_bitmap_clear_pages(g_dsp_ctx->dst_dt_buf[k].data,
+                                        g_dsp_ctx->dst_dt_buf[k].data_len);
         }
 #if HEX_OP_PROF
         g_dsp_ctx->nonop_dst_track_us += (uint64_t)(ggml_time_us() - prof_dst_t0);

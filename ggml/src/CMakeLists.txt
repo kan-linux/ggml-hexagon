@@ -502,7 +502,7 @@ elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
 endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES "Android")
-    target_link_libraries(ggml-base PRIVATE dl)
+    target_link_libraries(ggml-base PRIVATE dl log)
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "visionOS")

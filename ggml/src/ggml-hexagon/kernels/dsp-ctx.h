@@ -313,6 +313,22 @@ struct dsp_context {
     atomic_uint          async_flush_done;     /* consumer: == seqn means done */
     int                  async_flush_ranges_idx; /* 0 or 1, double-buffer selector */
     volatile int         async_flush_thread_running;
+
+    // Path-B3: DSP-side a-inv bitmap. Bit set = page invalidated this
+    // session, cleared when DSP writes to that page. Persists across
+    // batches within a model load; reset on 0xFFFC bit 4 (model reload).
+    // Allocated lazily on first 0xFFFC (size = mempool_dsp_size/4096 bits);
+    // freed in ggml_dsp_close. ~48 KB for a 1.5 GB mempool.
+    uint64_t * a_inv_bitmap_bits;
+    size_t     a_inv_bitmap_num_pages;
+    int        enable_dsp_a_inv_bitmap;  /* 0/1, pushed via 0xFFFC bit 19 */
+
+    // Path-G: first-touch weight pre-invalidation at model load time. When 1,
+    // AP can push a list of {ptr, len} ranges via execute_batch(0xFFFD) and
+    // DSP dcinvas them and adds the ptrs to weight_inval_ptrs[] in one batched
+    // call. The first PP batch then sees all weights as already-invalidated and
+    // skips per-op dcinva, improving TTFT. 0/1, pushed via 0xFFFC bit 20.
+    int        enable_first_touch_w_inv_loading;
 };
 
 #ifdef  __cplusplus

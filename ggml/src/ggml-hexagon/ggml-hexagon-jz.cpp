@@ -206,6 +206,15 @@ struct ion_pool_region {
     bool   in_use;      // true if currently allocated
 };
 
+// Path-E mechanism 2: per-buffer mirror record. One entry per unique heap
+// data pointer that Phase 5 mirrors into mempool. Defined at file scope so
+// the static graph_compute_batch function can name it without the full
+// ggml_backend_hexagon_context::cgraph_cache_entry:: qualifier.
+struct cgraph_mirror_meta {
+    void *   original_data;
+    uint32_t data_len;
+};
+
 struct ggml_backend_hexagon_context {
     int device;
     char name[GGML_MAX_NAME];
@@ -231,6 +240,19 @@ struct ggml_backend_hexagon_context {
     bool   weights_dirty;                       // set by set_tensor/memset_tensor, cleared by Phase 9
     bool   dsp_need_weight_inval_reset;         // set by free_buffer on model unload, sent to DSP via 0xFFFC before next batch
     std::vector<ion_pool_region> ion_regions;   // region tracking for mempool free-space management
+
+    // Path-G: per-tensor {data_ptr, len} list of repack weights collected at
+    // set_tensor time. Pushed to DSP once via 0xFFFD before the first PP batch
+    // so the first-touch dcinva cost is paid at model load time, not during
+    // the first batch. Cleared on free_buffer (model unload). Max 4096 entries
+    // mirrors DSP's weight_inval_ptrs[] cap.
+    struct weight_pre_inval_entry_t {
+        uint64_t ptr;   // tensor->data (or repack output) absolute ION pointer
+        uint32_t len;   // bytes covered by this weight
+        uint32_t reserved;
+    };
+    std::vector<weight_pre_inval_entry_t> weight_pre_inval_list;
+    bool   weight_pre_inval_pushed;             // true after the 0xFFFD push for the current model load
 
     // FastRPC call statistics
     uint64_t rpc_batch_call_count;              // total ggml_dsp_execute_batch calls
@@ -347,8 +369,17 @@ struct ggml_backend_hexagon_context {
     // The scheduler rebuilds split->graph every call, so the cgraph pointer
     // is NOT hashed. The underlying node ops/shapes/src/data ptrs are stable
     // for graph-reuse, which is what the hash covers.
-    // A FNV-1a hash over {op, ne[4], nb[4], non-null src[0..GGML_MAX_SRC-1] ptr, data ptr}
-    // per node gives a 64-bit key that is effectively collision-free.
+    // A FNV-1a hash over {op, data ptr, key src[0]} per node gives a 64-bit
+    // key that is effectively collision-free (Path-E mechanism 1: hash
+    // slimmed from 20 to 3 FNV-1a mix ops per node).
+    // Path-E mechanism 2: cgraph_cache_entry::cached_mirrors stores one
+    // cgraph_mirror_meta per unique heap data pointer that Phase 5 mirrors
+    // into mempool. The struct definition is at file scope (above this
+    // struct ggml_backend_hexagon_context) so the static
+    // graph_compute_batch function can name it without the full
+    // ggml_backend_hexagon_context::cgraph_cache_entry:: qualifier. The
+    // `using mirror_meta` alias below keeps the nested type name available
+    // for any callers that already have an entry in hand.
     struct cgraph_cache_entry {
         uint64_t content_hash = 0;
         int n_nodes = 0;
@@ -358,6 +389,8 @@ struct ggml_backend_hexagon_context {
         std::vector<ggml_tensor *> supported_nodes;
         std::vector<hex_op_desc>   hex_ops;
         std::vector<uint8_t>       is_weight;   // per-tensor boolean
+        using mirror_meta = cgraph_mirror_meta;
+        std::vector<mirror_meta> cached_mirrors;
     };
     std::unordered_map<uint64_t, cgraph_cache_entry> cgraph_cache;
     uint64_t cgraph_cache_hits   = 0;
@@ -382,6 +415,7 @@ struct ggml_backend_hexagon_context {
 
 struct hexagon_appcfg_t {
     int dump_debug_info;        // enable/disable dump debug info for troubleshooting issues on AP side
+    int dump_cgraph;            // 0=off, 1=full print on cache miss, 2=+per-call first/last log
     int thread_counts;          // thread_counts on CDSP side
     int dump_diag_info;         // enable/disable dump diag info for troubleshooting issues on CDSP side
     int ndev;                   // number of Hexagon devices (PDs), from GGML_HEXAGON_NDEV env
@@ -424,6 +458,8 @@ struct hexagon_appcfg_t {
                                 //   dsp_cache_trace_bit0 to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
     int enable_async_bulk_flush; // Path B1: DSP-side async bulk flush thread (default 1)
+    int enable_dsp_a_inv_bitmap; // Path B3: DSP-side a-inv page bitmap (default 0, opt-in)
+    int enable_first_touch_w_inv_loading; // Path G: bulk first-touch w-inv at model load (default 1)
 
     const char * cfgfilename;
     const char * runtime_libpath;
@@ -439,6 +475,7 @@ struct hexagon_appcfg_t {
 #endif
 static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dump_debug_info        = 0,
+        .dump_cgraph            = 0,
         .thread_counts          = 6,
         .dump_diag_info         = 0,
         .ndev                   = 1,
@@ -453,6 +490,8 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
         .enable_async_bulk_flush = 1,  // Path B1: async bulk flush thread (default on)
+        .enable_dsp_a_inv_bitmap = 0,  // Path B3: per-page a-inv bitmap (opt-in, dsp-ctx.h)
+        .enable_first_touch_w_inv_loading = 1,  // Path G: bulk first-touch w-inv at load (default on)
         .cfgfilename            = "ggml-hexagon.cfg",
 #if defined(__ANDROID__)
         .runtime_libpath        = "/data/local/tmp/",
@@ -646,11 +685,14 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     GGMLHEXAGON_LOG_VERBOSE("dsp_cache_trace_bit1:             %d", g_hexagon_appcfg.dsp_cache_trace_bit1);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(DSP):              %d", g_hexagon_appcfg.dump_diag_info);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(AP):               %d", g_hexagon_appcfg.dump_debug_info);
+    GGMLHEXAGON_LOG_VERBOSE("dump_cgraph:                      %d", g_hexagon_appcfg.dump_cgraph);
     GGMLHEXAGON_LOG_VERBOSE("enable graph_optimize:            %d", g_hexagon_appcfg.enable_graph_optimize);
     GGMLHEXAGON_LOG_VERBOSE("enable_opfusion:                  %d", g_hexagon_appcfg.enable_opfusion);
     GGMLHEXAGON_LOG_VERBOSE("force_opfusion_in_pp:             %d", g_hexagon_appcfg.force_opfusion_in_pp);
     GGMLHEXAGON_LOG_VERBOSE("enable_async_bulk_flush:          %d", g_hexagon_appcfg.enable_async_bulk_flush);
     GGMLHEXAGON_LOG_VERBOSE("enable_hmx_qkv_fused:             %d", g_hexagon_appcfg.enable_hmx_qkv_fused);
+    GGMLHEXAGON_LOG_VERBOSE("enable_dsp_a_inv_bitmap:          %d", g_hexagon_appcfg.enable_dsp_a_inv_bitmap);
+    GGMLHEXAGON_LOG_VERBOSE("enable_first_touch_w_inv_loading:%d", g_hexagon_appcfg.enable_first_touch_w_inv_loading);
     if (NULL != ctx) {
         GGMLHEXAGON_LOG_VERBOSE("ggml-dsp use hmx:                 %d", ctx->has_hmx);
     }
@@ -985,6 +1027,9 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit1", g_hexagon_appcfg.dsp_cache_trace_bit1, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_async_bulk_flush", g_hexagon_appcfg.enable_async_bulk_flush, 1);
+    hexagoncfg_instance.get_intvalue("cdsp", "enable_dsp_a_inv_bitmap", g_hexagon_appcfg.enable_dsp_a_inv_bitmap, 0);
+    hexagoncfg_instance.get_intvalue("cdsp", "enable_first_touch_w_inv_loading", g_hexagon_appcfg.enable_first_touch_w_inv_loading, 1);
+    hexagoncfg_instance.get_intvalue("cdsp", "dump_cgraph", g_hexagon_appcfg.dump_cgraph, 0);
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_types", g_hexagon_appcfg.enabled_types, "");
 
@@ -2018,7 +2063,9 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
             const uint32_t trace_bit0   = (g_hexagon_appcfg.dsp_cache_trace_bit0 ? 0x10000u : 0u);
             const uint32_t trace_bit1   = (g_hexagon_appcfg.dsp_cache_trace_bit1 ? 0x20000u : 0u);
             const uint32_t async_flush  = (g_hexagon_appcfg.enable_async_bulk_flush ? 0x40000u : 0u);
-            const uint32_t payload      = async_flush | trace_bit1 | trace_bit0 | mode_bits;
+            const uint32_t a_inv_bitmap_bit = (g_hexagon_appcfg.enable_dsp_a_inv_bitmap ? 0x80000u : 0u);  // bit 19
+            const uint32_t w_inv_loading_bit = (g_hexagon_appcfg.enable_first_touch_w_inv_loading ? 0x100000u : 0u);  // bit 20
+            const uint32_t payload      = w_inv_loading_bit | a_inv_bitmap_bit | async_flush | trace_bit1 | trace_bit0 | mode_bits;
             int opts_err = ggml_dsp_execute_batch(ctx->ggmlop_handle, payload, 0xFFFC);
             if (AEE_SUCCESS != opts_err) {
                 GGMLHEXAGON_LOG_WARN("set dsp_cache_mode=0x%x + dsp_cache_trace_bit0=%d + dsp_cache_trace_bit1=%d failed: 0x%x (DSP-side optimizations disabled)",
@@ -3153,6 +3200,7 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
       rpc_mempool_dsp_base(nullptr),
       weights_dirty(false),
       dsp_need_weight_inval_reset(false),
+      weight_pre_inval_pushed(false),
       rpc_batch_call_count(0),
       cumulative_graph_us(0),
       last_graph_end_us(0),
@@ -3978,6 +4026,9 @@ static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer
         bctx->warned_non_repack.clear();
         bctx->warned_qkv_name = false;
         bctx->dsp_need_weight_inval_reset = true;
+        // Path-G: clear pre-inval list; next model load starts fresh
+        bctx->weight_pre_inval_list.clear();
+        bctx->weight_pre_inval_pushed = false;
     }
     delete ctx;
 }
@@ -4781,6 +4832,30 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 if (flush_len == 0) flush_len = ggml_nbytes(tensor);
                 cpu_dcache_flush_range(hctx, hctx->rpc_mempool_handle,
                                        tensor->data, flush_len);
+                // Path-G: collect repack weight {ptr, len} for bulk 0xFFFD pre-inval
+                // (only for offset==0 first chunk; offset>0 chunks of same tensor
+                // share the same base ptr, so skip to avoid duplicates).
+                if (offset == 0 &&
+                    hctx->weight_pre_inval_list.size() < 4096 &&
+                    !hctx->weight_pre_inval_pushed) {
+                    // Path-G: collect repack weight {ptr, len} for bulk 0xFFFD pre-inval.
+                    // Push the OFFSET from the ION mempool base (not the AP-side
+                    // virtual address), because AP and DSP see this ION region
+                    // through different virtual mappings. DSP reconstructs the
+                    // DSP virtual address as base + offset.
+                    ggml_backend_hexagon_context::weight_pre_inval_entry_t e;
+                    e.ptr      = (uint64_t)((const char *)tensor->data - (const char *)hctx->rpc_mempool);
+                    e.len      = (uint32_t)flush_len;
+                    e.reserved = 0;
+                    hctx->weight_pre_inval_list.push_back(e);
+                    if (hctx->weight_pre_inval_list.size() == 1 ||
+                        hctx->weight_pre_inval_list.size() == 100 ||
+                        hctx->weight_pre_inval_list.size() % 500 == 0) {
+                        GGMLHEXAGON_LOG_ALWAYS("[AP-W-PREINVAL] set_tensor: list_size=%zu name=%s offset=0x%llx len=%u",
+                                             hctx->weight_pre_inval_list.size(), tensor->name,
+                                             (unsigned long long)e.ptr, e.len);
+                    }
+                }
             } else {
                 hctx->weights_dirty = true;
             }
@@ -5235,30 +5310,30 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     t_start = ggml_time_us();
 
     // ---- Phase 1: collect unique tensor objects + cgraph cache lookup ----
-    // Hash over each node's {op, ne[4], nb[4], non-null src[0..GGML_MAX_SRC-1] ptr, data ptr}.
-    // The src slot index is folded into the value so that NULL slots do not
-    // collide with real tensors at different positions. The node's own data
-    // pointer is kept because distinct dst tensors can share the same
-    // op/shape/srcs (e.g., buffer reuse), and omitting it caused cache hits
-    // to restore descriptors pointing to stale tensors.
-    // cgraph pointer is NOT used: the scheduler rebuilds split->graph every
-    // call, so the pointer churns. The content is stable.
+    // Path-E mechanism 1: hash slimmed from 20 to 3 FNV-1a mix per node.
+    // Folded per node: {op, data ptr, src[0]>>4 (if non-null)}.
+    // - op distinguishes compute (MUL_MAT, RMS_NORM, etc.)
+    // - data ptr is REQUIRED: omitting it caused cache hits to restore
+    //   descriptors pointing to stale tensors (distinct dst tensors can
+    //   share the same op/shape/srcs via buffer reuse)
+    // - src[0]>>4 is the minimum needed to break ties between ops that
+    //   differ only in their primary source (e.g., Q vs K vs V projections
+    //   in a fused QKV path). The 4-bit shift folds position-aware
+    //   identity since pointers are at least 16-byte aligned.
+    // 24 layers * ~30 ops = 720 nodes * 3 mix = 2160 FNV-1a mix ops per
+    // cgraph (was 14400). Collision risk: extremely low for 64-bit FNV
+    // over 3 well-chosen discriminators; 5-model CI validates.
     auto compute_content_hash = [&]() -> uint64_t {
         uint64_t h = 0xcbf29ce484222325ULL;  // FNV-1a 64-bit offset basis
+        constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
             if (!node) continue;
-            h ^= (uint64_t)node->op; h *= 0x100000001b3ULL;
-            for (int j = 0; j < 4; j++) { h ^= (uint64_t)node->ne[j]; h *= 0x100000001b3ULL; }
-            for (int j = 0; j < 4; j++) { h ^= (uint64_t)node->nb[j]; h *= 0x100000001b3ULL; }
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                ggml_tensor * src = node->src[j];
-                if (src) {
-                    h ^= (uint64_t)(uintptr_t)src ^ (uint64_t)j;
-                    h *= 0x100000001b3ULL;
-                }
+            h ^= (uint64_t)node->op; h *= FNV_PRIME;
+            h ^= (uint64_t)(uintptr_t)node->data; h *= FNV_PRIME;
+            if (node->src[0]) {
+                h ^= ((uint64_t)(uintptr_t)node->src[0] >> 4); h *= FNV_PRIME;
             }
-            h ^= (uint64_t)(uintptr_t)node->data; h *= 0x100000001b3ULL;
         }
         return h;
     };
@@ -5276,6 +5351,25 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             ctx->cgraph_cache_misses++;
         }
     }
+
+#if 0
+    // CGRAPH-DUMP: diagnostic for graph split identification. Activated by
+    // [cdsp] dump_cgraph=N in cfg. Level 1 dumps each unique sub-graph
+    // shape on cache miss (~25 dumps for 9B). Level 2 adds a one-liner
+    // per call (first/last op + hash) for split-boundary analysis.
+    // Uses ggml core's ggml_graph_print() (ggml.c#7568) for the full dump.
+    if (g_hexagon_appcfg.dump_cgraph >= 2) {
+        const char * first_op = (graph_n_nodes > 0) ? ggml_op_name(cgraph->nodes[0]->op) : "EMPTY";
+        const char * last_op  = (graph_n_nodes > 0) ? ggml_op_name(cgraph->nodes[graph_n_nodes - 1]->op) : "EMPTY";
+        const uint64_t call_n = ctx->cgraph_cache_hits + ctx->cgraph_cache_misses;
+        GGMLHEXAGON_LOG_ALWAYS("[CGRAPH-DUMP] call#%llu nodes=%u first=%s last=%s hash=0x%llx %s",
+                               (unsigned long long)call_n, graph_n_nodes, first_op, last_op,
+                               (unsigned long long)content_hash, cache_hit ? "HIT" : "MISS");
+    }
+    if (g_hexagon_appcfg.dump_cgraph >= 1 && !cache_hit) {
+        ggml_graph_print(cgraph);
+    }
+#endif
 
     // Bind to cached descriptors on hit, local vectors on miss. This avoids
     // the expensive assign() of hex_ops/tensor_src in the hot path.
@@ -5836,29 +5930,49 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     };
     std::unordered_map<void *, buffer_mirror_info> buffer_mirrors_map;
 
-    for (int32_t tidx = 0; tidx < (int32_t)n_tensors; tidx++) {
-        ggml_tensor * t = tensor_src[tidx];
-        if (!t->data) continue;
-
-        const char * data_ptr = (const char *)t->data;
-        if (data_ptr >= ion_base && data_ptr < ion_base + (ptrdiff_t)ion_size) {
-            continue;  // already in mempool
+    // Path-E mechanism 2: cache hit reuses cached_mirrors directly (skip the
+    // tensor_src scan + ggml_nbytes + ggml_hexagon_repacked_size per tensor);
+    // cache miss collects phase5_meta in parallel with buffer_mirrors_map
+    // build, then saves it to the entry at the end of Phase 5 step 2.
+    std::vector<cgraph_mirror_meta> phase5_meta;
+    if (cache_hit && cached_entry) {
+        for (const auto & m : cached_entry->cached_mirrors) {
+            buffer_mirrors_map[m.original_data] = {0, m.data_len, false};
         }
+    } else {
+        for (int32_t tidx = 0; tidx < (int32_t)n_tensors; tidx++) {
+            ggml_tensor * t = tensor_src[tidx];
+            if (!t->data) continue;
 
-        uint32_t t_size = (uint32_t)ggml_nbytes(t);
-        // For quantized weights repacked in-place by set_tensor,
-        // the actual data on heap is the repacked (larger) layout.
-        // The mirror must copy the full repacked data for DSP access.
-        bool is_quant_weight = is_weight[tidx] && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16;
-        if (is_quant_weight) {
-            size_t repacked = ggml_hexagon_repacked_size(t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
-            if (repacked > 0) t_size = (uint32_t)repacked;
-        }
-        auto it = buffer_mirrors_map.find(t->data);
-        if (it == buffer_mirrors_map.end()) {
-            buffer_mirrors_map[t->data] = {0, t_size, false};
-        } else if (t_size > it->second.max_data_len) {
-            it->second.max_data_len = t_size;
+            const char * data_ptr = (const char *)t->data;
+            if (data_ptr >= ion_base && data_ptr < ion_base + (ptrdiff_t)ion_size) {
+                continue;  // already in mempool
+            }
+
+            uint32_t t_size = (uint32_t)ggml_nbytes(t);
+            // For quantized weights repacked in-place by set_tensor,
+            // the actual data on heap is the repacked (larger) layout.
+            // The mirror must copy the full repacked data for DSP access.
+            bool is_quant_weight = is_weight[tidx] && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16;
+            if (is_quant_weight) {
+                size_t repacked = ggml_hexagon_repacked_size(t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+                if (repacked > 0) t_size = (uint32_t)repacked;
+            }
+            auto it = buffer_mirrors_map.find(t->data);
+            if (it == buffer_mirrors_map.end()) {
+                buffer_mirrors_map[t->data] = {0, t_size, false};
+                phase5_meta.push_back({t->data, t_size});
+            } else if (t_size > it->second.max_data_len) {
+                it->second.max_data_len = t_size;
+                // Update the corresponding meta entry so cached_mirrors
+                // holds the final per-buffer max data_len.
+                for (auto & mm : phase5_meta) {
+                    if (mm.original_data == t->data) {
+                        mm.data_len = t_size;
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -5923,6 +6037,18 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         m.mirror_offset = it->second.mirror_offset;
         m.data_len      = it->second.max_data_len;  // use full allocated (possibly repacked) size for flush/copy-back
         mirrors.push_back(m);
+    }
+
+    // Path-E mechanism 2: on cache miss, save phase5_meta to the entry now
+    // that step 2 has produced the final per-buffer data_len. Subsequent
+    // cache hits reuse this list to rebuild buffer_mirrors_map without
+    // re-scanning tensor_src / re-running ggml_nbytes / re-running
+    // ggml_hexagon_repacked_size. Note: phase5_meta is also used by Phase
+    // 11's copyback map (which derives from `mirrors` populated above, so
+    // the cached list is already in sync with what Phase 11 sees).
+    if (!cache_hit) {
+        auto & entry = ctx->cgraph_cache[content_hash];
+        entry.cached_mirrors.assign(phase5_meta.begin(), phase5_meta.end());
     }
 
     // ---- Phase 6: track mempool offsets for repacked quantized weights ----
@@ -6252,7 +6378,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         const uint32_t trace_bit0 = (g_hexagon_appcfg.dsp_cache_trace_bit0 ? 0x10000u : 0u);
         const uint32_t trace_bit1 = (g_hexagon_appcfg.dsp_cache_trace_bit1 ? 0x20000u : 0u);
         const uint32_t reset_bit  = 0x10u;
-        const uint32_t reset_payload = mode_bits | trace_bit0 | trace_bit1 | reset_bit;
+        const uint32_t a_inv_bitmap_bit = (g_hexagon_appcfg.enable_dsp_a_inv_bitmap ? 0x80000u : 0u);  // bit 19
+        const uint32_t w_inv_loading_bit = (g_hexagon_appcfg.enable_first_touch_w_inv_loading ? 0x100000u : 0u);  // bit 20
+        const uint32_t reset_payload = mode_bits | trace_bit0 | trace_bit1 | w_inv_loading_bit | a_inv_bitmap_bit | reset_bit;
         int rst_err = ggml_dsp_execute_batch(ctx->ggmlop_handle, reset_payload, 0xFFFC);
         if (AEE_SUCCESS != rst_err) {
             GGMLHEXAGON_LOG_ERROR("DSP weight_inval reset failed: 0x%x, aborting batch", rst_err);
@@ -6266,6 +6394,70 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         } else {
             ctx->dsp_need_weight_inval_reset = false;
             GGMLHEXAGON_LOG_DEBUG("DSP weight_inval array reset (model reload)");
+        }
+    }
+
+    // Path-G: bulk first-touch weight pre-inval (push list once per model load).
+    // Runs after the 0xFFFC reset so the DSP table is empty; the pre-inval list
+    // then seeds it with all repack weights collected at set_tensor time. After
+    // this push, the first batch's INVAL_SRC_IF_NEEDED sees these weights as
+    // already-invalidated and skips per-op dcinva, moving the cost from the
+    // first PP batch to model load time.
+    if (g_hexagon_appcfg.enable_first_touch_w_inv_loading &&
+        !ctx->weight_pre_inval_pushed &&
+        !ctx->weight_pre_inval_list.empty()) {
+        GGMLHEXAGON_LOG_ALWAYS("[AP-W-PREINVAL] entering 0xFFFD push: list_size=%zu region_off=0x%zx mempool_len=0x%zx",
+                             ctx->weight_pre_inval_list.size(), ctx->rpc_mempool_usage,
+                             ctx->rpc_mempool_len);
+        // Chunked push: max 4096 entries per call (DSP table cap). For models
+        // with more weights, issue multiple 0xFFFD calls. The list itself is
+        // capped at 4096 in set_tensor.
+        const uint32_t n_entries_total = (uint32_t)ctx->weight_pre_inval_list.size();
+        const size_t   entry_size      = sizeof(ggml_backend_hexagon_context::weight_pre_inval_entry_t);
+        const size_t   list_bytes      = (size_t)n_entries_total * entry_size;
+        // Bump mempool to get a region for the entry list. The region is freed
+        // right after the 0xFFFD call (FastRPC is synchronous; DSP finishes
+        // reading the list before returning).
+        const size_t header_bytes = sizeof(uint32_t);
+        const size_t list_payload_bytes = list_bytes;  // N * 16
+        const size_t total_region_bytes = header_bytes + list_payload_bytes;
+        size_t region_off = (ctx->rpc_mempool_usage + 4095) & ~4095ull;  // page-align
+        if (region_off + ((total_region_bytes + 4095) & ~4095ull) <= ctx->rpc_mempool_len) {
+            ctx->rpc_mempool_usage = region_off + ((total_region_bytes + 4095) & ~4095ull);
+            // Copy entries to mempool. Layout: [4-byte n_entries header][N entries x 16 bytes].
+            // n_entries is in the header (not in batch_offset) so the full 32-bit
+            // page_offset can address any 4KB-aligned position in the mempool
+            // (up to 16 TB), not just 256 MB. Without this, large models like
+            // gemma4 (2.9 GB) overflow the 16-bit page_offset field and the
+            // DSP reads the wrong memory.
+            const size_t header_bytes = sizeof(uint32_t);
+            const size_t list_payload_bytes = list_bytes;  // N * 16
+            const size_t total_region_bytes = header_bytes + list_payload_bytes;
+            char * region_ptr = (char *)ctx->rpc_mempool + region_off;
+            *((uint32_t *)region_ptr) = n_entries_total;
+            memcpy(region_ptr + header_bytes,
+                   ctx->weight_pre_inval_list.data(), list_payload_bytes);
+            // DC CVAC: flush AP cache so DSP sees fresh data
+            cpu_dcache_flush_range(ctx, ctx->rpc_mempool_handle,
+                                   region_ptr, total_region_bytes);
+            // batch_offset = full 32-bit page offset of the list region header
+            const uint32_t page_offset = (uint32_t)(region_off >> 12);
+            int push_err = ggml_dsp_execute_batch(ctx->ggmlop_handle, page_offset, 0xFFFD);
+            if (AEE_SUCCESS != push_err) {
+                GGMLHEXAGON_LOG_WARN("0xFFFD pre-inval push failed: 0x%x, falling back to lazy first-touch",
+                                     push_err);
+            } else {
+                ctx->weight_pre_inval_pushed = true;
+                GGMLHEXAGON_LOG_ALWAYS("[AP-W-PREINVAL] pushed %u weight entries (%zu MiB) via 0xFFFD",
+                                     n_entries_total, list_bytes / (1024 * 1024));
+            }
+            // Roll back the mempool bump: the list region is no longer needed
+            // after FastRPC returns. (DSP read it inside execute_batch.)
+            ctx->rpc_mempool_usage = region_off;
+        } else {
+            GGMLHEXAGON_LOG_WARN("mempool exhausted for 0xFFFD pre-inval list (%zu bytes needed, %zu remaining)",
+                                 list_bytes,
+                                 ctx->rpc_mempool_len - region_off);
         }
     }
 
@@ -6344,15 +6536,13 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                     if (inval_ranges[i].first <= cur_end || inval_ranges[i].first - cur_end <= merge_gap) {
                         if (inval_ranges[i].second > cur_end) cur_end = inval_ranges[i].second;
                     } else {
-                        cpu_dcache_inval_range(ctx, 0,
-                            (const char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
+                        cpu_dcache_inval_range(ctx, 0, (const char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
                         total_inval += cur_end - cur_start;
                         cur_start = inval_ranges[i].first;
                         cur_end   = inval_ranges[i].second;
                     }
                 }
-                cpu_dcache_inval_range(ctx, 0,
-                    (const char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
+                cpu_dcache_inval_range(ctx, 0, (const char *)ctx->rpc_mempool + cur_start, cur_end - cur_start);
                 total_inval += cur_end - cur_start;
                 GGMLHEXAGON_LOG_DEBUG("mempool-batch: phase11 DC CIVAC %zu ranges, %u bytes total",
                                       inval_ranges.size(), total_inval);
