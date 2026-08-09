@@ -1339,7 +1339,7 @@ qwen1 比 gemma4 慢 14.6 ms/batch, 缓存维护多吃 29 ms (56% of delta), 把
 
 ### 8.1 现象与背景
 
-5 模型 CI (Table-6A) 之外，临时跑了一次 Qwen3.5-9B (alias `qwen3-9b`，底层为 Qwen3.5-9B-Q4_0.gguf，5.1 GiB，n_layer=32 + delta-net 层) 与 QCOM libggml-htp 的对比。Terminal 实测 (QCOM 端数据来源：log_xxx.txt 截图；JZ 端数据来源：`qwen3_9b_tg_prof_20260808-192916.log` / `dump_perf_stats` 输出)：
+5 模型 CI (Table-6A) 之外，临时跑了一次 Qwen3.5-9B (alias `qwen3-9b`，底层为 Qwen3.5-9B-Q4_0.gguf，5.03 GiB，n_layer=32 + delta-net 层) 与 QCOM libggml-htp 的对比。Terminal 实测 (QCOM 端数据来源：log_xxx.txt 截图；JZ 端数据来源：`qwen3_9b_tg_prof_20260808-192916.log` / `dump_perf_stats` 输出)：
 
 **Table-23**：Qwen3.5-9B 现象与背景总览
 
@@ -1376,7 +1376,7 @@ unaccounted time =    24.21 ms /  0.0 %    (total - sampling - prompt eval - eva
 graphs reused = 253
 ```
 
-注：JZ 端 PP 27.31 tok/s / TG 1.48 tok/s 与 QCOM PP 143.69 / TG 7.70 形成 5.26x / 5.20x 差距 (Table-23)；JZ load 时间（1912.61 ms）显著高于 QCOM（366.10 ms），源于 ION mempool 4 GB 装不下 5.4 GB 9B 模型权重，1.4 GB 回退到 system memory 后被分批 load。unaccounted 24.21 ms = 174413.97 - 105.93 - 65.72 - 1912.61 - 1903.87 - 172379.97 = 44.87 ms（与 24.21 差异是 common_perf_print 内部对 sampling/samplers 不重复减，本质仍是 0.0% 级）。graphs reused = 253 与 QCOM 一致（upstream scheduler 共享）。
+注：JZ 端 PP 27.31 tok/s / TG 1.48 tok/s 与 QCOM PP 143.69 / TG 7.70 形成 5.26x / 5.20x 差距 (Table-23)；JZ load 时间（1912.61 ms）显著高于 QCOM（366.10 ms），与权重回退 system memory 相关——`log_qwen3.5-9b.txt` 中两次运行的回退规模不同（PID 20562: 权重拆 2005+1996 MiB 双 chunk，后块 1996 MiB 回退；PID 21326: 单块 4002 MiB 整体回退 heap），精确规模取决于运行时 mempool 剩余与 chunk 拆分，不是固定值。unaccounted 24.21 ms = 174413.97 - 105.93 - 65.72 - 1912.61 - 1903.87 - 172379.97 = 44.87 ms（与 24.21 差异是 common_perf_print 内部对 sampling/samplers 不重复减，本质仍是 0.0% 级）。graphs reused = 253 与 QCOM 一致（upstream scheduler 共享）。
 
 **8.1.3 JZ 端实测明细 (`ggmlhexagon_dump_perf_stats` 输出)**
 
@@ -1400,10 +1400,10 @@ cgraph cache: hits=6351 misses=49 (hit_rate=99.2%) entries=0
 **关键观察**：
 1. **QCOM `graphs reused = 253 / 255 runs = 99.2%`** - 这是 **upstream llama.cpp scheduler** 的 cgraph cache 命中率统计（在 `common_perf_print` 输出），含义是：255 个 decode 步里 scheduler 复用了同一份已切分好的 cgraph 结构（nodes/ops/sub-graph 划分）的次数；~2 步因为 KV cache 增长或 graph reopt 触发重新切分。**注意此处的 "graphs reused" 与 FastRPC 没有任何关系**——它是 scheduler 层级的 cgraph 结构复用计数，不是 QCOM 端的 descriptor 缓存计数。QCOM 端没有"FastRPC descriptor 重建"的概念：QCOM 的提交链路是 dspqueue 持久化环形队列（`dspqueue_create` 一次，`dspqueue_write` 多次复用，line 1802-1813），descriptor 概念由 dspqueue 内部 `htp_opbatch_req` 承载，每次 `dspqueue_write` 是把 N 个 op 的 descriptor 批量入队，不存在 per-call FastRPC descriptor 缓存/重建过程。JZ 端 cgraph cache（`hits=6351 misses=49 hit_rate=99.2%`）是 JZ 自己按 op+shape+src ptr 哈希建的 cache（[ggml-hexagon-jz.cpp:5159](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5159)），与 QCOM 的 `graphs reused` 含义不同但恰好都是 99.2%，反映两端 9B 模型的 cgraph 拓扑变化模式一致（每 255 步里 ~2 步需要重切）
 2. **JZ cgraph cache 与 QCOM `graphs reused` 都是 99.2%** - JZ 端的 cache 是按 op+shape+src ptr 哈希的 AP 端 descriptor 复用 cache（[ggml-hexagon-jz.cpp:5159](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5159)，miss 时走 Phase 2 descriptor 重建），QCOM 端的 `graphs reused` 是 upstream scheduler 的 cgraph 结构复用计数（miss 时重新切分 sub-graph）。两者属于不同层级但都恰好命中 99.2%，原因是 9B 模型的 cgraph 拓扑变化频率稳定（每 255 步 ~2 步需要重切），与具体后端实现无关。**真正决定提交路径成本的是 cgraph cache miss 之后的动作**：JZ 走 per-sub-graph 同步 FastRPC（每次 mirror + sync），QCOM 走 dspqueue_write 批提交（25 个 sub-graph 一次入队）
-3. **JZ batch_calls=6400** - JZ 9B 一次推理调用 DSP 6400 次，每 token 平均 25.1 次（1 PP + 24 个 ssm_out MUL_MAT split × 256 = 6144 + 主图 ~256 ≈ 6400）
-4. **JZ per-call overhead = 21.4 ms/call** - 每 sub-call 26.6 ms 总耗时，5.3 ms 是 DSP 真实计算，21.4 ms 是非 DSP 开销（FastRPC setup + mirror + sync）；**25.1 calls × 21.4 ms = 537 ms / token 是 JZ 单 token 主要开销**
+3. **JZ batch_calls=6400** - JZ 9B 一次推理调用 DSP 6400 次，每 token 平均 25.0 次（24 个 ssm_out MUL_MAT CPU split 把每 token 的 cgraph 切成 25 个 Hexagon sub-graph，256 token x 25 = 6400）
+4. **JZ per-call overhead = 21.4 ms/call** - 每 sub-call 26.6 ms 总耗时，5.3 ms 是 DSP 真实计算，21.4 ms 是非 DSP 开销（FastRPC setup + mirror + sync）；**25.0 calls x 21.4 ms = 535 ms / token 是 JZ 单 token 主要开销**
 5. **JZ p5+p12 = 136.5 s = 78% of total** - mirror 计算是 JZ 9B 真实瓶颈（68.7 s compute + 67.8 s apply）；其余 22% 是 p1+p6+p8+p11 等
-6. **JZ p10 dsp_exec = 5.262 ms/call** - 不是 0.5 ms！sub-call 真实 DSP 计算是 5.3 ms（含 ssm_out MUL_MAT），不是简单 matmul 的 0.5 ms
+6. **JZ p10 dsp_exec = 5.262 ms/call** - 不是 0.5 ms！sub-call 真实 DSP 计算是 5.3 ms（不含 ssm_out MUL_MAT，后者在 CPU 执行），不是简单 matmul 的 0.5 ms
 7. **PP 36.61 ms/token vs TG 676.00 ms/token = 18.5x 差异** - TG 100% decode-bound，与 qwen1 经验一致
 8. **输出内容**：jinja "Thinking Process" 模式（Analyze Request / Identify Key Information），正常电影介绍（"Once Upon a Time in America", "Sergio Leone", "Robert De Niro"），非乱码
 
@@ -1416,7 +1416,7 @@ cgraph cache: hits=6351 misses=49 (hit_rate=99.2%) entries=0
 | Qwen3.5-2B (对照, 6 章) | TG tok/s | 14.50 | 7.74 | 1.87x | JZ 比 QCOM 快 1.87x |
 | qwen1 (对照, 7 章) | TG tok/s | 18.62 | ~30 | 1.61x | JZ 比 QCOM 快 1.61x |
 
-Qwen3.5-9B 是 JZ 第二个出现 TG / PP 同时落后于 QCOM 的模型（第一个是 Qwen1.5-1.8B，TG -22.3% / PP -28.8%，见 3.5 节"Qwen1.5-1.8B PP/TG 均落后的根因"分析）。**两者的本质区别**：Qwen1.5-1.8B 仅落后 22-29%（~0.7-0.8x of QCOM），根因是 dspqueue pipelining 优势在 MHA + 24 层 + VTCM/cache 压力场景的最大化；Qwen3.5-9B 落后 80%+（~0.19x of QCOM，5.2x gap），根因是 graph split（24 个 ssm_out MUL_MAT split）+ per-sub-call FastRPC overhead（25 sub-call × 21.4 ms = 537 ms/token vs QCOM 1 dspqueue 0.1 ms）。**Qwen3.5-9B 是首个双边失利差距达 5x 量级的模型**，需要单独章节分析。**JZ cgraph cache 与 QCOM `graphs reused` 命中率都是 99.2%**（两者层级不同但恰好一致，Qwen3.5-9B cgraph 拓扑变化频率稳定），所以差距不在 cache 命中率，而是 JZ 每 token 25 个 sub-call 串行 FastRPC vs QCOM 1 个 dspqueue 批提交。
+Qwen3.5-9B 是 JZ 第二个出现 TG / PP 同时落后于 QCOM 的模型（第一个是 Qwen1.5-1.8B，TG -22.3% / PP -28.8%，见 3.5 节"Qwen1.5-1.8B PP/TG 均落后的根因"分析）。**两者的本质区别**：Qwen1.5-1.8B 仅落后 22-29%（~0.7-0.8x of QCOM），根因是 dspqueue pipelining 优势在 MHA + 24 层 + VTCM/cache 压力场景的最大化；Qwen3.5-9B 落后 80%+（~0.19x of QCOM，5.2x gap），根因是 graph split（24 个 ssm_out MUL_MAT split，根因见 8.3：Q5_K 不被 validator 支持）+ per-sub-call FastRPC overhead（25 sub-call x 21.4 ms = 537 ms/token vs QCOM 25 次 dspqueue_write ~2.5 ms/token）。**Qwen3.5-9B 是首个双边失利差距达 5x 量级的模型**，需要单独章节分析。**JZ cgraph cache 与 QCOM `graphs reused` 命中率都是 99.2%**（两者层级不同但恰好一致，Qwen3.5-9B cgraph 拓扑变化频率稳定），所以差距不在 cache 命中率，而在单次提交开销：两端 sub-graph 数量相同（同一 upstream scheduler 切分），JZ 每段走同步 FastRPC（21.4 ms），QCOM 每段只是一次 dspqueue ring-buffer write（~0.1 ms，~214x）。
 
 ### 8.2 SPLIT 现场抓取方法
 
@@ -1432,7 +1432,7 @@ adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=. \
   -m /sdcard/Qwen3.5-9B-Q4_0.gguf -p 'Hello'" 2>&1 | tee log_qwen3.5_9b_graphsplit.txt
 ```
 
-抓取结果：一次 64-token TG 产生 **1000 `## SPLIT` 记录**（500 个 CPU split + 500 个 Hexagon split），分布在 20 个 cgraph：`graph_reserve` log 显示其中 2 个 `n_tokens=16` 的 cgraph（PP 处理 jinja 模板展开的 16 token 提示 + 1 个 TG 16 token cgraph），其余 18 个 `n_tokens=1` 的 cgraph（PP/TG 单 token 步进）。`rpc stats: batch_calls=1600`（20 cgraph × 80 rpc_call/instance，含 mirror + main graph 等内部 batch），与 1000 SPLIT 不直接对应。
+抓取结果：一次 64-token TG 产生 **1000 `## SPLIT` 记录**（500 个 CPU split + 500 个 Hexagon split），分布在 20 个 cgraph：`graph_reserve` log 显示其中 2 个 `n_tokens=16` 的 cgraph（PP 处理 jinja 模板展开的 16 token 提示 + 1 个 TG 16 token cgraph），其余 18 个 `n_tokens=1` 的 cgraph（PP/TG 单 token 步进）。`rpc stats: batch_calls=1600`（64 个 TG token x 25 个 Hexagon sub-graph/token；1000 条 SPLIT 记录是 20 个 unique cgraph 结构 x 50 段的静态切分输出，cgraph cache 命中时不再重复打印，故 1600 次实际 DSP 调用只对应 1000 条 SPLIT 记录）。
 
 **与 8.1.3 实际推理参数差异说明（重要，2026-08-08）**：抓取 log 使用 `-n 64 --ubatch-size 1 --batch-size 1 -p 'Hello'`，8.1.3 实际推理使用 `n_predict=256 n_batch=2048`（复杂 prompt）。两个场景的 **per-token SPLIT 模式完全一致**：
 
@@ -1450,17 +1450,18 @@ adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=. \
 
 **Table-26**：25 calls/token 的构成（每 token 固定开销）
 
-| 来源 | 数量 | 触发条件 | 每次是否产生新 batch_call |
+| 来源 | 段数 | 触发条件 | 对应 SPLIT 段 |
 |---|---:|---|---|
-| 24 个 delta-net ssm_out MUL_MAT 切到 CPU | 24 | 每 token 都经过全部 24 个 delta-net 层（block 0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30），每层 `ssm_out.weight` 在 CPU buffer 触发 1 次 mirror + main graph 调用 | 是 |
-| 1 个 model.output norm 切到 CPU | 1 | 每 token 都需做 final norm | 是 |
-| **per-token 合计** | **25** | - | - |
+| embedding GET_ROWS 在 CPU | 1 个 CPU 段 | token_embd.weight（545.62 MiB, Q4_0, [4096 x 248320]）固定在 CPU buffer（upstream 常规：input embedding 在 host 执行） | SPLIT #0 |
+| 24 个 delta-net ssm_out MUL_MAT 切到 CPU | 24 个 CPU 段 | 每 token 都经过全部 24 个 delta-net 层（block 0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30），每层 `ssm_out.weight`（Q5_K, 11 MiB）在 CPU buffer | SPLIT #2,4,...,48 |
+| 切回 Hexagon 的 sub-graph | 25 个 Hexagon 段 | 上述 25 个 CPU 段把每 token 的 cgraph 切出 25 个 Hexagon sub-graph，每段 1 次 DSP 调用；末段（SPLIT #49）含完整 model.output（output_norm MUL + 795.70 MiB Q6_K lm_head MUL_MAT 均在 Hexagon 执行） | SPLIT #1,3,...,49 |
+| **per-token batch_calls 合计** | **25** | - | - |
 
 **关键洞察**：
 
-1. **25 calls/token 与 TG token 数完全独立**：不论 TG 是 64 还是 256 token，每 token 都需经过 24 个 delta-net 层 + 1 个 model.output norm，ssm_out MUL_MAT 切到 CPU 是"每层每 token"行为而非"首次"行为，故 per-token 调用数严格恒定为 25
-2. **batch_calls 与 TG token 数线性相关**：`batch_calls = 25 × TG_token_count`，故 64 → 256 token 翻 4 倍时 batch_calls 也精确翻 4 倍（1600 → 6400）。**这反过来证明抓取 log 的 SPLIT 模式分类（25 个 unique 边界 op）可直接外推到实际推理**——24 个 ssm_out + 1 个 model.output 这套结构对所有 TG token 都一样，区别仅在重复次数
-3. **消除 split 的潜在收益**：`25 calls/token` 中 24 个来自 ssm_out split，每个 split 引入 ~21 ms overhead，故 ssm_out split 单独贡献 ~504 ms/token = 0.50 s/token 的纯 split 开销。**根治 ssm_out split（mempool 扩到 5.4 GB 或 scatter-gather）理论上能把 per-token 调用从 25 降到 1，消除 96% 的 split 开销**
+1. **25 calls/token 与 TG token 数完全独立**：不论 TG 是 64 还是 256 token，每 token 都需经过 1 次 embedding 查表 + 全部 24 个 delta-net 层，ssm_out MUL_MAT 切到 CPU 是"每层每 token"行为而非"首次"行为，故 per-token 调用数严格恒定为 25
+2. **batch_calls 与 TG token 数线性相关**：`batch_calls = 25 x TG_token_count`，故 64 -> 256 token 翻 4 倍时 batch_calls 也精确翻 4 倍（1600 -> 6400）。**这反过来证明抓取 log 的 SPLIT 模式分类（25 个 unique 边界 op）可直接外推到实际推理**——1 个 embedding 段 + 24 个 ssm_out 段这套结构对所有 TG token 都一样，区别仅在重复次数
+3. **消除 split 的潜在收益**：`25 calls/token` 中 24 个来自 ssm_out split，合并后 per-token 调用从 25 降到 1。注意省的只是**随 call 数线性的固定开销**（~13.5 ms/段，scan/descriptor/sync/dcinva），mirror memcpy 按引用量计、不随段合并减少（heap 权重仍需镜像，8.5/8.6），故消除 split 的净收益是 ~24 x 13.5 = ~325 ms/token，TG 1.48 -> ~2.8 tok/s（8.5 节测算）。**最短根治路径是 Q5_K 转存 Q4_0（见 8.3，复用既有 Q4_K/Q6_K 转存机制，~30-50 行）**；scatter-gather 解决的是 heap 权重的 mirror 与 > 4 GiB 容量，不消除 split（8.7 节 2026-08-09 修正）
 
 `--ubatch-size 1 --batch-size 1` 强制单 token 步进，会让 PP 部分每个 prompt token 单独产生 1 个 cgraph（prompt eval = 1 token / 0 ms），但**不会改变 TG 单 token 的 SPLIT 模式**——split 仅由 `blk.N.ssm_out.weight` 的 buffer 位置触发，与 batch size 无关。`-p 'Hello'` 简化 prompt 让 PP 缩为 1 个 cgraph（vs 实际推理的更多 token PP），**也不影响 TG 的 split 计数**。
 
@@ -1497,9 +1498,9 @@ adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=. \
 | 45, 47 | `linear_attn_out-28, 29` | 16K each | delta-net | block 28, 29 |
 | 49 | `linear_attn_out-30` + `leaf_498` | 16K+0K | delta-net + 最终 norm | block 30 完成，model.output 起点 |
 
-**对应的 25 个 CPU SPLIT 边界（`blk.N.ssm_out.weight` MUL_MAT 全部切到 CPU）**：
+**对应的 25 个 CPU SPLIT 边界（24 个 `blk.N.ssm_out.weight` MUL_MAT + 1 个 embedding GET_ROWS）**：
 
-**Table-29**：25 个 CPU SPLIT 边界 + 24 个 delta-net ssm_out 汇总
+**Table-29**：25 个 CPU SPLIT 边界 = 24 个 delta-net ssm_out + 1 个 embedding
 
 | 切到 CPU 的 block | 出现次数 | ssm_out.weight 大小 | 层类型 |
 |---:|---:|---:|---|
@@ -1512,7 +1513,7 @@ adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=. \
 | 24, 25, 26 | 20 × 3 | 11M × 3 | delta-net |
 | 28, 29, 30 | 20 × 3 | 11M × 3 | delta-net |
 | **小计** | **480** | **264 MB 总 ssm_out** | **24 个 delta-net** |
-| model.output | 20 | - | 最终 norm（也在 CPU） |
+| embedding GET_ROWS (SPLIT #0) | 20 | - | token_embd.weight 545.62 MiB 固定在 CPU（upstream 常规）；model.output 完整在 Hexagon（output_norm MUL + output.weight lm_head MUL_MAT 均标 `[Hexag]`，见 log） |
 | **CPU 端总数** | **500** | - | - |
 
 8 个 MHA-only 层 (层号 3, 7, 11, 15, 19, 23, 27, 31) **不出现 ssm_out MUL_MAT split**（它们没有 ssm_out.weight 张量）。这与 Qwen3-Next 架构的 3:1 模式（3 个 delta-net + 1 个 MHA）一致：32 层 / 4 = 8 cycle，每个 cycle 3 个 delta-net + 1 个 MHA = 24 个 delta-net + 8 个 MHA。
@@ -1532,13 +1533,26 @@ node # 56 (MUL_MAT): linear_attn_out-0  [CPU]
 - 8 个 MHA block（3, 7, 11, 15, 19, 23, 27, 31）的所有 op 完整在 Hexagon 端运行，无 CPU 切分
 - SPLIT #7 的 5 inputs（`linear_attn_out-2` + `leaf_55` + `leaf_59` + `leaf_61` + `attn_inp_kq_mask`）表明 MHA block 3 接收 4 个额外 leaf 输入（KV cache view + mask），是进入 MHA block 的标志
 
-**ssm_out.weight 在 CPU buffer 的根因**：9B 模型 5.4 GB，JZ 的 ION mempool 4 GB 装不下 1.4 GB。从 [ggml-hexagon-jz.cpp:5083](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5083) 的日志看：
+**ssm_out.weight 在 CPU buffer 的根因（2026-08-09 修正：是 Q5_K validator 不支持，不是 mempool 容量）**：
+
+先前的归因是"9B 模型 5.4 GB，JZ 的 ION mempool 4 GB 装不下，ssm_out.weight 随主 weight 块回退到 system memory"。**该归因与 graphsplit log 矛盾，已撤回**。三重证据链：
+
+1. **log 证据**：`log_qwen3.5_9b_graphsplit.txt` 中 24 个 `ssm_out.weight`（各 11 MiB）标 `[CPU]`，但同层全部其他权重（ffn_down 30 MiB / ffn_up 27 MiB / attn_qkv 18 MiB / attn_gate 9 MiB / ssm_conv1d / ssm_alpha / ssm_beta，从 blk.0 到末层 blk.31 一致）以及 `output.weight`（795.70 MiB lm_head）、`output_norm.weight` **全部标 `[Hexag]`**。注意 `[Hexag]` 标签只说明 tensor 属于 hexagon buft 的 buffer，不代表 backing store 在 mempool 里——本次运行 4002 MiB hexagon 权重块中 2005 MiB 进 mempool、1996 MiB 回退 heap（heap 块内 tensor 仍标 `[Hexag]`，运行时靠 mirror 维持 DSP 执行，不触发 split，见 8.6）。真正被 scheduler 路由到 CPU buft 的权重只有 24 个 ssm_out.weight。"mempool 装不下 ssm_out"不成立——ssm_out 在调度阶段就被判给 CPU，从未进入 hexagon buft 的分配流程。
+2. **GGUF 元数据证据**（Qwen3.5-9B-Q4_0.gguf 实测）：全部 24 个 `ssm_out.weight` 是 **Q5_K** [4096, 4096]，11.00 MiB x 24 = 264.0 MiB，且 **Q5_K 在全模型 427 个 tensor 中恰好只有这 24 个**——与 24 个 CPU split 一一对应。类型普查：Q4_0 n=173 (3929.62 MiB，含 token_embd.weight [4096, 248320] 545.62 MiB)，Q6_K n=1 (output.weight 795.70 MiB，全模型唯一)，Q4_1 n=4 (120.00 MiB)，Q8_0 n=48 (6.38 MiB)，F32 n=177 (32.39 MiB)。模型总权重 5148.1 MiB = 5.03 GiB（427 tensors，32 layers）。
+3. **代码证据**：[ggml-hexagon-jz.cpp:3336-3406](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L3336-L3406) `ggmlhexagon_supported_mul_mat` 的 switch 仅支持 Q8_0 / Q4_0 / IQ4_NL / Q4_1 / MXFP4 / Q4_K / Q6_K（外加 F16/F32/BF16），**Q5_K 走 `default: return false`**（line 3404）。
+
+**正确根因链**：ssm_out.weight 是 Q5_K -> JZ MUL_MAT validator 返回 false -> upstream scheduler 把该 MUL_MAT 分配到 CPU backend -> tensor 随之落入 CPU buffer -> 24 个 delta-net 层每层产生 1 个 CPU split。**与 mempool 容量无关**。
+
+**mempool 容量问题的真实边界（与 split 根因相互独立）**：`log_qwen3.5-9b.txt` 的 "ion pool exhausted" 记录确实存在，且两次运行模式不同：
 
 ```
-device=0 ion pool exhausted: needed 4002 MiB, remaining 3973 MiB -- falling back to system memory
+PID 20562: 2005 MiB 权重 chunk 进 mempool (51.08%), 随后 1996 MiB chunk 回退 (needed 1996, remaining 1968)
+PID 21326: 单块 4002 MiB 权重 chunk 整体回退 heap (needed 4002, remaining 3973)
 ```
 
-4002 MiB 主 weight 大块放不下，回退到 system memory；后续小 weight (含 11 MiB 的 ssm_out.weight x 24) 也命中 system memory buffer。upstream scheduler 的 split 触发条件是 "src weight 的 buffer 不被当前 backend 支持"，强制产生 CPU MUL_MAT + Hexagon output buffer 的 CPU <-> Hexagon 切分。
+mempool 4 GiB 装不下 5.0 GiB 全模型是**事实**（对 > 4 GiB 模型的容量约束真实存在，8.7 节的 scatter-gather 讨论仍然成立），但在 graphsplit / tg_prof 运行中，容量回退的受害者**不是** ssm_out：4002 MiB hexagon 权重块里 2005 MiB 进 mempool、1996 MiB 回退 heap，heap 块内 tensor 仍属 hexagon buft、仍由 DSP 经 mirror 执行，不产生 split。真正落入 CPU 的只有 Q5_K 的 ssm_out.weight（类型被 validator 拒绝，调度阶段判给 CPU buft，264 MiB 从未进 hexagon 权重块）。即 **当前 9B 的 24 个 split 不是 mempool 容量造成的**；容量回退的真实代价体现在 p5/p12 mirror overhead（8.6 节，136.5 s），是另一条独立成本链。
+
+**最短修复路径（随根因反转而变）**：在 `set_tensor` 时把 Q5_K 转存为 Q4_0，复用 [ggml-hexagon-jz.cpp:3329](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L3329) 已有的 "Q4_K/Q6_K are stored as Q4_0" repack 机制，24 个 split 直接消除，batch_calls 6400 -> ~256。改动集中在 set_tensor 量化类型转换与 validator 放行，比 scatter-gather（DSP 端 descriptor 协议扩展）简单一个量级，应作为 9B 性能修复的第一优先级（见 8.7.4 路径表重排）。
 
 ### 8.4 根因 2: QCOM 的 dspqueue 机制（5x 差距的真因）
 
@@ -1631,37 +1645,40 @@ AP 端把所有 op 入队后立刻返回，DSP 后台消费；AP 端在 DSP 跑 
 
 | 指标 | JZ (实测) | QCOM (实测) | 差距倍数 | 数据来源 |
 |---|---:|---:|---:|---|
-| 9B TG 24 个 ssm_out split 提交次数 | 24 次 fastrpc × 256 token = 6144 + 主图 ~256 = **6400 次** | 1~2 次 dspqueue_write per cgraph (256 cgraphs, 253 cache hit) | ~25x | JZ batch_calls=6400 vs QCOM graphs reused=253 |
+| 9B TG Hexagon sub-graph 提交次数 | 25 sub-graph x 256 token = **6400 次** fastrpc（24 个 ssm_out CPU split 把每 token 的 Hexagon 图切成 25 段；CPU 侧另有 24 段/token 的 CPU 执行不占 fastrpc） | **同样 ~25 sub-graph x 256 token**（同一 upstream scheduler + QCOM validator 同样拒绝 Q5_K，见注 3），每段 1 次 dspqueue_write | ~1x（次数相同） | JZ batch_calls=6400；QCOM 次数为代码级推断（待 QCOM 侧 log 验证） |
 | 单次提交开销 (反推) | ~21.4 ms (FastRPC + mirror) | ~0.1 ms (dspqueue_write) | ~214x | JZ dump_perf_stats per-call overhead avg=21369 us |
 | AP-DSP overlap | 否 (同步阻塞) | 是 (dspqueue 异步) | - | ggml-hexagon.cpp:3707-3715 |
-| **cgraph cache hit rate (实测)** | **99.2%** (6351/6400) | **99.2%** (253/255) | **1.0x (相同)** | JZ dump_perf_stats vs QCOM graphs reused, **upstream scheduler 共享** |
-| 实际平均 overhead/call (实测) | 21.4 ms | ~5 ms (反推, 1 dspqueue per cgraph + 99% cache hit) | ~4x | p10 3-way + graphs reused |
+| **cgraph cache hit rate (实测)** | **99.2%** (6351/6400 sub-calls, JZ AP 端 descriptor cache) | **99.2%** (253/255 decode 步, upstream sched-graph 复用计数) | **1.0x (相同)** | JZ dump_perf_stats vs QCOM graphs reused, **两者分母与层级不同, 恰好一致** |
+| 实际平均 overhead/call (实测/反推) | 21.4 ms | ~0.1-0.4 ms (反推: dspqueue_write ~0.1 ms/次; 或每 token ~10 ms 非 DSP 时间 / 25 段 = ~0.4 ms) | ~50-214x | p10 3-way + 注 2 |
 | 9B TG 总耗时 (实测) | 174.4 s (6400 calls) | **33.1 s** (255 runs) | 5.27x | JZ dump_perf_stats vs QCOM eval time |
 | 9B TG tok/s (实测) | 1.48 | **7.70** | 5.20x | Table-23 |
 | 9B PP tok/s (实测) | 27.31 | **143.69** | 5.26x | Table-23 |
 | unaccounted time 占比 (实测) | 0.005% (8.3 ms / 174414 ms) | **0.0%** (9.20 ms / 33537 ms) | ~1x | JZ unaccounted=8292 us vs QCOM 9.20 ms |
-| 每 token 提交成本 (实测) | 25 calls × 21.4 ms = **537 ms** | 1 dspqueue × 0.1 ms = **0.1 ms** | ~5370x | batch_calls/256 vs graphs reused/255 |
+| 每 token 提交成本 (实测/反推) | 25 calls x 21.4 ms = **537 ms** | 25 writes x ~0.1 ms = **~2.5 ms** | ~214x | JZ dump_perf_stats per-call overhead；QCOM 0.1 ms/write 为反推 |
 
 注 1：QCOM 端 0.1 ms/dspqueue_write 是反推值（dspqueue 内部是简单 ring buffer write，enqueue + 一次 signal 系统调用），QCOM 端未单独测量此项；JZ 端 21.4 ms/call 来自 dump_perf_stats `per-call overhead: avg=21369 us`。
 
-注 2：QCOM 端"5 ms/overhead"也是反推（129.85 ms - 120 ms DSP compute）；QCOM 端 `common_perf_print` 只输出顶层分类（sampling / samplers / load / prompt eval / eval / total / unaccounted），**没有 JZ 的 p1-p12 12 阶段**。unaccounted = 0.0% 说明 dspqueue 让 AP 准备与 DSP 算完全 overlap，没有阻塞空隙，AP 端没有空转。
+注 2：QCOM 端"~0.4 ms/overhead/call"是反推（每 token 129.85 ms - ~120 ms DSP compute = ~10 ms 非 DSP 时间，除以 25 段/token）；QCOM 端 `common_perf_print` 只输出顶层分类（sampling / samplers / load / prompt eval / eval / total / unaccounted），**没有 JZ 的 p1-p12 12 阶段**。unaccounted = 0.0% 说明 dspqueue 让 AP 准备与 DSP 算完全 overlap，没有阻塞空隙，AP 端没有空转。
 
-注 3：QCOM 必然也存在 24 个 ssm_out MUL_MAT split（QCOM 用同样的 upstream scheduler、同样的算子 dispatch），但因 dspqueue 批提交 + cgraph cache 99.2% hit rate（与 JZ 相同），24 个 split 都被吸收到 1 个 dspqueue_write 内，总开销降到 ~0.1 ms/调用级（与 JZ 的 21.4 ms/调用形成 ~214x 差）。**单 token 提交成本 JZ 537 ms vs QCOM 0.1 ms，~5370x 差距**——这是 5.20x 整体差距的真因。dspqueue 批提交把 25 sub-call 压成 1 dspqueue_write，提交次数减少 25x；单次开销 0.1ms vs 21.4ms 又省 214x；两者乘出 ~5370x 的提交路径差距。
+注 3（2026-08-09 重写）：QCOM 同样存在 24 个 ssm_out MUL_MAT CPU split——这不是推测而是代码级事实：QCOM `ggml_hexagon_supported_mul_mat`（[ggml-hexagon.cpp:2783-2853](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon.cpp#L2783-L2853)）的 src0 switch 只认 Q4_0/Q4_1/Q8_0/IQ4_NL/MXFP4/F16/F32，**Q5_K 同样走 `default: return false`**（L2841-2842），且 QCOM 没有 JZ 的 Q4_K/Q6_K -> Q4_0 转存机制（`ggml_hexagon_is_repack_type` L210-214 不含任何 K-quants），同一 upstream scheduler 面对同一张 cgraph 必然给出同样的 24 个 CPU split。两端 split 拓扑相同；`graphs reused=253` 是 upstream sched-graph 的复用计数（253/255 decode 步复用切分拓扑），**不是提交次数**，与每 token 25 段提交不矛盾。真正的差距在**单次提交开销**：JZ 每段走同步 FastRPC + mirror（21.4 ms），QCOM 每段只是一次 dspqueue ring-buffer write（~0.1 ms，~214x）；每 token 提交成本 JZ 537 ms vs QCOM ~2.5 ms。dspqueue 并没有把 25 个 sub-call 压成 1 次提交（sub-graph 数量由 upstream scheduler 的 split 决定，两边相同），它把每次提交变便宜 ~214x——这是 5.20x 整体差距的真因：JZ 681 ms/token 中 537 ms 是提交开销，扣除后 ~145 ms 与 QCOM 130 ms/token 基本持平。此外 QCOM 还有 JZ 没有的 lm_head split（L2805-2808 `ne[1] > 32768` 硬编码拒绝 lm_head；JZ 靠 Q6_K -> Q4_0 转存 + mempool 连续 IOVA 把 795.70 MiB lm_head 留在 DSP，是 JZ 的净优势，见 why-perbuffer 文档）。
 
 ### 8.5 ssm_out split 的次要性澄清
 
-ssm_out MUL_MAT 在 QCOM 必然也存在同样的 24 个 split（QCOM 用同样的 upstream scheduler，同样的算子 dispatch：SOLVE_TRI / SSM_CONV / GATED_DELTA_NET 三个算子签名与 JZ 一模一样，对比 [htp/gated-delta-net-ops.c:1079-1147](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c#L1079-L1147) 与 [kernels/gated-delta-net-ops.c:1079-1147](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/kernels/gated-delta-net-ops.c#L1079-L1147) 完全相同；[htp/main.c:697-708](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/htp/main.c#L697-L708) 的 op dispatch 也无 fused ssm_out）。
+ssm_out MUL_MAT 在 QCOM 必然也存在同样的 24 个 split（代码级证据见 8.4.5 注 3：QCOM validator 同样 `default: return false` 拒绝 Q5_K，且无 K-quants 转存机制；另从算子层面看，SOLVE_TRI / SSM_CONV / GATED_DELTA_NET 三个算子签名与 JZ 一模一样，对比 [htp/gated-delta-net-ops.c:1079-1147](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c#L1079-L1147) 与 [kernels/gated-delta-net-ops.c:1079-1147](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/kernels/gated-delta-net-ops.c#L1079-L1147) 完全相同；[htp/main.c:697-708](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/htp/main.c#L697-L708) 的 op dispatch 也无 fused ssm_out）。
 
-QCOM 同样有 24 个 ssm_out MUL_MAT split（每 token 24 个 split），但因 dspqueue 批提交，这 24 个 split 被 1 个 dspqueue_write 吸收，单 token 提交成本从 JZ 537 ms 降到 QCOM 0.1 ms。**这个开销与 5.2x 整体差距不是同一个量级**——5.2x 整体差距来自 dspqueue 把 25 sub-call 压成 1 dspqueue 的提交路径优化，ssm_out split 本身的算子成本在两边都相同。
+QCOM 的 24 个 split 产生与 JZ 相同数量的 sub-graph 段（~25 段/token），差别只在每段的提交成本：QCOM 每段一次 dspqueue_write（~0.1 ms），单 token 提交成本 ~2.5 ms；JZ 每段一次同步 FastRPC + mirror（21.4 ms），单 token 提交成本 537 ms（~214x）。**5.2x 整体差距来自这个提交路径差距**（JZ 681 ms/token 扣掉 537 ms 提交后 ~145 ms，与 QCOM 130 ms/token 持平），ssm_out split 本身的算子成本在两边都相同。
 
-JZ 这边 24 个 split 仍是 ~120 sec 的硬成本（视归因方法不同），具体测算（基线：174.4 s 总，6400 batch_calls, 21.4 ms/call overhead, p5+p12 = 136.5 s）：
+JZ 这边 24 个 split 的硬成本测算（基线：174.4 s 总，6400 batch_calls，21.4 ms/call overhead，p5+p12 = 136.5 s）。消除 split = 每 token 25 个 Hexagon 段合并为 1 段。注意 mirror memcpy 总量**不按 call 数缩减**：合并后的单段仍引用全部 heap 常驻权重（~2 GiB，见 8.6），每 token 都要镜像一次；省的只是随 call 数线性的固定开销（scan/descriptor/sync/dcinva）：
 
-- **保守估算法**（24 个 split 单独省 21.4 ms × 24 = 514 ms/token 提交开销，假设 mirror 仍存在）：174.4 s - 132 s = 42 s，256/42 = **6.1 tok/s**（已超 QCOM 7.70 但实际 mirror 不会全归零，不合理）
-- **乐观估算法**（24 个 split 触发 p5+p12 mirror 全归零，136.5 s 全省）：174.4 s - 136.5 s = 37.9 s，256/37.9 = **6.8 tok/s**（也接近 QCOM，仍不合理）
-- **合理中位**（split 消除但 mirror 仍部分存在，~50% p5+p12 节省）：174.4 s - 68 s = 106 s，256/106 = **2.4 tok/s**
+- **固定开销部分**（随 call 数线性）：25 x ~13.5 ms -> 1 x ~13.5 ms，节省 ~325 ms/token，这是消除 split 的收益大头
+- **mirror memcpy 部分**（按引用量）：合并前后都是 ~2 GiB/token（~200 ms），不省
+- 估算：681 - 325 = 356 ms/token -> **~2.8 tok/s**
+- 即便按 mirror 全免的极端假设（136.5 s 全省）：174.4 - 136.5 = 37.9 s -> 6.8 tok/s，不可及，因为 heap 常驻权重必须镜像才能被 DSP 读
 - 综合判断 ssm_out split 单独消除后 TG 区间 **1.48 -> 2.0-3.0 tok/s**
 
-即便乐观到 3.0 tok/s，依然离 QCOM 7.70 tok/s 差 2.5x。**根治必须靠 dspqueue 风格的批提交**——把 25 sub-call 的 537 ms 提交开销压到 0.1 ms。
+即便乐观到 3.0 tok/s，依然离 QCOM 7.70 tok/s 差 2.5x。后续收益来自两处（与 split 修复正交）：(a) mirror memcpy 的消除（heap 权重改走 scatter-gather / DMA 拉取，8.6/8.7 节）；(b) per-call 固定开销的压缩（dspqueue 风格批提交，8.8 节）。
+
+**8.3 根因反转对本节结论的影响**：split 修复从"扩 mempool / scatter-gather"降级为 `set_tensor` 的 Q5_K -> Q4_0 转存（复用既有 Q4_K/Q6_K 机制，约几十行），实施成本极低。它对 TG 上限的贡献是"次要"的（2.0-3.0 tok/s），但它是后续一切提交路径优化的**前置条件**——不先把 24 个 CPU 段消掉，批提交/流水线无从合并——应最先落地。
 
 ### 8.6 Mirror 机制深度分析与 DMA 拉取路径讨论
 
@@ -1696,36 +1713,37 @@ for (auto & kv : buffer_mirrors_map) {
 
 **设计不完整的根因**：mirror 区域是临时 ion_region，每次 call 结束被 [Phase 12 末尾的 free 释放](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L6591-L6597)，下一次 call mempool 区域被复用，必须重新拷贝。Path-E mechanism 2 跳过的只是 tensor_src scan（~1 ms / call），memcpy 本身的 11-12 ms 还在。
 
-**对 9B 的具体开销**：
-- 6400 calls 中 6144 个 ssm_out sub-graph → 不走 JZ mirror（CPU 跑 MUL_MAT）
-- 256 个 main sub-graph → 走 mirror，每 call mirror ~1.5 GB 权重 + 激活
-- 12.5 ms / call * 256 call = **3.2 sec 纯 mirror 开销**
+**对 9B 的具体开销**（2026-08-09 修正分解）：
 
-这 3.2 sec 不是 80% 的根因（80% 是 p5/p12 在 6400 calls 上的累加），但 mirror 确实在 256 call 上还有 3.2 s 可以省。**Path-E mechanism 2 的真正修复**：cache hit 时跳过 memcpy（仅当 mempool 区域还在复用窗口内），patch 大约 30-50 行，改 Phase 5 step 2 即可。这是 1 天能做完且零风险的工作，但收益远小于 8.7 节列出的三阶段路径（3.2 sec vs 170+ sec）。
+- 6400 batch_calls = 25 个 Hexagon 段/token x 256 token（24 个 CPU 段在 CPU 侧执行，不占 batch_calls，"6400 中 6144 个是 ssm_out sub-graph"的旧分解有误）
+- 每个 Hexagon 段的 mirror 对象有两类：(a) CPU 段边界的 `linear_attn_out-*` 激活（1 MiB x 24 处/token，小头）；(b) **heap 回退 chunk（1996 MiB）中被该段引用的权重切片**（大头）——25 段合计 ~2 GiB/token
+- p5+p12 = 136.5 s 的分解：固定开销（scan/descriptor/sync/dcinva，随 call 数线性）6400 x ~13 ms = ~83 s，mirror memcpy ~2 GiB/token x 256 token @ ~10 GB/s = ~51 s
+
+**Path-E mechanism 2 修复对 9B 无效（2026-08-09 修正）**：先前认为"cache hit 时跳过 memcpy 是 30-50 行 patch、1 天零风险"。对 9B 这个修复**不成立**：临时 mirror 区每 call 释放不是单纯的设计疏忽，而是容量所迫——常驻权重已占 ~2.1 GiB，mempool 余量 ~1.5 GiB，装不下 ~2 GiB heap 权重的常驻镜像（2.1 + 2.0 = 4.1 GiB > 4 GiB 硬顶）。即使 patch 让 cache hit 跳过 memcpy，也没有空间让镜像常驻。该 patch 只对小 mirror 集场景（如五模型的 mask/激活镜像）有效；9B 的 mirror 消除只能靠 scatter-gather / DMA 拉取（8.6.2 / 8.7），让 DSP 直接读 system memory 的 heap 权重。
 
 #### 8.6.2 "DSP 主动从 system memory DMA 拉 weight" 路径详解
 
 **当前 mirror 的本质**（问题）：
 
 ```
-[System Memory: ssm_out.weight 11MB] 
+[System Memory: heap 回退权重 (1996 MiB chunk)] 
         |  
         |  AP-side memcpy (Phase 5)  
-        |  每次 call 拷 11MB  
+        |  每 token 合计拷 ~2 GiB (25 段各拷其引用切片)
         |  走 DDR -> AP L1 -> DDR -> ION
         v  
-[ION mempool 4GB]  
+[ION mempool 4GB 临时 mirror 区]  
         |  
         |  DSP 读
         v  
 [DSP L2 cache]
 ```
 
-问题：
-- 每次 call 拷 11 MB AP-side memcpy
-- 4 GB mempool 装不下 5.4 GB 模型，ssm_out.weight 被留在 system memory
-- scheduler 看到 weight 不在 DSP buffer → 触发 split
-- 24 个 ssm_out split 是这个的直接后果
+问题（2026-08-09 修正因果链）：
+- 每 token ~2 GiB AP-side mirror memcpy（~200 ms），这是 mempool 容量回退的真实代价
+- 4 GB mempool 装不下 5.0 GiB 模型 -> 4002 MiB hexagon 权重块中 1996 MiB 回退 heap
+- heap 权重**不触发 split**（buffer 仍属 hexagon buft），触发的是 mirror
+- 24 个 ssm_out split 是另一条独立因果链（Q5_K 被 validator 拒绝，8.3 节），与 mirror/容量无关
 
 **"DSP 主动 DMA 拉 weight" 的本质**（提议）：
 
@@ -1754,20 +1772,20 @@ for (auto & kv : buffer_mirrors_map) {
 | 数据搬运主体 | AP CPU memcpy | DSP DMA engine |
 | 第一次 11MB weight | AP 拷 11 MB (~11 ms) | DSP DMA 11 MB (~1 ms) |
 | 后续重复读 | AP 重拷 11 MB | DSP 命中 L2，0 搬运 |
-| mempool 占用 | 11 MB 常驻 | **0**（weight 不在 ION） |
-| scheduler 视角 | weight 在 system memory -> split | weight 在 DSP-accessible buffer -> 无 split |
+| mempool 占用 | 临时 mirror 区常驻周转 | **0**（weight 不在 ION） |
+| scheduler 视角 | weight 在 hexagon buft heap 回退 -> 无 split，但每 call 付 mirror memcpy | weight 在 DSP-accessible buffer -> 无 split 且无 mirror |
 
 **需要 JZ 当前没有的支持**：
 
 1. **JZ buffer type 支持 cross-buffer view**：当前 [repack_buffer_type](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L352-L356) 只能描述 ION mempool 内的 buffer，需要新增一种 buffer type 表示"system memory pages mapped to DSP via HAP_mmap2"
 2. **DSP 端 execute_op 支持 scatter-gather descriptor**：当前每个 src/dst 必须是单一连续 mempool region，需要扩展为"远端 system memory 区域 + 任意 offset"
-3. **AP 不再分配 ION 给 ssm_out.weight**：`set_tensor` 检测到这类 weight 时走新 buffer type
+3. **AP 不再为 heap 回退权重走临时 mirror**：`set_tensor` / alloc 检测到这类 weight 时走新 buffer type，DSP 直接 DMA 读 system memory
 4. **cache coherency 协议扩展**：system memory 页可能带 CPU L1/L2 stale data，DSP 读前需 `dc ivac`（这是 Path-G 已处理的事情，可复用）
 
 **5 模型 CI 兼容性**：
-- 4 GB mempool 限制绕开（9B 的 ssm_out.weight 不再占 mempool）→ 9B 可装下
+- 4 GB mempool 限制绕开（heap 回退权重不再占临时 mirror 区）-> 9B 可装下
 - gemma4-e2b / qwen1 等小模型不受影响（用旧路径）
-- 性能提升预期：9B TG 1.48 → 4-5 tok/s（24 sub-graph mirror 开销消除 + 24 split 消失 + 11 MB 冷 DMA 一次）
+- 性能提升预期（2026-08-09 重估）：24 个 split 已由 Q5_K -> Q4_0 转存覆盖（8.3/8.5，1.48 -> ~2.8 tok/s）；本路径在此之上消除 ~2 GiB/token 的 mirror memcpy（~200 ms/token），叠加后 9B TG ~2.8 -> ~6-7 tok/s（DSP 计算 ~131 ms/token 成为新瓶颈）
 
 **实施成本与阻塞**：
 
@@ -1780,7 +1798,7 @@ for (auto & kv : buffer_mirrors_map) {
 | cache coherency 协议扩展 | 中（dc ivac flush 整个 weight region） | 复用 Path-G 的 0xFFFD 机制 |
 | 上游 ggml-backend.cpp scheduler hook | 高 | 与 upstream llama.cpp 接口耦合 |
 
-**与三阶段路径的关系**：本路径是 8.8 短期 op_batch 累积 + 中期 dspqueue 异步化之外的**第四条路径**，**不冲突**——它消除的是 mirror 24 sub-graph 的 memcpy 与 4 GB mempool 限制，dspqueue 消除的是 25 sub-call 的提交开销。两者可叠加：先 dspqueue 解决 per-call overhead，再用 DMA 拉取解决 mempool 限制与 ssm_out split。**短期不能上**（实施成本 1-2 个月），但它是 9B 4-5x 加速的真正根治方案。
+**与三阶段路径的关系**：本路径是 Q5_K 转存（消 split）与 8.8 三阶段提交路径（消 per-call 固定开销）之外的**第三条独立路径**，**不冲突**——它消除的是 ~2 GiB/token 的 mirror memcpy 与 4 GB mempool 容量限制。三者正交可叠加：Q5_K 转存把 25 段合并为 1 段，dspqueue 把每段固定开销压到 ~0.1 ms 级，DMA 拉取把 mirror memcpy 归零。**短期不能上**（实施成本 1-2 个月），但它是 9B 追平 QCOM 的根治方案之一（与 dspqueue 并列）。
 
 ### 8.7 如何突破 4 GiB mempool 平台限制
 
@@ -1922,23 +1940,23 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
 
 **绕开路径（升顶 2026-08-08：根因是 V79 user VA 32-bit 硬件 hard cap, 单 mempool 扩容只能到 4 GiB, 真正扩容需 scatter-gather / sliding window）**：
 
-**核心论断（用户 8.1.3 + 8.2 数据论证, 2026-08-08）**：9B 模型 5.26x PP / 5.20x TG 性能差距的根因是 graph split（24 个 ssm_out MUL_MAT split）→ batch_calls = 6400 → 每 token 25 sub-call × 21.4 ms = 535 ms overhead, 占总时间 79%。**只要能把 batch_calls 从 6400 降到 ~256, TG 就能从 1.48 提升到 5-6 tok/s（接近 QCOM 7 tok/s）**。**scatter-gather (方案 2) 是实现这一点的 clear win 路径**——它消除 graph split 同时保留 JZ single mempool 架构优势（lmhead offload）。
+**核心论断（2026-08-09 修正：split 根因是 Q5_K 类型，scatter-gather 的定位随之修正）**：9B 模型 5.26x PP / 5.20x TG 性能差距的直接表象是 graph split（24 个 ssm_out MUL_MAT split）→ batch_calls = 6400 → 每 token 25 sub-call × 21.4 ms = 535 ms overhead, 占总时间 79%。但两点先前归因已撤回：(1) **split 的根因不是 mempool 容量**——ssm_out.weight 是 Q5_K，被 JZ MUL_MAT validator 在调度期判给 CPU（8.3 节三重证据链），即便 mempool 无限大这 24 个 split 依然存在；(2) **消除 split 的收益没有先前估计的大**——合并 25 段为 1 段只省随 call 数线性的固定开销（~325 ms/token），heap 权重的 mirror memcpy（~200 ms/token）不随段合并减少，单独消除 split TG 1.48 -> ~2.8 tok/s（8.5 节），不是 5-6 tok/s。**最短修复路径是 set_tensor 时 Q5_K -> Q4_0 转存（复用既有 Q4_K/Q6_K 机制，~30-50 行，8.7.4 步骤 0）**；scatter-gather（方案 2）的定位修正为**消除 heap 回退权重的 mirror memcpy + 支持 > 4 GiB 模型**（13B/20B 门票），与 Q5_K 转存正交叠加后 9B TG 可到 ~6-7 tok/s（8.6.2 节）。
 
 **两类路径的本质区分（升顶 2026-08-08, 避免与 8.7.3 方案 1 混为"都需要用户决策"）**：
 
-- **方案 2 (scatter-gather) = clear win**：保留主 mempool (offload lmhead), 仅对超出 4 GiB 部分 (264 MB ssm_out.weight) 做 scatter-gather。**保留 JZ single mempool 架构, 不失去 lmhead offload 能力**, < 4 GiB 模型 (qwen1/2B/8B) 完全不受影响。**9B 模型净收益 +4.8 tok/s**, 提升 4 倍。**应提升为 9B 性能根治路径, 优先级最高**
+- **方案 2 (scatter-gather) = clear win（2026-08-09 修正定位）**：保留主 mempool (offload lmhead), 让 heap 回退的 ~2 GiB 权重被 DSP 直接 scatter-gather 读取。**保留 JZ single mempool 架构, 不失去 lmhead offload 能力**, < 4 GiB 模型 (qwen1/2B/8B) 完全不受影响。**收益是消除 ~200 ms/token 的 mirror memcpy + 支持 > 4 GiB 模型（13B/20B）**；它**不消除 24 个 ssm_out split**——ssm_out.weight 是 Q5_K 类型被 validator 拒绝、调度期就在 CPU buft（8.3），从未进入 hexagon 权重块，scatter-gather 够不到它们。消除 split 靠 Q5_K -> Q4_0 转存（8.7.4 步骤 0，~30-50 行）。两者叠加 9B TG ~6-7 tok/s
 - **方案 1 (per-buffer 替代) = 需用户决策**：完全放弃 single mempool, 失去 lmhead offload。**qwen1/2B/8B 等 < 4 GiB 模型 TG 可能显著下降**。属于**架构层面 trade-off, 不是 clear win**, 详见上面"关键架构取舍"段（line 1774-1795）
 
 **重要警告（用户指出, 2026-08-08）**：方案 1（per-buffer 替代单 mempool）**几乎推翻 JZ single mempool 架构的两大根基之一**——single mempool 让 JZ 能 offload lmhead（连续 IOVA），改多 mempool 后 lmhead 必须回 CPU，qwen1 / 2B / 8B 等 < 4 GiB 模型 TG 可能下降。**这是真正 trade-off，不是 clear win**。详见上面"关键架构取舍"段。**方案 2 (scatter-gather) 不在此警告范围内**——它保留主 mempool, 不推翻 JZ 架构
 
 - **方案 1 — 多 mempool 替代单 mempool（per-buffer 仿 QCOM）【已识别但不在 8.7.4 主路径表, 需用户决策】**：放弃 JZ 的 single-mempool 架构，仿 QCOM per-buffer 方案（[ggml-hexagon.cpp:1065-1075](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon.cpp#L1065-L1075)），预分配多个 1 GiB pinned buffer（每次 `rpcmem_alloc2` + `fastrpc_mmap`），按 tensor 实际大小挑选合适 buffer 装入。代码改动集中在 [ggml-hexagon-jz.cpp:1725-1790](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L1725-L1790) 的 `ggmlhexagon_init_rpcmempool` 和后续 tensor→mempool 分配逻辑。**取舍（用户指出, 2026-08-08）**：获得 9B+ 模型容量，但**几乎推翻 JZ single mempool 架构的两大根基之一**——single mempool 让 JZ 能 offload lmhead（连续 IOVA），改多 mempool 后 lmhead 必须回 CPU，qwen1 / 2B / 8B 等 < 4 GiB 模型 TG 可能显著下降。这不是 clear win, 详见上面"关键架构取舍"段（line 1774-1795）和下方"重要结论"段。**本方案在 8.7.4 主路径表 1a/1b/1c 中不再列出, 仅在此处保留为"已识别风险路径"**, 待用户明确接受"放弃 JZ 架构优势换取 9B+ 容量"后再评估
-- **方案 2 — scatter-gather descriptor【9B 性能根治路径, clear win, 应优先推进】**：DSP 端 execute_op 支持从多个非连续 mempool region 拉取数据（即便每个 region < 4 GiB，scatter 多 region 总和 > 4 GiB），让 9B / 13B / 20B 模型的 weight 分布在 2-3 个 mempool 里。AP 侧 descriptor 含 `n_buffers + base + size[]` 数组，DSP 侧 execute_op 按基址+偏移取数。**与方案 1 不同**：方案 2 不完全放弃 single mempool，可在保留主 mempool (offload lmhead) 的同时为超出部分新增几个辅助 mempool（scatter-gather 访问），架构上更"加法"而非"替换"。**9B 模型最低可行范围**：只对 ssm_out.weight (24 × 11 MB = 264 MB) 做 scatter-gather, 主 4 GiB mempool 仍装主要权重 + lmhead, 不需完整重构。**预期收益**：
-  - 消除 24 个 ssm_out MUL_MAT split → batch_calls 从 6400 降到 ~256（25x 降幅）
-  - 每 token 节省 24 × 21.4 ms = 514 ms overhead
-  - 9B TG: 1.48 → ~6.3 tok/s（消除 lmhead CPU 化 -0.05 tok/s 后净 +4.8 tok/s）
+- **方案 2 — scatter-gather descriptor【容量与 mirror 根治路径, clear win, 但 2026-08-09 起不再是消 split 路径】**：DSP 端 execute_op 支持从多个非连续 mempool region 拉取数据（即便每个 region < 4 GiB，scatter 多 region 总和 > 4 GiB），让 9B / 13B / 20B 模型的 weight 分布在 2-3 个 mempool 里。AP 侧 descriptor 含 `n_buffers + base + size[]` 数组，DSP 侧 execute_op 按基址+偏移取数。**与方案 1 不同**：方案 2 不完全放弃 single mempool，可在保留主 mempool (offload lmhead) 的同时为超出部分新增几个辅助 mempool（scatter-gather 访问），架构上更"加法"而非"替换"。**9B 模型最低可行范围（2026-08-09 修正）**：对 heap 回退的 ~2 GiB 权重做 scatter-gather（DSP 直读 system memory，等效 8.6.2 的 DMA 拉取），消除每 token ~2 GiB 的 AP-side mirror memcpy；**24 个 ssm_out split 不在本路径范围**——它们是 Q5_K 类型拒绝（8.3），由 Q5_K -> Q4_0 转存覆盖（8.7.4 步骤 0）。**预期收益（2026-08-09 重估）**：
+  - 消除 ~200 ms/token mirror memcpy（heap 权重免镜像，DSP 直读）
+  - 与 Q5_K 转存叠加：1.48 -> ~2.8（转存消 split）-> ~6-7 tok/s（scatter-gather 消 mirror）
+  - 支持 > 4 GiB 模型（13B / 20B 门票，8.7.2/8.7.3 矩阵）
   - < 4 GiB 模型（qwen1/2B/8B）继续用 JZ single mempool, **完全不受影响**
   - 保留 lmhead offload 架构优势, 9B lmhead 继续 DSP 执行
-  - **总评：clear win, 优先级最高, 应立即推进**
+  - **总评：clear win（容量/mirror 维度），优先级仅次于 Q5_K 转存**
 - **方案 3 — HAP_mmap2 直读 system memory 物理 fd**（真正绕开 ION / 走 ARM64 host PA 空间）：跳过 ION 分配，由 AP 侧 `mmap` 一大段匿名页（24 GB system mem 完整可用，无 4 GiB 限制），把 fd 通过 `fastrpc_mmap` 传给 DSP，HAP_mmap2 直接映射物理页。**理论最干净**，但要求 fastrpc_ioctl 的 size 字段确实没截断（证据 E 已证 FastRPC ioctl 是 `__u64`），且 HAP_mmap2 内部支持 > 4 GiB 物理连续页
 
 **与 QCOM per-buffer 方案的对比（升顶 2026-08-08：4 GiB 根因是 V79 user VA, 1a 已撤回）**：
@@ -1957,23 +1975,25 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
 | 20B 模型 (~12 GB) 可行性 | 已验证 | 不可行 | 可行 (12 块 1 GiB) | 可行 (4 块 3 GiB) |
 | 32B 模型 (~20 GB) 可行性 | 取决于 ctx, 权重装得下 | 不可行 | 可行 (20 块 1 GiB) | 可行 (7 块 3 GiB) |
 
-**重要结论（升顶 2026-08-08, scatter-gather 提升为 clear win 根治路径）**：
+**重要结论（2026-08-09 重写, Q5_K 转存提升为最短路径, scatter-gather 保持 clear win 但重新定位）**：
 
-scatter-gather (8.7.3 方案 2 = 8.7.4 1b) **同时解决两个问题**, 应提升为 9B 性能根治路径：
+9B 性能修复现在是**两条独立路径的叠加**，各自解决一个问题：
 
-1. **"装得下"** — 让 9B / 13B / 20B 模型的 weight 能存到 system memory, 不被 4 GiB mempool 卡住
-2. **"消除 graph split"** — 让 ssm_out.weight 264 MB 能被 DSP 访问, 消除 24 个 MUL_MAT split, batch_calls 从 6400 降到 ~256, **TG 净提升 4 倍**（+4.8 tok/s）
+1. **Q5_K -> Q4_0 转存（消 graph split）** — ssm_out.weight 264 MB 是 Q5_K 类型被 validator 拒绝（8.3），set_tensor 时转存 Q4_0（复用既有 Q4_K/Q6_K 机制，~30-50 行）后 validator 放行，24 个 MUL_MAT split 直接消除，batch_calls 从 6400 降到 ~256，**TG 1.48 -> ~2.8 tok/s**（8.5 节测算，省的是随 call 数线性的固定开销 ~325 ms/token）
+2. **scatter-gather / DMA 拉取（消 mirror + 扩容量）** — heap 回退的 ~2 GiB 权重免镜像，**消除 ~200 ms/token mirror memcpy**，叠加路径 1 后 **TG ~2.8 -> ~6-7 tok/s**（8.6.2 节）；同时把可装模型上限从 4 GiB 提到 24 GiB（13B/20B 门票）
 
-scatter-gather 与 op_batch / dspqueue 路径是**正交且可叠加的优化路径**：
-- scatter-gather 解决 "**装得下 + 消除 graph split**"（解决 9B 5.2x 性能差距根因）
-- op_batch (8.8 短期) 解决 "**每 sub-call 提交开销**"（1.7-2.4x TG 提升, 但 sub-call 数不变, 仍受 25 个 split 拖累）
-- dspqueue (8.8 中期) 解决 "**AP-DSP 异步 overlap**"（3.5 → 6-7.7 tok/s, 与 scatter-gather 叠加）
+两条路径正交可叠加，且与提交路径优化（op_batch / dspqueue，8.8）也**正交**：
+- Q5_K 转存解决 "**24 个 CPU split**"（类型根因，~30-50 行，最先落地）
+- scatter-gather 解决 "**装得下 + 免 mirror**"（容量根因，DSP 端协议扩展，1-2 个月）
+- op_batch (8.8 短期) 解决 "**每 sub-call 固定提交开销**"（split 消除后段数已少，收益收窄，见 8.7.4）
+- dspqueue (8.8 中期) 解决 "**AP-DSP 异步 overlap**"（叠加后 8-10 tok/s）
 
-**优先级升顶（2026-08-08）**：
-- scatter-gather (1b) 优先级**最高**, 是 9B 性能根治路径
-- op_batch (8.8 短期) 降为**短期 complementary 优化**（可与 1b 并行, 1b 实施期间也能继续优化）
+**优先级（2026-08-09 重排）**：
+- **Q5_K -> Q4_0 转存优先级最高**（最短路径、~30-50 行、收益确定、是后续提交路径优化的前置条件——不消掉 24 个 CPU 段，批提交无从合并）
+- scatter-gather (1b) 其次，是容量/mirror 根治路径（clear win）
+- op_batch (8.8 短期) 降为**短期 complementary 优化**（可与转存并行，转存落地后其收益被部分覆盖）
 - 1c/1d 作为更长线储备
-- 8.7.3 方案 1 (per-buffer 替代) 继续搁置, 需用户决策
+- 8.7 绕开路径方案 1 (per-buffer 替代) 继续搁置, 需用户决策
 
 **QCOM per-buffer 方案没有被 JZ 采纳的设计哲学原因**：
 
@@ -1981,26 +2001,32 @@ scatter-gather 与 op_batch / dspqueue 路径是**正交且可叠加的优化路
 - QCOM 无 mirror 机制（mirror 是 JZ 自有设计），故可直接 per-buffer 拆分无副作用
 - 因此 JZ 走 scatter-gather / 多 mempool 路径时，mirror 机制必须先扩展支持跨 buffer（这是 8.6 节讨论 mirror 机制时已经识别的 gap）
 
-**当前 JZ 受限的机制**：
+**当前 JZ 的内存去向（2026-08-09 按 GGUF 元数据 + alloc log 修正）**：
 
 ```
-5.4 GB 模型权重
-  ├── 4.0 GB 装入 ION mempool (1 个 HAP_mmap2 块)
-  └── 1.4 GB 留在 system memory
-        └── ssm_out.weight 命中 (11 MB × 24 层 = 264 MB)
-              └── scheduler 看到 weight 在 CPU buffer
-                    └── 触发 24 个 split
+5.03 GiB 模型权重 (427 tensors, GGUF 实测 5148.1 MiB)
+  ├── CPU buft 809.6 MiB (调度期决定, 与 mempool 容量无关)
+  │     ├── token_embd.weight 545.62 MiB (Q4_0)
+  │     │     └── embedding GET_ROWS 在 CPU (upstream 常规)
+  │     └── 24 x ssm_out.weight 264.0 MiB (Q5_K)
+  │           └── JZ MUL_MAT validator 拒 Q5_K -> 调度期判给 CPU
+  │                 └── 触发 24 个 split (类型根因, 扩容 mempool 也消不掉)
+  └── hexagon buft ~4088 MiB (output.weight Q6_K 795.70 已转存 Q4_0 545.62)
+        ├── ~2059 MiB 进 ION mempool (2005 MiB chunk + 54 MiB chunk)
+        └── 1996.95 MiB 回退 heap (needed 1996 > remaining 1968)
+              └── hexagon buft 属性不变, 不触发 split
+                    └── 代价是每 token ~2 GiB mirror memcpy (~200 ms, 8.6 节)
 ```
 
-**scatter-gather 突破后的新内存布局**：
+**scatter-gather 突破 + Q5_K 转存叠加后的新内存布局**：
 
 ```
-5.4 GB 模型权重
-  └── 0 GB 装入 ION mempool (用于 activation / scratch)
-  └── 5.4 GB 留在 system memory, DSP 通过 HAP_mmap2 单独 map
-        └── DSP 端用 DMA 拉 system memory 页
-              └── scheduler 看到 weight 在 DSP-accessible buffer
-                    └── 无 split
+5.03 GiB 模型权重
+  ├── CPU buft 545.62 MiB: token_embd.weight (embedding 仍在 CPU, upstream 行为)
+  └── DSP 可达 ~4.2 GiB (4088 MiB + ssm_out 转存后 216 MiB, Q5_K 264 -> Q4_0 216)
+        └── 权重存 system memory, DSP scatter-gather / DMA 直读
+              ├── 无 split (Q5_K 已转 Q4_0, validator 放行)
+              └── 无 mirror memcpy (heap 回退消失)
 ```
 
 #### 8.7.1 三个独立的内存维度
@@ -2011,7 +2037,7 @@ scatter-gather 与 op_batch / dspqueue 路径是**正交且可叠加的优化路
 
 | 维度 | 当前位置 | 4 GiB 限制是否卡 | 突破方式 |
 |---|---|---|---|
-| **Weight** | ION mempool 4 GB | ✅ 是（9B 已卡 1.4 GB） | scatter-gather / DSP 端 mirror |
+| **Weight** | ION mempool 4 GB | ✅ 是（9B 已回退 ~2.0 GiB 到 heap，靠 mirror 维持执行） | scatter-gather / DSP 端 mirror |
 | **KV cache** | ION mempool 4 GB | ✅ 是（长 ctx 8K 卡 1.6-3.4 GB） | K/V 量化 (FP16/Q8, 7 章 Table-22 P1) |
 | **Activation / scratch** | ION mempool 4 GB | ❌ 否（小，< 100 MB） | 不需要突破 |
 
@@ -2030,169 +2056,85 @@ scatter-gather 与 op_batch / dspqueue 路径是**正交且可叠加的优化路
 
 #### 8.7.3 不同模型在不同手机上的可行性矩阵
 
-**Qwen3.5-9B 实际内存分配示例（基于 [ggml-hexagon-jz.cpp:5050-5097](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5050-L5097) `alloc_buffer` 行为）**：
+**Qwen3.5-9B 实际内存分配（GGUF 元数据 + `log_qwen3.5-9b.txt` alloc 记录实测，2026-08-09 重写）**：
+
+先前版本此处的布局图基于估计的每层大小（MHA ~130 MB / delta-net ~167 MB）与"24 个 ssm_* 权重容量溢出触发 split"的因果链，两处都与实测矛盾，已撤回：(1) GGUF 普查显示全模型仅 24 个 `ssm_out.weight` 是 Q5_K，其余 ssm_* 权重是 Q4_0/Q4_1/Q8_0/F32 并正常留在 hexagon buft，**被 scheduler 判给 CPU 的只有 Q5_K 的 ssm_out**（8.3 节）；(2) 容量回退的受害者是 1996.95 MiB 的普通 hexagon 权重 chunk——回退 heap 后仍属 hexagon buft，经 mirror 维持 DSP 执行，**不产生 split**，代价是 mirror memcpy。实测布局：
 
 ```
 ========================================================================
-Qwen3.5-9B 在 JZ single mempool 中的内存布局 (alloc_buffer 调用)
+Qwen3.5-9B 在 JZ 后端的实际内存去向 (GGUF + alloc log 实测)
 ========================================================================
 
-Qwen3.5-9B 模型完整内容: 5.01 GiB, 32 layers, 427 tensors
-  - 1 x token_embd.weight         (Q4_0, 152064 x 4096)    ~330 MiB
-  - 1 x output_norm + output.bias (FP32/F16)               ~5 MiB
-  - 8 MHA layers x 7 tensors     (attn_q/k/v/out + ffn_*)  ~130 MB/layer
-                                                                  = ~1.0 GiB
-  - 24 delta-net layers x 14 tensors (MHA part + ssm_*)     ~167 MB/layer
-                                                                  = ~4.0 GiB
-  (8 MHA + 24 delta-net = 32 layers total)
-  注意: 24 delta-net layers 的 ssm_* 权重约占 1.4 GiB (24 x ~60 MB)
+模型总量: 427 tensors, 32 layers, 5148.1 MiB = 5.03 GiB
+  Q4_0  n=173  3929.62 MiB  (含 token_embd.weight [4096, 248320] 545.62)
+  Q6_K  n=1     795.70 MiB  (output.weight [4096, 248320], 全模型唯一)
+  Q5_K  n=24    264.00 MiB  (全部 ssm_out.weight [4096, 4096], 11.00 x 24)
+  Q4_1  n=4     120.00 MiB / Q8_0 n=48  6.38 MiB / F32 n=177  32.39 MiB
 
-DSP user VA 0x0000_0000 -------------------------------------> 0xFFFF_FFFF
-                            (32-bit = 4 GiB hard cap, V79 PRM sec 1.1)
+调度期三路去向 (前两路 CPU 均与 mempool 容量无关):
 
-+----------------------- 4 GiB mempool (ION pre-allocated) -----+
-|                                                                |
-|  Offset     Region         Size       Content                   |
-|  ------     ------         ----       -------                   |
-|  0x0000     [reserved]     8 MiB      metadata reserve          |
-|                                                                |
-|  0x0800     [Chunk 0]      ~330 MiB   token_embd.weight         |
-|                                       (Q4_0, 152064 x 4096)    |
-|                                                                |
-|  ~0x14B0    [Chunk 1]      ~5 MiB     output_norm + output.bias |
-|                                                                |
-|  ~0x1800    [Chunk 2]      ~1.0 GiB   blk.0..blk.7 MHA layers   |
-|                                       (8 MHA layers x ~130 MB)  |
-|                                       attn_q/k/v/out + ffn_*   |
-|                                                                |
-|  ~0x5800    [Chunk 3]      ~2.3 GiB   blk.8..blk.31 24 delta-net|
-|  (24 layers x ~96 MB MHA part)         MHA part (attn + ffn,   |
-|                                        ~96 MB/layer)            |
-|                                                                |
-|  -- above ~3.6 GiB of 5.01 GiB loaded into mempool ----------   |
-|                                                                |
-|  0xE000_    [GAP / free]   ~400 MiB   mempool tail sparse       |
-|  0000                                  (fragmentation waste)     |
-|                                                                |
-|  0xF800_    [mempool end]  0          no more alloc             |
-|  0000                                                         |
-|                                                                |
-+----------------------------------------------------------------+
-                              v
-                  mempool full (3.6 GiB used, 400 MiB wasted)
-                  remaining 1.4 GiB of model CANNOT fit
-                              v
-+----- 1.4 GiB model overflow: kept in ARM64 system memory ----+
-|                                                                |
-|  blk.8..blk.31 delta-net layers ssm_* weights (24 x ~60 MB)  |
-|  - ssm_out.weight: 24 x 11 MiB = 264 MB                       |
-|  - other ssm_*:   24 x ~47 MiB = ~1130 MB                     |
-|                                                                |
-|  This 1.4 GiB is NOT in single mempool.                       |
-|  buffer type: is_ion_buffer = false                            |
-|  -> MUL_MAT op whose src/dst contains these tensors           |
-|     forced to split to CPU (8.3 Table-29: 25 CPU SPLIT)        |
-|                                                                |
-+----------------------------------------------------------------+
+  [CPU buft  809.6 MiB]
+    token_embd.weight   545.62 MiB  embedding GET_ROWS 在 CPU (upstream 常规,
+                                    log: "cannot be used with preferred buffer
+                                    type CPU_REPACK, using CPU instead")
+    24 x ssm_out.weight 264.0 MiB   Q5_K 被 MUL_MAT validator 拒 (8.3)
+                                    -> 24 个 CPU split (SPLIT #2,4,...,48)
 
-========================================================================
-Key observations (correspond to alloc_buffer behavior)
-========================================================================
+  [ION mempool  ~2059 MiB 权重] (hexagon buft)
+    weight chunk A  2005.05 MiB     首 tensor = output.weight 545.62 MiB
+                                    (Q6_K 经 set_tensor 转存 Q4_0, 省 250 MiB)
+    weight chunk B    54.00 MiB
+    另有 compute buffer 若干 (50 + 4 + 256 + 50 + 62.62 MiB)
 
-1. alloc_buffer call order: token_embd -> output_norm -> blk.0..blk.7
-   MHA -> blk.8..blk.31 delta-net (MHA part) -> 24 ssm_* OVERFLOW
-   (the 24 ssm_* never fit, so they spill to system memory)
+  [heap 回退  1996.95 MiB] (hexagon buft, 容量所迫: needed 1996 > remaining 1968)
+    普通层权重, 不触发 split, DSP 经临时 mirror 执行
+    代价: ~2 GiB/token AP-side mirror memcpy (~200 ms, 8.6 节)
 
-2. 5.01 GiB model > 4 GiB single mempool, 1.4 GiB cannot fit.
-   The 24 delta-net ssm_* weights (1.4 GiB) spill to ARM64 system
-   memory -> MUL_MAT triggers 25 CPU SPLIT (8.3 Table-29)
-   -> each CPU SPLIT adds 21.4 ms split overhead (8.4 section)
-   -> 24 SPLIT x 21.4 ms = 513 ms/token = 0.5 s/token pure split cost
-
-3. If mempool grew to 5.01 GiB (V79 DSP VA 4 GB hard cap broken,
-   needs scatter-gather or sliding window mmap; AP side is 64-bit
-   OS without this limit), all 5.01 GiB model fits in single
-   mempool -> 25 CPU SPLIT gone -> per-token call drops from 25
-   to 1 -> theoretical TG 1.48 -> 4-5 tok/s (8.6.2)
-
-4. mempool actual usable 4016 MiB (probe_slots=4032 - 8 MiB metadata
-   - 8 MiB get_max_size reserve); QCOM default 1024 MiB but uses
-   per-buffer scatter-gather to break V79 4 GB limit (8.7 Table-33)
+mempool 注册容量 4024 MiB (probe 4032 - 8 MiB reserve)
+  权重装入后 pool_used 2109 MiB (52.4%), 加 compute buffer 后 ~2.5 GiB
+  余量 ~1.5 GiB 空闲, 但单 chunk 需求 1996 MiB > 当时剩余 1968 MiB -> 回退
 ```
 
-**Qwen3.5-9B 在 8 GiB mempool 中的假设内存布局（仅作对比分析，V79 DSP VA 有 32-bit 4 GiB hard cap，AP 端是 64 位 OS 无这个约束，需 scatter-gather 才能突破；详见 8.7 节）**：
+**Key observations（对应 alloc_buffer 行为，2026-08-09 重写）**：
+
+1. 权重 chunk 边界由运行时 mempool 余量决定，不是固定值：PID 20562 拆 2005+1996 MiB 双 chunk（后块回退）；PID 21326 单块 4002 MiB 整体回退 heap（needed 4002 > remaining 3973）。两次运行的 split 模式相同——24 个 Q5_K split 与 chunk 边界无关
+2. 5.03 GiB 模型 > 4 GiB mempool 是事实，但容量回退的代价形态是 **mirror memcpy**（heap 权重每 token ~2 GiB 镜像，~200 ms），**不是 split**；24 个 split 全部来自 Q5_K 类型拒绝，扩容 mempool 消不掉
+3. 消除 split 的最短路径是 Q5_K -> Q4_0 转存（8.7.4 步骤 0）：24 个 CPU 段消失，batch_calls 6400 -> 256，省 ~325 ms/token 固定开销，TG 1.48 -> ~2.8 tok/s（8.5 节测算）
+4. 若容量也突破（scatter-gather / 等效 8 GiB）：heap 回退消失、mirror memcpy 归零，叠加后 681 - 325 - 200 = ~156 ms/token -> ~6-7 tok/s（8.6.2 节）；13B/20B 模型同时获得装载门票
+5. QCOM default `get_max_size` 1024 MiB、per-buffer scatter-gather 突破 V79 4 GiB 限制的架构对比见 8.7 Table-33/34，不受影响
+
+**容量突破后的假设对比（仅作对比分析；V79 DSP user VA 仍是 32-bit 4 GiB hard cap，需 scatter-gather 让 backing store 落在 system memory。另注意：embedding 在 CPU 与 Q5_K split 均与容量无关，不随扩容消失）**：
 
 ```
 ========================================================================
-Qwen3.5-9B 在 8 GiB mempool 中的内存布局 (假设场景, 突破 4 GB 限制)
+4 GiB 现状 vs 容量突破 (scatter-gather / 等效 8 GiB) 对比 (Qwen3.5-9B)
 ========================================================================
 
-DSP user VA: 在 scatter-gather 下仍 4 GiB window, 实际 backing store
-             在 system memory 不受 V79 user VA 32-bit 限制
+| Metric                      | 4 GiB 现状             | 容量突破后                |
+| --------------------------- | ---------------------- | ------------------------- |
+| 模型总权重                  | 5.03 GiB               | 5.03 GiB                  |
+| DSP 可达权重                | 4088 MiB (2059 mempool | ~4304 MiB (含 ssm_out     |
+|                             |  + 1996 heap + 小chunk)|  转存后 216 MiB)          |
+| CPU 权重                    | 809.6 MiB (token_embd  | 545.62 MiB (仅 token_embd,|
+|                             |  545.62 + ssm_out 264) |  embedding 在 CPU 是      |
+|                             |                        |  upstream 常规, 不消)     |
+| 24 个 ssm_out CPU split     | 有 (Q5_K 类型根因)     | 仍在 -- 与容量无关,       |
+|                             |                        | 需叠加 Q5_K 转存才消除    |
+| mirror memcpy               | ~2 GiB/token (~200 ms) | 0 (heap 回退消失)         |
+| Hexagon 段/token            | 25                     | 25 (扩容 alone);          |
+|                             |                        | 1 (叠加 Q5_K 转存)        |
+| batch_calls (256 token)     | 6400                   | 6400 (alone); 256 (叠加)  |
+| TG tok/s (估算)             | 1.48 (实测)            | ~2.1 (alone, 只省 mirror);|
+|                             |                        | ~6-7 (叠加转存, 8.6.2)    |
+| 13B (~7.5 GB) / 20B (~11 GB)| 不可                   | 可装 (backing 在 system   |
+|                             |                        |  memory, 16 GB 手机覆盖)  |
 
-+-------------------- 8 GiB backing mempool (system memory) ------+
-|                                                                |
-|  Offset     Region         Size       Content                   |
-|  ------     ------         ----       -------                   |
-|  0x0000     [reserved]     8 MiB      metadata reserve          |
-|                                                                |
-|  0x0800     [Chunk 0]      ~330 MiB   token_embd.weight         |
-|                                       (Q4_0, 152064 x 4096)    |
-|                                                                |
-|  ~0x14B0    [Chunk 1]      ~5 MiB     output_norm + output.bias |
-|                                                                |
-|  ~0x1800    [Chunk 2]      ~1.4 GiB   blk.0..blk.7 MHA layers   |
-|                                       (8 MHA layers x ~180 MB)  |
-|                                       attn_q/k/v/out + ffn_*   |
-|                                                                |
-|  ~0x7000    [Chunk 3]      ~3.0 GiB   blk.8..blk.31 24 delta-net|
-|  (24 layers x ~130 MB complete)        MHA part + ssm_* all in  |
-|                                       (MHA ~70 MB + ssm_in/out  |
-|                                        + A_log + dt_bias + conv1d|
-|                                        = ~60 MB ssm part)        |
-|                                                                |
-|  -- above ~4.8 GiB fully loaded into mempool -----------------  |
-|                                                                |
-|  ~0x1330    [GAP / free]   ~3.2 GiB   mempool tail free         |
-|  0000                                  (ample room for KV cache)|
-|                                                                |
-|  0x2000_    [KV cache]     0~1.2 GiB  per-request, grows        |
-|  0000                                  dynamically              |
-|                                                                |
-+----------------------------------------------------------------+
-                              v
-                  NO system memory fallback needed
-                  NO CPU SPLIT (all 25 SPLIT boundaries resolved)
-                              v
+Key insight (2026-08-09 修正): 容量突破单独只省 mirror (~200 ms/token),
+不消 split -- 旧结论 "扩容到 8 GiB 消掉全部 25 个 split -> 5.7 tok/s
+QCOM parity" 已撤回, split 是 Q5_K 类型根因。split 消除靠 Q5_K 转存
+(~30-50 行, 8.7.4 步骤 0)。容量 + 转存叠加把 9B TG 从 1.48 推到
+~6-7 tok/s; 再叠 dspqueue 批提交 (8.8) 追平/超过 QCOM 7.70。
 ========================================================================
-   system memory fallback: 0 (empty, no tensor pushed out)
-========================================================================
-
-(empty - 5.01 GiB model fully fits in 8 GiB mempool)
-
-========================================================================
-4 GiB vs 8 GiB mempool 对比 (Qwen3.5-9B)
-========================================================================
-
-| Metric                       4 GiB mempool        8 GiB mempool
-| ---------------------------- -------------------- --------------------
-| Total model weight           5.01 GiB              5.01 GiB
-| Weight in mempool            3.6 GiB (~72%)        5.01 GiB (100%)
-| Weight in system memory      1.4 GiB (~28%)        0 GiB
-| CPU SPLIT boundaries         25 (24 ssm_out + 1)   0
-| batch_calls per TG token     25                    1
-| Per-token split overhead     ~513 ms (0.5 s/token) ~0 ms
-| TG tok/s (theoretical)       1.48 (current)        5.7 (QCOM parity)
-| TG tok/s with QCOM per-call  2.5-3.5 (8.8)         6-7.7 (8.8)
-| KV cache (8K ctx) headroom   ~64 MiB in 400 MiB    ~1.2 GiB in 3.2 GiB
-|                              GAP (tight)            GAP (comfortable)
-| 13B model fit                NO (8.5 GB > 4 GB)    YES (8.5 GB < 8 GB)
-| 20B model fit                NO (12 GB > 4 GB)     NO (12 GB > 8 GB)
-
-Key insight: doubling mempool from 4 GiB to 8 GiB removes ALL 25
-CPU SPLIT for Qwen3.5-9B, recovers 100% of pure-split overhead
-(513 ms/token), and enables 13B model support - the cleanest
-single-step improvement for the 9B performance gap.
 ```
 
 **Table-39**：scatter-gather + K/V 量化双重突破后，主流 Q4_0 模型在不同手机上的可行性
@@ -2215,43 +2157,48 @@ single-step improvement for the 9B performance gap.
 
 **前提澄清**：4 GiB 限制是 **Hexagon V79 user-mode 32-bit 虚拟地址空间（硬件 PRM §1.1）**——这是**硬件 hard cap**，不是 platform 软件层限制。任何软件 workaround（ION/FastRPC/HAP_mmap 字段升级）都**不能**让 DSP 看到 > 4 GiB。QCOM 之所以支持 9B/13B/20B 模型，是因为使用了 **scatter-gather** 或 **sliding window mmap** 让 DSP 只在 4 GiB VA window 内工作、weight 实际存 system memory。JZ current 架构（pre-allocate 4 GiB mempool + 一次性 mmap 整个）受此限制，**需要架构重构才能突破**
 
-**Table-40**：突破 4 GiB 限制后的优化路径顺序（按收益/风险/工时排序）
+**Table-40**：9B 性能修复路径顺序（2026-08-09 重排：Q5_K 转存升为最短路径；按收益/风险/工时排序）
 
-| 步骤 | 工作 | 解决 4 GiB 哪个维度 | 9B TG 收益 | JZ 改动量 |
+| 步骤 | 工作 | 解决什么问题 | 9B TG 收益 | JZ 改动量 |
 |---|---|---|---|---|
-| 1a. ~~JZ 改 `get_max_size` (1 行)~~ **(已撤回)** | 改 `get_max_size()` 返回 1 GiB 让 ggml core 拆 chunk | weight | **不可行 (验证失败, 2026-08-08)** | N/A (JZGmp `alloc_buffer` 是 bump allocator, 改 `get_max_size` 不能扩总容量) |
-| 1b. JZ scatter-gather (8.7.3 方案 2, 根治)【9B 性能根治路径, clear win, 应优先推进】 | DSP 端 HVX descriptor 从 system memory 物理页拉 weight, **绕过 V79 user VA 4 GiB hard cap** | weight | 装得下 + 消除 24 个 graph split, AP cgraph 改动中等 | 较大 (DSP entry.c scatter-gather 支持 + 4 个缺失点) |
-| 1c. HAP_mmap2 system memory (8.7.3 方案 3) | `HAP_mmap2` 按 layer 切换 mmap 内容, sliding window | weight | 装得下, **仍受 V79 4 GiB 总 VA 限制** | 较大 (需要 DSP 端 mmap 切换协议 + cache 一致性) |
+| **0. Q5_K -> Q4_0 set_tensor 转存（最短路径，2026-08-09 新增）** | 复用既有 Q4_K/Q6_K 转存机制：`ggml_hexagon_weight_dsp_type` 加 Q5_K 映射 + 新增 `repack_q5k_as_q4_0_tiled_to_buf` + validator switch 加 Q5_K case | **24 个 ssm_out CPU split（类型根因，8.3）** | 1.48 -> ~2.8 tok/s（batch_calls 6400 -> 256，省 ~325 ms/token 固定开销，8.5） | **小（~30-50 行，集中在 set_tensor 转换与 validator 放行）** |
+| 1a. ~~JZ 改 `get_max_size` (1 行)~~ **(已撤回)** | 改 `get_max_size()` 返回 1 GiB 让 ggml core 拆 chunk | weight 容量 | **不可行 (验证失败, 2026-08-08)** | N/A (JZGmp `alloc_buffer` 是 bump allocator, 改 `get_max_size` 不能扩总容量) |
+| 1b. JZ scatter-gather (8.7 绕开路径方案 2, 容量/mirror 根治)【clear win, 2026-08-09 重新定位】 | DSP 端 HVX descriptor 从 system memory 物理页拉 weight, **绕过 V79 user VA 4 GiB hard cap** | weight 容量 + heap 权重 mirror memcpy（**不含 split**——split 是 Q5_K 类型根因，由步骤 0 覆盖） | 叠加步骤 0 后 ~2.8 -> ~6-7 tok/s；13B/20B 装载门票 | 较大 (DSP entry.c scatter-gather 支持 + 4 个缺失点) |
+| 1c. HAP_mmap2 system memory (8.7 绕开路径方案 3) | `HAP_mmap2` 按 layer 切换 mmap 内容, sliding window | weight 容量 | 装得下, **仍受 V79 4 GiB 总 VA 限制** | 较大 (需要 DSP 端 mmap 切换协议 + cache 一致性) |
 | 1d. 混合方案 (控制结构放 user VA + weight 放 system memory, 工程最干净) | 控制结构放 DSP user VA, weight 放 system memory scatter-gather | weight + control | 装得下, 理论最干净 | 较大 (架构重构, 1-2 个月工时) |
-| 2. 短期 op_batch 累积 (8.8) | 解决 25 sub-call 提交开销 | 不直接相关 | 1.48 → 2.5-3.5 tok/s | 小 (改 1 个函数) |
-| 3. K/V 量化 (7 章 Table-22 P1) | 让 KV cache 装下 4 GiB | KV cache | 6-7.7 → 8-10 tok/s | 中 (算子 + Q8/FP16 kernel) |
-| 4. 中期 dspqueue 异步化 (8.8) | 进一步压平 per-call 开销 | 不直接相关 | 8-10 → 接近/超过 QCOM | 中 (改 fastrpc 路径) |
+| 2. 短期 op_batch 累积 (8.8) | 压缩 per-call 固定提交开销 | 与容量/split 均不直接相关 | 步骤 0 落地前 1.48 -> 2.5-3.5 tok/s；步骤 0 之后收益收窄（段数已从 25 降到 1，可批的段不多） | 小 (改 1 个函数) |
+| 3. K/V 量化 (7 章 Table-22 P1) | 让 KV cache 装下 4 GiB | KV cache | 6-7.7 -> 8-10 tok/s | 中 (算子 + Q8/FP16 kernel) |
+| 4. 中期 dspqueue 异步化 (8.8) | 进一步压平单次提交开销 (~214x 差距的真因，8.4) | 提交路径 | 叠加后 8-10 tok/s，追平/超过 QCOM | 中 (改 fastrpc 路径) |
 
-步骤 1 是大模型（> 4 GB）性能优化的"门票"——没有它后面三步都受限于"只能装 4 GB 模型"。但 1b / 1c / 1d 三选一**不互斥**：1d (混合方案) 工程最干净但重构量最大，1c 仍受 V79 4 GiB 总 VA 限制（sliding window 不是真的绕开），**1b scatter-gather 是 9B 性能根治路径（clear win, 应优先推进）**。
+步骤 0 是 9B 性能修复的"第一刀"——不先消掉 24 个 CPU 段，后续批提交/流水线无从合并（25 段不合并，op_batch 能批的只是 descriptor 准备，段间同步开销还在）；步骤 1 是大模型（> 4 GB）的"容量门票"。1b / 1c / 1d 三选一**不互斥**：1d (混合方案) 工程最干净但重构量最大，1c 仍受 V79 4 GiB 总 VA 限制（sliding window 不是真的绕开），**1b scatter-gather 是容量/mirror 维度的 clear win**。
 
-**8.7.3 方案 1 (per-buffer 替代单 mempool, 仿 QCOM) 不在主路径表**：8.7.3 节列出的"方案 1"路径虽然最直接（仿 QCOM per-buffer 拆分），但**几乎推翻 JZ single mempool 架构优势**（失去 offload lmhead 能力, qwen1 / 2B / 8B 等 < 4 GiB 模型 TG 可能显著下降），详见上面"关键架构取舍"段（line 1774-1795）。**本路径作为"已识别风险路径"搁置**, 在用户明确接受"放弃 JZ 架构优势换取 9B+ 容量"之前**不推荐推进**——这是架构层面的取舍, 不是 clear win
+**8.7 绕开路径方案 1 (per-buffer 替代单 mempool, 仿 QCOM) 不在主路径表**：8.7 节"绕开路径"列出的"方案 1"路径虽然最直接（仿 QCOM per-buffer 拆分），但**几乎推翻 JZ single mempool 架构优势**（失去 offload lmhead 能力, qwen1 / 2B / 8B 等 < 4 GiB 模型 TG 可能显著下降），详见上面"关键架构取舍"段。**本路径作为"已识别风险路径"搁置**, 在用户明确接受"放弃 JZ 架构优势换取 9B+ 容量"之前**不推荐推进**——这是架构层面的取舍, 不是 clear win
 
-**优先建议（升顶 2026-08-08：scatter-gather 提升为 clear win 根治路径, op_batch 降为 complementary）**：
+**优先建议（2026-08-09 重排：Q5_K 转存升为最高优先级，scatter-gather 保持 clear win 但重新定位为容量/mirror 路径）**：
 
 - **编号映射澄清**：
-  - 8.7.3 节"绕开路径"列了"方案 1/2/3"
-  - 8.7.4 路径表"步骤 1"列了 1a/1b/1c/1d, **其中 1b=8.7.3 方案 2 (scatter-gather), 1c=8.7.3 方案 3 (HAP_mmap2), 1d=混合方案 (8.7.3 没有, 是新增路径)**
-  - **8.7.3 方案 1 (per-buffer 替代单 mempool) 不在 8.7.4 主路径表**, 原因是几乎推翻 JZ single mempool 架构 (失去 offload lmhead), 是已识别风险路径, 不是 clear win
-- **1b scatter-gather 优先级最高, 是 9B 性能根治路径**：
+  - 8.7 节"绕开路径"列了"方案 1/2/3"
+  - 8.7.4 路径表"步骤 1"列了 1a/1b/1c/1d, **其中 1b=8.7 绕开路径方案 2 (scatter-gather), 1c=方案 3 (HAP_mmap2), 1d=混合方案 (8.7 绕开路径没有, 是新增路径)**；**步骤 0 (Q5_K 转存) 是 2026-08-09 新增**，源于 8.3 节根因反转（split 是 Q5_K 类型根因，不是容量根因）
+  - **8.7 绕开路径方案 1 (per-buffer 替代单 mempool) 不在 8.7.4 主路径表**, 原因是几乎推翻 JZ single mempool 架构 (失去 offload lmhead), 是已识别风险路径, 不是 clear win
+- **步骤 0 (Q5_K -> Q4_0 转存) 优先级最高**：
+  - 改动最小（~30-50 行：`ggml_hexagon_weight_dsp_type` 加映射 + 仿 `repack_q6k_as_q4_0_tiled_to_buf` 新增 Q5_K 转换 + validator 加 case）
+  - 收益确定（24 个 split 直接消除，batch_calls 6400 -> 256，TG 1.48 -> ~2.8 tok/s）
+  - 是后续一切提交路径优化的**前置条件**（不消掉 24 个 CPU 段，批提交/流水线无从合并）
+  - 副作用可控：Q5_K -> Q4_0 是有损重量化（与既有 Q4_K/Q6_K -> Q4_0 同性质），ssm_out 权重体积 264 -> 216 MiB，加载期一次性转换；**需先做 CPU vs DSP 数值对比验证输出不乱码**（9B 乱码问题与 GATED_DELTA_NET 相关，转存后该层输入分布变化需回归）
+  - < 4 GiB 模型（qwen1/2B/8B）不含 Q5_K ssm_out, **完全不受影响**（五模型 CI 回归确认）
+- **1b scatter-gather 其次（容量/mirror clear win）**：
   - 保留 JZ single mempool 架构, 主 mempool 仍装 lmhead + 主要权重
-  - 只对 264 MB ssm_out.weight 做 scatter-gather, 不需完整重构
-  - 消除 24 个 MUL_MAT split → batch_calls 6400 → 256, 9B TG +4.8 tok/s
+  - 消除 heap 回退权重的 ~200 ms/token mirror memcpy，叠加步骤 0 后 TG ~6-7 tok/s
+  - 把可装模型上限从 4 GiB 提到 24 GiB（13B/20B 门票）
   - < 4 GiB 模型（qwen1/2B/8B）继续用 single mempool, **完全不受影响**
-  - 是 clear win, **应立即推进**（1-2 个月工时, 实施成本集中在 DSP 端 entry.c scatter-gather 支持）
+  - 实施成本集中在 DSP 端 entry.c scatter-gather 支持（1-2 个月工时）
 - **2 op_batch 累积 降为短期 complementary 优化**：
-  - 不依赖 scatter-gather, 可与 1b 并行实施
-  - 解决每 sub-call 提交开销（21.4 ms / call → 5-10 ms / call）
-  - 单独收益：1.48 → 2.5-3.5 tok/s（1.7-2.4x）
-  - 与 1b 叠加：1b 消除 split 后 batch_calls 256, op_batch 收益变小（call 数已少）
-- **4 中期 dspqueue 异步化**：与 1b/2 正交, 进一步压平 per-call 开销, 1b+2+4 叠加可达 8-10 tok/s
-- **8.7.3 方案 1 (per-buffer 替代) 暂不推进**：因推翻 JZ 架构优势, 待用户正式提交"1 路径架构取舍"提案（含 6 维 trade-off 表格分析）后, 由用户决定是否接受
+  - 不依赖步骤 0/1b, 可并行实施；在步骤 0 落地前可先把 1.48 推到 2.5-3.5 tok/s
+  - 步骤 0 落地后段数已从 25 降到 1，其收益被大部分覆盖
+- **4 中期 dspqueue 异步化**：与 0/1b/2 正交, 压平单次提交开销（~214x 差距的真因）, 全部叠加可达 8-10 tok/s
+- **8.7 绕开路径方案 1 (per-buffer 替代) 暂不推进**：因推翻 JZ 架构优势, 待用户正式提交"1 路径架构取舍"提案（含 6 维 trade-off 表格分析）后, 由用户决定是否接受
 - **1c / 1d 作为更长线储备** (1-2 个月工时), 等 1b 决策后再评估
-- **建议优先策略**：1b (scatter-gather) 优先, 同步并行 2 (op_batch), 1b 实施期间持续验证 qwen1 / 2B / 8B 等 < 4 GiB 模型 TG 不退化
+- **建议优先策略**：步骤 0 (Q5_K 转存) 立即落地并过五模型 CI, 同步并行 1b (scatter-gather) 与 2 (op_batch), 实施期间持续验证 qwen1 / 2B / 8B 等 < 4 GiB 模型 TG 不退化
 
 #### 8.7.5 与 8.6 节的关系
 
@@ -2267,6 +2214,8 @@ single-step improvement for the 9B performance gap.
 8.8 节列出的三阶段修复路径（短期 op_batch / 中期 dspqueue / 远期 producer-consumer）解决的是 per-call overhead，与本节 scatter-gather 是**正交的两条独立路径**，可同时推进。
 
 ### 8.8 三阶段修复路径
+
+**前置说明（2026-08-09）**：本节三阶段解决的是**提交路径开销**（8.4 节 ~214x 差距的真因），与 8.7.4 步骤 0（Q5_K 转存消 split）正交。注意步骤 0 落地后每 token Hexagon 段从 25 降到 1，短期 op_batch 的"多段合一"收益被大部分覆盖——op_batch 更应理解为步骤 0 落地前的过渡手段，或与步骤 0 并行推进的互补路径。中远期 dspqueue / producer-consumer 不受段数影响，仍是追平 QCOM 的主路径。
 
 **Table-41**：9B TG 5.2x 差距修复路径（按收益/风险/工时排序）
 
@@ -2285,13 +2234,13 @@ single-step improvement for the 9B performance gap.
 
 ### 8.9 本章结论
 
-1. **9B TG 5.20x / PP 5.26x 差距的真因是 dspqueue 批提交压平 25 sub-call 到 1 dspqueue_write 的提交路径**（单 token 提交成本 JZ 537 ms vs QCOM 0.1 ms = 5370x 差），不是 ssm_out 算子缺失（QCOM 算子 dispatch 与 JZ 一致，ssm_out MUL_MAT 同样有 24 个 split）
-2. **JZ cgraph cache 与 QCOM `graphs reused` 命中率都是 99.2%**（JZ 是 AP 端按 op+shape+src ptr 哈希的 descriptor 复用 cache，QCOM 是 upstream scheduler 的 cgraph 结构复用计数，两者层级不同但都恰好命中 99.2%，因 9B cgraph 拓扑变化频率稳定），差距**不在** cache 命中率，而在 cache miss 之后的提交路径（25 sub-call 串行 FastRPC vs 1 dspqueue 批提交）和单次提交开销（21.4 ms vs 0.1 ms）
-3. **ssm_out.weight 在 CPU buffer 是次要因素**，根治仍需 mempool 扩到 5.4 GB 或预拷贝 ssm_out 到 DSP，但即使消除 split 单独 TG 也只能从 1.48 提到 2.0-3.0 tok/s（Table-41 短期路径才能到 2.5-3.5 tok/s）
-4. **JZ 当前 174.4 sec 中 ~136.5 sec (78%) 是 p5/p12 mirror overhead**（68.70 + 67.83 sec）；DSP 真实计算 ~33.7 sec (p10)；其余 ~4.2 sec 是 p1+p6+p8+p11 等；mirror 是 JZ 9B 的最大成本项
+1. **9B TG 5.20x / PP 5.26x 差距的真因是单次提交开销差距（2026-08-09 修正算术）**：两端 sub-graph 数量相同（同一 upstream scheduler，QCOM validator 同样拒 Q5_K，各 ~25 段/token），JZ 每段走同步 FastRPC + mirror（21.4 ms），QCOM 每段只是一次 dspqueue ring-buffer write（~0.1 ms，~214x）；单 token 提交成本 JZ 537 ms vs QCOM ~2.5 ms。dspqueue 没有把 25 段压成 1 次提交，它把每次提交变便宜 ~214x——JZ 676 ms/token 中 537 ms 是提交开销，扣除后 ~145 ms 与 QCOM 130 ms/token 基本持平（8.4.5 注 3）。不是 ssm_out 算子缺失（QCOM 算子 dispatch 与 JZ 一致）
+2. **JZ cgraph cache 与 QCOM `graphs reused` 命中率都是 99.2%**（JZ 是 AP 端按 op+shape+src ptr 哈希的 descriptor 复用 cache，QCOM 是 upstream scheduler 的 cgraph 结构复用计数，两者层级不同但都恰好命中 99.2%，因 9B cgraph 拓扑变化频率稳定），差距**不在** cache 命中率，而在单次提交开销（21.4 ms vs ~0.1 ms）
+3. **ssm_out.weight 在 CPU buffer 的根因是 Q5_K 量化类型不被 JZ MUL_MAT validator 支持（2026-08-09 根因反转，8.3）**，与 mempool 容量无关；QCOM validator 同样拒 Q5_K，两端 split 拓扑相同。最短修复是 set_tensor 时 Q5_K -> Q4_0 转存（复用既有 Q4_K/Q6_K 机制，~30-50 行），24 个 split 直接消除，batch_calls 6400 -> 256；单独消除 split TG 从 1.48 到 ~2.8 tok/s（8.5），它是后续提交路径优化的前置条件，列为 8.7.4 步骤 0 最先落地
+4. **JZ 当前 174.4 sec 中 ~136.5 sec (78%) 是 p5/p12 mirror overhead**（68.70 + 67.83 sec），其中 ~83 sec 是随 call 数线性的固定开销（6400 calls x ~13 ms，步骤 0 消 split 可省），~51 sec 是 heap 回退权重的 mirror memcpy（~2 GiB/token，需 scatter-gather/容量突破才省，8.6.1 分解）；DSP 真实计算 ~33.7 sec (p10)；其余 ~4.2 sec 是 p1+p6+p8+p11 等
 5. **QCOM 端 unaccounted 0.0% 说明 dspqueue 让 AP 准备与 DSP 算完全 overlap**（QCOM 没有 JZ 的 p1-p12 12 阶段，AP 端没有空转），cgraph cache 99.2% hit 让 99% 的 decode 步走 cache 复用路径
-6. **短期 op_batch 累积**是性价比最高的路径（1-2 周工时，1.7-2.4x 收益，不动 SDK 调用约定）
-7. 配合第七章 Table-22 P0 (E 方向 AP per-call overhead 消除) + 本章 Table-41 短期路径，JZ 9B TG 理论可从 1.48 -> 2.5-3.5 tok/s；中期 dspqueue 异步化后可达 6-7.7 tok/s 接近 QCOM
+6. **修复路径三条正交叠加（2026-08-09 重排，8.7.4 Table-40）**：步骤 0 Q5_K 转存消 split（1.48 -> ~2.8 tok/s，~30-50 行，最高优先级）-> scatter-gather 消 mirror + 扩容量（-> ~6-7 tok/s）-> dspqueue 异步化压单次提交开销（-> 8-10 tok/s）；op_batch 累积作为步骤 0 落地前的过渡（1.48 -> 2.5-3.5 tok/s）可并行
+7. 配合第七章 Table-22 P0 (E 方向 AP per-call overhead 消除) + 本章 Table-40/41 路径，JZ 9B TG 理论可从 1.48 逐步追到 8-10 tok/s，追平/超过 QCOM 7.70
 
 ### 8.10 与第七章 (qwen1) 的对比
 
@@ -2299,14 +2248,14 @@ qwen1 (24 层 MHA 1:1) 与 qwen3.5-9B (32 层 + delta-net 24) 在 JZ 优化路�
 
 | 维度 | qwen1 (第七章) | qwen3.5-9B (本章) |
 |---|---|---|
-| 首要瓶颈 | a-inv + bulk flush (60% wall, L2 8 MB 限制) | split per-call overhead (78% wall = p5+p12 136.5s / 174.4s) |
-| 算子瓶颈 | H3 KV invalidation 确认 (16241 us/batch) | 24 个 ssm_out MUL_MAT split |
-| 模型容量 | 1.2 GiB (Q4_0)，全装入 4 GB mempool | 5.1 GiB (Q4_0)，1.4 GB 回退 system memory |
+| 首要瓶颈 | a-inv + bulk flush (60% wall, L2 8 MB 限制) | 提交路径开销 (p5+p12 136.5s = 78% wall：~83s 随 call 数线性的固定开销 + ~51s heap 权重 mirror memcpy) |
+| 算子瓶颈 | H3 KV invalidation 确认 (16241 us/batch) | 24 个 ssm_out MUL_MAT split（Q5_K 不被 validator 支持，8.3 根因反转） |
+| 模型容量 | 1.2 GiB (Q4_0)，全装入 4 GB mempool | 5.03 GiB (GGUF 实测 5148.1 MiB)：CPU 809.6 MiB (token_embd 545.62 + Q5_K ssm_out 264) + hexagon 权重 4088 MiB 中 1996 MiB 回退 heap |
 | QCOM 对比 | JZ TG 比 QCOM 快 1.61x | JZ TG 比 QCOM 慢 5.20x |
-| 主要优化方向 | K/V 量化 (Table-22 P1, 10-19% TG) | dspqueue 批提交 (Table-41 短期, 1.7-2.4x TG) |
-| 短期可实施性 | 高 (改 cache 写入路径) | 中 (改 fastrpc descriptor 格式) |
+| 主要优化方向 | K/V 量化 (Table-22 P1, 10-19% TG) | Q5_K 转存消 split (Table-40 步骤 0, ~30-50 行) + dspqueue 批提交 (Table-41, 中期) |
+| 短期可实施性 | 高 (改 cache 写入路径) | 高 (Q5_K 转存复用既有 Q4_K/Q6_K 机制) |
 
-两条路径不冲突：qwen1 走 cache 量化路线，qwen3.5-9B 走 dspqueue 批提交路线。可以分头推进，最终在 P2 远期 (producer-consumer 流水线) 阶段汇合。
+两条路径不冲突：qwen1 走 cache 量化路线，qwen3.5-9B 走 Q5_K 转存消 split (步骤 0) + dspqueue 批提交路线。可以分头推进，最终在 P2 远期 (producer-consumer 流水线) 阶段汇合。
 
 
 ***
@@ -2319,6 +2268,10 @@ qwen1 (24 层 MHA 1:1) 与 qwen3.5-9B (32 层 + delta-net 24) 在 JZ 优化路�
 ***
 
 ## 修订历史
+
+### 2026-08-09
+
+- **第八章 ssm_out split 根因反转与全章数据修正 (Kimi-K3, 基于 log_qwen3.5_9b_graphsplit.txt / log_qwen3.5-9b.txt / Qwen3.5-9B-Q4_0.gguf 元数据实测)**：核心修正是 8.3 节根因反转——24 个 ssm_out.weight 在 CPU buffer 的原因是 **Q5_K 量化类型不被 JZ MUL_MAT validator 支持**（[ggml-hexagon-jz.cpp:3404](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L3404) `default: return false`），upstream scheduler 调度期判给 CPU，**与 mempool 容量无关**；三重证据链：graphsplit log 中 24 个 ssm_out.weight 标 `[CPU]` 而同层全部其他权重及 lm_head 标 `[Hexag]` / GGUF 普查全模型 427 个 tensor 中 Q5_K 恰好只有这 24 个 / validator switch 代码。最短修复路径随之确定为 set_tensor 时 Q5_K -> Q4_0 转存（复用 [ggml-hexagon-jz.cpp:1460-1464](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L1460-L1464) 既有 Q4_K/Q6_K 转存机制，~30-50 行），24 个 split 直接消除。各节修正：8.1.2 注（两次运行回退规模不同：PID 20562 双 chunk 2005+1996 MiB vs PID 21326 单块 4002 MiB）/ 8.1.3 观察 3/4/6（batch_calls = 256 token x 25 段、25 x 21.4 = 535 ms/token、dsp_exec 不含 ssm_out）/ 8.2（batch_calls = 64 x 25 分解、Table-25 命中率 98.4%、Table-26 重构 embedding 段、洞察 3 算术 ~504 -> ~325 ms/token）/ 8.3 全节重写（正确根因链 + mempool 容量问题真实边界 + 最短修复路径）/ Table-29（"model.output 在 CPU"行修正为 embedding GET_ROWS，model.output 完整在 Hexagon）/ 8.4.5 Table-30 与注 3 重写（QCOM validator 同样拒 Q5_K 且无 K-quants 转存、提交开销差距 5370x -> 214x 算术修正、graphs reused 是 sched-graph 复用计数非提交次数、JZ lm_head offload 是净优势）/ 8.5 重写（split 次要性论证：省固定开销 ~325 ms/token 不省 mirror memcpy，1.48 -> ~2.8 tok/s）/ 8.6.1/8.6.2（p5+p12 136.5 s 分解为 ~83 s 固定 + ~51 s mirror memcpy、Path-E mechanism 2 修复对 9B 无效的容量论证、mirror 因果链修正）/ 8.7（核心论断、方案 2 定位、重要结论、当前/突破后内存去向图全部按 GGUF+log 重写；scatter-gather 从"消 split"重新定位为"消 mirror + 扩容量"，不再声称消除 24 个 split）/ 8.7.1 Table-37（1.4 GiB -> ~2.0 GiB heap 回退）/ 8.7.3 布局图重写（token_embd 545.62 MiB [4096, 248320]、output.weight Q6_K 795.70 MiB 转存 Q4_0 545.62 MiB、撤回 MHA ~130 MB / delta-net ~167 MB 每层估计与"ssm_* 容量溢出触发 split"因果链）/ 8 GiB 假设对比表重写（扩容 alone 不消 split 只省 mirror -> ~2.1 tok/s，叠加转存 -> ~6-7 tok/s；旧"8 GiB 消全部 25 split -> 5.7 QCOM parity"结论撤回）/ 8.7.4 Table-40 路径表重排（新增步骤 0 Q5_K 转存升为最高优先级最短路径，scatter-gather 保持 clear win 但定位为容量/mirror 路径，op_batch 收益随段数减少而收窄）/ 8.8 前置说明（三阶段与步骤 0 的正交关系）/ 8.9 结论 1/3/4/6 重写（214x 算术、Q5_K 根因、mirror 83+51 分解、三路径叠加路线）/ 8.10 对比表（容量行改 5.03 GiB 三路去向、首要瓶颈分解、优化方向改 Q5_K 转存 + dspqueue）
 
 ### 2026-08-08
 
