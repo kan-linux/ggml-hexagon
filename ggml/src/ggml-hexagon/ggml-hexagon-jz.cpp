@@ -147,6 +147,7 @@ struct ggml_backend_hexagon_reg_context;
 
 static bool                  ggmlhexagon_is_metadata_op(enum ggml_op op);
 static int                   ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx);
+static void                  probe_multi_rpcmem(ggml_backend_hexagon_context * ctx);
 static const char *          ggmlhexagon_get_htparch_desc(size_t htp_arch);
 static size_t                ggmlhexagon_get_system_total_memory_in_bytes(void);
 static int                   ggmlhexagon_get_hvx_arch_ver(int domain, uint32_t * capability);
@@ -322,9 +323,11 @@ struct ggml_backend_hexagon_context {
     char repack_buft_name[GGML_MAX_NAME];       // "hexagon-ion-buffer-<name>-REPACK"
 
     // Per-device hardware caps (probed at init, used by supports_op)
-    bool has_vtcm;  // domain has VTCM pages available
-    bool has_hvx;   // domain has HVX support
-    bool has_hmx;   // domain has HMX support
+    bool has_vtcm;             // domain has VTCM pages available
+    bool has_hvx;              // domain has HVX support
+    bool has_hmx;              // domain has HMX support
+    bool has_async_fastrpc;    // domain supports async FastRPC
+    bool has_extended_map;     // domain supports extended (>=4 GiB) VA mapping
 
     // Cached htp_mm_kernel_params per (weight_data, ne11). For TG, the
     // precompute math produces identical results for every token, so we
@@ -405,6 +408,12 @@ struct hexagon_appcfg_t {
                                 //   dsp_cache_trace_bit0 to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
 
+    int probe_multi_rpcmem;     // Spike A: validate multi-rpcmem + HAP_mmap2 chain at init
+                                //   0=disabled (default, production)
+                                //   1=allocate N independent rpcmem buffers, fastrpc_mmap each,
+                                //     DSP-side HAP_mmap2 each via register_rpcmem IDL, then
+                                //     fastrpc_munmap + rpcmem_free. Logs [MULTI-RPCMEM-PROBE] OK/FAIL.
+
     const char * cfgfilename;
     const char * runtime_libpath;
     char version[GGMLHEXAGON_TMPBUF_LEN];
@@ -430,6 +439,7 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit0   = 0,
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
+        .probe_multi_rpcmem     = 0,
         .cfgfilename            = "ggml-hexagon.cfg",
 #if defined(__ANDROID__)
         .runtime_libpath        = "/data/local/tmp/",
@@ -624,6 +634,7 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(DSP):              %d", g_hexagon_appcfg.dump_diag_info);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(AP):               %d", g_hexagon_appcfg.dump_debug_info);
     GGMLHEXAGON_LOG_VERBOSE("enable graph_optimize:            %d", g_hexagon_appcfg.enable_graph_optimize);
+    GGMLHEXAGON_LOG_VERBOSE("probe_multi_rpcmem (Spike A):     %d", g_hexagon_appcfg.probe_multi_rpcmem);
     if (NULL != ctx) {
         GGMLHEXAGON_LOG_VERBOSE("ggml-dsp use hmx:                 %d", ctx->has_hmx);
     }
@@ -644,11 +655,12 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
     size_t total_mem = ggmlhexagon_get_system_total_memory_in_bytes();
     GGMLHEXAGON_LOG_VERBOSE("device info: %s, dsp arch version 0x%x, system mem size %d MiB",
                              ctx->socinfo.soc_desc, dsp_version, total_mem / SIZE_IN_MB);
-    GGMLHEXAGON_LOG_VERBOSE("device=%d name=%s arch=%s vtcm=%zuMB hvx=%d hmx=%d",
+    GGMLHEXAGON_LOG_VERBOSE("device=%d name=%s arch=%s vtcm=%zuMB hvx=%d hmx=%d async_fastrpc=%d extended_map=%d",
                              ctx->device, ctx->name,
                              ggmlhexagon_get_htparch_desc(ctx->socinfo.htp_arch),
                              ctx->socinfo.vtcm_size_in_mb,
-                             (int)ctx->has_hvx, (int)ctx->has_hmx);
+                             (int)ctx->has_hvx, (int)ctx->has_hmx,
+                             (int)ctx->has_async_fastrpc, (int)ctx->has_extended_map);
     GGMLHEXAGON_LOG_VERBOSE("model: n_layer=%u (parsed from tensor name suffixes)",
                              ctx->max_layer_idx_seen + 1);
     GGMLHEXAGON_LOG_VERBOSE("rpc stats: batch_calls=%llu cum_p10=%lld us cum_graph=%lld us avg_p10=%lld us avg_graph=%lld us",
@@ -952,6 +964,7 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit0", g_hexagon_appcfg.dsp_cache_trace_bit0, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit1", g_hexagon_appcfg.dsp_cache_trace_bit1, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
+    hexagoncfg_instance.get_intvalue("cdsp", "probe_multi_rpcmem", g_hexagon_appcfg.probe_multi_rpcmem, 0);
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_types", g_hexagon_appcfg.enabled_types, "");
 
@@ -1500,6 +1513,46 @@ bail:
     return false;
 }
 
+// Probe whether the DSP domain supports mapping buffers into the extended
+// (>=4 GiB) virtual address range. If 1, fastrpc_mmap can use
+// FASTRPC_MAP_FD_EXTENDED / FASTRPC_MAP_FD_DELAYED_EXTENDED to place buffers
+// beyond the 32-bit user VA ceiling, unlocking scatter-gather and sliding
+// window schemes that would otherwise hit the 4 GiB VA hard cap.
+static bool ggmlhexagon_is_extended_map_supported(int domain) {
+    int hexagon_error = AEE_SUCCESS;
+    if (remote_handle_control) {
+        if (domain == CDSP_DOMAIN_ID) {
+            struct remote_dsp_capability dsp_capability_extended_map;
+            dsp_capability_extended_map.domain       = (uint32_t)domain;
+            dsp_capability_extended_map.attribute_ID = EXTENDED_MAP_SUPPORT;
+            dsp_capability_extended_map.capability   = (uint32_t)0;
+            hexagon_error = remote_handle_control(DSPRPC_GET_DSP_INFO, &dsp_capability_extended_map, sizeof(struct remote_dsp_capability));
+            if ((hexagon_error & 0xFF) == (AEE_EUNSUPPORTEDAPI & 0xFF)) {
+                GGMLHEXAGON_LOG_WARN("FastRPC Capability API is not supported on this device");
+                hexagon_error = AEE_SUCCESS;
+                goto bail;
+            } else if (dsp_capability_extended_map.capability == 1) {
+                return true;
+            }
+
+            if (hexagon_error != AEE_SUCCESS){
+                GGMLHEXAGON_LOG_WARN("failed with error 0x%x", hexagon_error);
+                goto bail;
+            }
+        } else {
+            hexagon_error = AEE_EUNSUPPORTED;
+            GGMLHEXAGON_LOG_WARN("extended VA mapping is not supported on domain %d", domain);
+            goto bail;
+        }
+    } else {
+        hexagon_error = AEE_EUNSUPPORTEDAPI;
+        GGMLHEXAGON_LOG_WARN("remote_dsp_capability interface is not supported on this device");
+    }
+
+bail:
+    return false;
+}
+
 static void ggmlhexagon_set_rpc_latency(remote_handle64 handle, int qos, int latency) {
     int hexagon_error = AEE_SUCCESS;
     (void)latency;
@@ -1747,6 +1800,74 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
     return 0;
 }
 
+// Spike A: validate that N independent rpcmem buffers can each be allocated
+// (rpcmem_alloc2), FastRPC-mapped (fastrpc_mmap), and DSP-side HAP_mmap2'd
+// (via the new register_rpcmem IDL call) without conflicting with the main
+// mempool. The 3-API chain must work for buffers beyond the main mempool for
+// the scatter-gather design to scale (Tier 2: per-chunk dynamic rpcmem).
+//
+// On success logs [MULTI-RPCMEM-PROBE] OK with the HAP_mmap2 VA per buffer.
+// On any failure logs [MULTI-RPCMEM-PROBE] FAIL with the failing step and
+// continues cleanup. Never aborts init: a probe failure must not block
+// production behavior on the main mempool.
+static void probe_multi_rpcmem(ggml_backend_hexagon_context * ctx) {
+    const int    N_BUFFERS = 2;
+    const size_t BUF_SIZE  = 4 * SIZE_IN_MB;  // 4 MiB each, 20 MiB total probe footprint
+
+    void * bufs[N_BUFFERS] = {nullptr};
+    int    fds [N_BUFFERS] = {-1};
+
+    GGMLHEXAGON_LOG_ALWAYS("[MULTI-RPCMEM-PROBE] START: N=%d x %zu MiB, FastRPC only (no ION)",
+                           N_BUFFERS, BUF_SIZE / SIZE_IN_MB);
+
+    for (int i = 0; i < N_BUFFERS; i++) {
+        // Step 1: AP-side rpcmem_alloc2 (FastRPC API)
+        bufs[i] = rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, BUF_SIZE);
+        if (!bufs[i]) {
+            GGMLHEXAGON_LOG_ALWAYS("[MULTI-RPCMEM-PROBE] FAIL step=rpcmem_alloc2 i=%d errno=%d", i, errno);
+            goto cleanup;
+        }
+        // Step 2: get fd for fastrpc_mmap
+        fds[i] = rpcmem_to_fd(bufs[i]);
+        if (fds[i] < 0) {
+            GGMLHEXAGON_LOG_ALWAYS("[MULTI-RPCMEM-PROBE] FAIL step=rpcmem_to_fd i=%d", i);
+            goto cleanup;
+        }
+        // Step 3: fastrpc_mmap (FastRPC API, FASTRPC_MAP_FD_DELAYED to match main mempool)
+        int err = fastrpc_mmap(ctx->domain_id, fds[i], bufs[i], 0, BUF_SIZE, FASTRPC_MAP_FD_DELAYED);
+        if (err != 0) {
+            GGMLHEXAGON_LOG_ALWAYS("[MULTI-RPCMEM-PROBE] FAIL step=fastrpc_mmap i=%d err=%d (fd=%d)", i, err, fds[i]);
+            goto cleanup;
+        }
+        // Step 4: DSP-side HAP_mmap2 via register_rpcmem IDL call
+        uint32_t fd32    = (uint32_t)fds[i];
+        uint32_t size_lo = (uint32_t)(BUF_SIZE & 0xFFFFFFFFu);
+        uint32_t size_hi = (uint32_t)((BUF_SIZE >> 32) & 0xFFFFFFFFu);
+        int reg_err = ggml_dsp_register_rpcmem(ctx->ggmlop_handle, fd32, size_lo, size_hi);
+        if (reg_err != 0) {
+            GGMLHEXAGON_LOG_ALWAYS("[MULTI-RPCMEM-PROBE] FAIL step=register_rpcmem i=%d err=0x%x (fd=%d)", i, reg_err, fds[i]);
+            goto cleanup;
+        }
+        // Step 5: write test pattern (validates AP-side write to the buffer, and
+        // indirectly that the underlying pages are alive after fastrpc_mmap +
+        // HAP_mmap2 both succeeded).
+        memset(bufs[i], (uint8_t)(0xA0u + (uint8_t)i), BUF_SIZE);
+    }
+
+    GGMLHEXAGON_LOG_ALWAYS("[MULTI-RPCMEM-PROBE] OK: %d x %zu MiB, all 3 APIs (rpcmem_alloc2 + fastrpc_mmap + HAP_mmap2) succeeded",
+                           N_BUFFERS, BUF_SIZE / SIZE_IN_MB);
+
+cleanup:
+    for (int i = 0; i < N_BUFFERS; i++) {
+        if (fds[i] >= 0) {
+            fastrpc_munmap(ctx->domain_id, fds[i], bufs[i], BUF_SIZE);
+        }
+        if (bufs[i]) {
+            rpcmem_free(bufs[i]);
+        }
+    }
+}
+
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
     if (ctx->rpc_mempool) {
         GGMLHEXAGON_LOG_DEBUG("free rpc mempool %p", ctx->rpc_mempool);
@@ -1802,13 +1923,16 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
     if (!ctx->has_hmx && htp_arch >= V73) {
         ctx->has_hmx = true;
     }
+    ctx->has_async_fastrpc  = ggmlhexagon_is_async_fastrpc_supported(ctx->domain_id);
+    ctx->has_extended_map   = ggmlhexagon_is_extended_map_supported(ctx->domain_id);
     GGMLHEXAGON_LOG_DEBUG("dsp arch version %d, vtcm_count %d, vtcm_page %d", htp_arch, vtcm_count, vtcm_page);
     //FIXME: hmx_depth/hmx_spatial report 0 via DSPRPC_GET_DSP_INFO on some devices
     GGMLHEXAGON_LOG_ALWAYS("device %d caps: has_vtcm=%d,has_hvx=%d,has_hmx=%d,hvx_support_128b %d,"
-                            "unsigned pd supported %d, async fastrpc supported %d",
+                            "unsigned pd supported %d, async fastrpc supported %d, extended va map supported %d",
                                 ctx->device, (int)ctx->has_vtcm, (int)ctx->has_hvx, (int)ctx->has_hmx, hvx_support_128b,
                                 ggmlhexagon_is_unsignedpd_supported(ctx->domain_id),
-                                ggmlhexagon_is_async_fastrpc_supported(ctx->domain_id));
+                                (int)ctx->has_async_fastrpc,
+                                (int)ctx->has_extended_map);
     return htp_arch;
 }
 
@@ -2005,6 +2129,13 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
             } else {
                 GGMLHEXAGON_LOG_ALWAYS("[AP-WARMUP] FastRPC/mempool warmup done");
             }
+        }
+
+        // Spike A: validate the multi-rpcmem + HAP_mmap2 chain. Off by default
+        // (production). Enable via cfg [cdsp] probe_multi_rpcmem = 1 to validate
+        // the Tier 2 (per-chunk dynamic rpcmem) path that scatter-gather needs.
+        if (g_hexagon_appcfg.probe_multi_rpcmem) {
+            probe_multi_rpcmem(ctx);
         }
     } else {
         GGMLHEXAGON_LOG_ERROR("error 0x%x: failed to open domain %d(%s)", hexagon_error, domain_id, ggmlhexagon_get_dsp_name(domain_id));

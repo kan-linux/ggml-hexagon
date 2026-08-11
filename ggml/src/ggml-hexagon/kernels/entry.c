@@ -1954,6 +1954,44 @@ AEEResult ggml_dsp_register_ion(remote_handle64 h, uint32_t ion_fd, uint32_t siz
     return AEE_SUCCESS;
 }
 
+// Spike A probe path. Same fd + size contract as register_ion, but for an
+// arbitrary (N-th) rpcmem buffer, not the main mempool. Maps the fd into DSP
+// user VA via HAP_mmap2, logs the result, and intentionally does NOT persist
+// the VA: the goal is to validate that the 3-API chain (rpcmem_alloc2 +
+// fastrpc_mmap + HAP_mmap2) works for buffers beyond the main mempool.
+// The mapped pages stay live until DSP process exit, which is acceptable for
+// a one-shot init probe (5 x 4 MiB = 20 MiB).
+AEEResult ggml_dsp_register_rpcmem(remote_handle64 h, uint32_t rpcmem_fd, uint32_t size_lo, uint32_t size_hi) {
+    g_dsp_ctx = (struct dsp_context *)h;
+    if (!g_dsp_ctx) return AEE_EBADPARM;
+    int32_t fd = (int32_t)rpcmem_fd;
+    uint64_t size = ((uint64_t)size_hi << 32) | (uint64_t)size_lo;
+
+    GGMLHEXAGON_LOG_INFO("[RPCMEM-REG] fd=%d, size=%llu bytes (%dMB)",
+                         fd, (unsigned long long)size, (int32_t)(size >> 20));
+
+    int64_t t0_mmap = ggml_time_us();
+#if __HVX_ARCH__ > 73
+    void * va = HAP_mmap2(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, fd, 0);
+#else
+    void * va = HAP_mmap(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, fd, 0);
+#endif
+    int64_t dt_mmap = ggml_time_us() - t0_mmap;
+
+    if (va == (void *)-1) {
+        GGMLHEXAGON_LOG_ERROR("[RPCMEM-REG] HAP_mmap2 FAILED: returned -1 (fd=%d, size=%llu)", fd, (unsigned long long)size);
+        return AEE_EFAILED;
+    }
+
+    // Probe-only: do NOT persist va (would conflict with main mempool_dsp_base
+    // and is meaningless for a one-shot validation call). The mapping lives
+    // until DSP process exit, releasing the 4 MiB physical pages.
+    FARF(ALWAYS, "[RPCMEM-REG] HAP_mmap2 OK: va=%p (fd=%d, size=%zuMB, time=%lld us)",
+         va, fd, (size_t)size / (1024*1024), (long long)dt_mmap);
+
+    return AEE_SUCCESS;
+}
+
 // Wake/suspend the work_queue + hmx_queue worker threads around a batch,
 // mirroring htp/main.c htp_packet_callback. Without wakeup the workers stay in
 // qurt_futex_wait and (depending on QuRT futex semantics) can miss seqn
