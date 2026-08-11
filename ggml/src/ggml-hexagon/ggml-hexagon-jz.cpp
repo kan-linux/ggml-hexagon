@@ -75,6 +75,7 @@
 #include "ggml-hexagon.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "gguf.h"   // Spike A: gguf_init_from_file for chunked streaming test
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
 #pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
@@ -231,6 +232,13 @@ struct ggml_backend_hexagon_context {
     bool   weights_dirty;                       // set by set_tensor/memset_tensor, cleared by Phase 9
     bool   dsp_need_weight_inval_reset;         // set by free_buffer on model unload, sent to DSP via 0xFFFC before next batch
     std::vector<ion_pool_region> ion_regions;   // region tracking for mempool free-space management
+
+    // Spike A: chunked streaming minimal test state (off by default)
+    bool     enable_chunked_test;                  // cfg-controlled; default false
+    char     test_gguf_path[GGMLHEXAGON_TMPBUF_LEN]; // absolute path to gguf, from cfg
+    size_t   chunked_test_bytes_loaded;            // total bytes copied into mempool
+    int64_t  chunked_test_tensors_loaded;          // number of tensors successfully loaded
+    int64_t  chunked_test_tensors_failed;          // number of tensors that failed
 
     // FastRPC call statistics
     uint64_t rpc_batch_call_count;              // total ggml_dsp_execute_batch calls
@@ -407,6 +415,10 @@ struct hexagon_appcfg_t {
                                 //   dsp_cache_trace_bit0 to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
 
+    // Spike A: chunked streaming minimal test config
+    int        enable_chunked_test;                  // 0=off, 1=run ggmlhexagon_test_chunked_load at init
+    std::string test_gguf_path;                      // absolute path to gguf, e.g. "/data/local/tmp/Qwen3.5-9B-Q4_0.gguf"
+
     const char * cfgfilename;
     const char * runtime_libpath;
     char version[GGMLHEXAGON_TMPBUF_LEN];
@@ -432,6 +444,8 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit0   = 0,
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
+        .enable_chunked_test    = 0,
+        .test_gguf_path         = "",
         .cfgfilename            = "ggml-hexagon.cfg",
 #if defined(__ANDROID__)
         .runtime_libpath        = "/data/local/tmp/",
@@ -626,6 +640,10 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(DSP):              %d", g_hexagon_appcfg.dump_diag_info);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(AP):               %d", g_hexagon_appcfg.dump_debug_info);
     GGMLHEXAGON_LOG_VERBOSE("enable graph_optimize:            %d", g_hexagon_appcfg.enable_graph_optimize);
+    GGMLHEXAGON_LOG_VERBOSE("enable chunked_test:             %d", g_hexagon_appcfg.enable_chunked_test);
+    if (g_hexagon_appcfg.enable_chunked_test) {
+        GGMLHEXAGON_LOG_VERBOSE("chunked_test gguf path:          %s", g_hexagon_appcfg.test_gguf_path.c_str());
+    }
     if (NULL != ctx) {
         GGMLHEXAGON_LOG_VERBOSE("ggml-dsp use hmx:                 %d", ctx->has_hmx);
     }
@@ -957,6 +975,10 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_types", g_hexagon_appcfg.enabled_types, "");
+
+    // Spike A: chunked streaming minimal test config
+    hexagoncfg_instance.get_intvalue("cdsp", "enable_chunked_test", g_hexagon_appcfg.enable_chunked_test, 0);
+    hexagoncfg_instance.get_stringvalue("cdsp", "test_gguf_path", g_hexagon_appcfg.test_gguf_path, "");
 
     memcpy(g_hexagon_appcfg.version, version.c_str(), strlen(version.c_str()));
 
@@ -1790,6 +1812,132 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
     return 0;
 }
 
+// Spike A: chunked streaming minimal test.
+// Sequential gguf -> mempool copy. No layer grouping, no producer, no eviction.
+// Verifies that gguf read + mempool region alloc work end-to-end on a real gguf.
+static int ggmlhexagon_test_chunked_load(ggml_backend_hexagon_context * ctx) {
+    // Cache std::string into ctx->test_gguf_path (char[]) for use in access/fopen
+    snprintf(ctx->test_gguf_path, sizeof(ctx->test_gguf_path), "%s", g_hexagon_appcfg.test_gguf_path.c_str());
+    if (ctx->test_gguf_path[0] == '\0') {
+        GGMLHEXAGON_LOG_ERROR("[CHUNKED-TEST] test_gguf_path is empty");
+        return -1;
+    }
+    if (access(ctx->test_gguf_path, F_OK) != 0) {
+        GGMLHEXAGON_LOG_ERROR("[CHUNKED-TEST] gguf not found: %s", ctx->test_gguf_path);
+        return -2;
+    }
+
+    GGMLHEXAGON_LOG_ALWAYS("[CHUNKED-TEST] start: gguf=%s mempool=%zu MB usage=%zu MB",
+                          ctx->test_gguf_path,
+                          ctx->rpc_mempool_len / SIZE_IN_MB,
+                          ctx->rpc_mempool_usage / SIZE_IN_MB);
+
+    // Save mempool_usage so this probe does not poison the inference path.
+    // After this function returns, alloc_buffer will resume from the original
+    // offset. The bytes we wrote are now logically free (and will be reallocated
+    // or overwritten by the real model load / runtime mirrors), but they remain
+    // physically mapped. We zero them on return to avoid stale-weight reads
+    // if the real model load skips this region.
+    const size_t saved_mempool_usage = ctx->rpc_mempool_usage;
+
+    // Open gguf metadata only (no tensor data allocation)
+    // Suppress designated-initializer warning; gguf_init_params uses them.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wc++20-designator"
+#endif
+    struct gguf_init_params params = { .no_alloc = true, .ctx = nullptr };
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+    struct gguf_context * gf = gguf_init_from_file(ctx->test_gguf_path, params);
+    if (!gf) {
+        GGMLHEXAGON_LOG_ERROR("[CHUNKED-TEST] gguf_init_from_file failed");
+        return -3;
+    }
+
+    int64_t n_tensors = gguf_get_n_tensors(gf);
+    size_t  data_off  = gguf_get_data_offset(gf);
+    GGMLHEXAGON_LOG_ALWAYS("[CHUNKED-TEST] %lld tensors, data_offset=%zu",
+                          (long long)n_tensors, data_off);
+
+    FILE * f = fopen(ctx->test_gguf_path, "rb");
+    if (!f) {
+        GGMLHEXAGON_LOG_ERROR("[CHUNKED-TEST] fopen failed: %s", ctx->test_gguf_path);
+        gguf_free(gf);
+        return -4;
+    }
+
+    // Reserve head 8 MiB for runtime (matches alloc layout)
+    size_t head_reserve = 8 * SIZE_IN_MB;
+    size_t data_limit   = ctx->rpc_mempool_len - head_reserve;
+
+    int64_t tensors_loaded = 0;
+    int64_t tensors_failed = 0;
+    size_t  bytes_loaded   = 0;
+    int64_t tensors_skipped = 0;
+
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gf, i);
+        size_t       off  = gguf_get_tensor_offset(gf, i);
+        size_t       sz   = gguf_get_tensor_size(gf, i);
+
+        // 128-byte aligned bump alloc (mirrors existing logic in alloc_buffer)
+        size_t aligned_offset = ((ctx->rpc_mempool_usage + 127) / 128) * 128;
+        if (aligned_offset + sz > data_limit) {
+            GGMLHEXAGON_LOG_WARN("[CHUNKED-TEST] mempool full at tensor %lld/%lld (%s, %zu bytes), stop",
+                                (long long)i, (long long)n_tensors, name, sz);
+            tensors_skipped = n_tensors - i;
+            break;
+        }
+
+        if (fseek(f, (long)(data_off + off), SEEK_SET) != 0) {
+            GGMLHEXAGON_LOG_WARN("[CHUNKED-TEST] fseek failed: %s", name);
+            tensors_failed++;
+            continue;
+        }
+        void * dst = (char *)ctx->rpc_mempool + aligned_offset;
+        if (fread(dst, 1, sz, f) != sz) {
+            GGMLHEXAGON_LOG_WARN("[CHUNKED-TEST] fread failed: %s", name);
+            tensors_failed++;
+            continue;
+        }
+
+        ctx->rpc_mempool_usage = aligned_offset + sz;
+        bytes_loaded          += sz;
+        tensors_loaded++;
+
+        if (tensors_loaded % 50 == 0) {
+            GGMLHEXAGON_LOG_VERBOSE("[CHUNKED-TEST] progress: %lld tensors, %zu MB",
+                                   (long long)tensors_loaded, bytes_loaded / SIZE_IN_MB);
+        }
+    }
+
+    fclose(f);
+    gguf_free(gf);
+
+    ctx->chunked_test_tensors_loaded = tensors_loaded;
+    ctx->chunked_test_tensors_failed = tensors_failed;
+    ctx->chunked_test_bytes_loaded   = bytes_loaded;
+    GGMLHEXAGON_LOG_ALWAYS("[CHUNKED-TEST] done: loaded=%lld failed=%lld skipped=%lld bytes=%zu pool_usage=%zu MB",
+                          (long long)tensors_loaded, (long long)tensors_failed,
+                          (long long)tensors_skipped, bytes_loaded,
+                          ctx->rpc_mempool_usage / SIZE_IN_MB);
+
+    // Restore mempool_usage so inference path is not poisoned by this probe.
+    // Zero the bytes we wrote in the [saved_mempool_usage, rpc_mempool_usage)
+    // range so a future alloc that lands here does not read stale probe data
+    // (the region is logically free, but physically mapped).
+    if (ctx->rpc_mempool && ctx->rpc_mempool_usage > saved_mempool_usage) {
+        memset((char *)ctx->rpc_mempool + saved_mempool_usage, 0,
+               ctx->rpc_mempool_usage - saved_mempool_usage);
+    }
+    ctx->rpc_mempool_usage = saved_mempool_usage;
+    GGMLHEXAGON_LOG_ALWAYS("[CHUNKED-TEST] restored mempool_usage=%zu MB",
+                          ctx->rpc_mempool_usage / SIZE_IN_MB);
+    return 0;
+}
+
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
     if (ctx->rpc_mempool) {
         GGMLHEXAGON_LOG_DEBUG("free rpc mempool %p", ctx->rpc_mempool);
@@ -2010,6 +2158,19 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
         if (0 != ggmlhexagon_init_rpcmempool(ctx)) {
             GGMLHEXAGON_LOG_ERROR("failed to init rpc mempool");
             goto bail;
+        }
+        // Spike A: chunked streaming minimal test, runs after mempool is ready
+        if (g_hexagon_appcfg.enable_chunked_test) {
+            int rc = ggmlhexagon_test_chunked_load(ctx);
+            if (rc != 0) {
+                GGMLHEXAGON_LOG_ERROR("[CHUNKED-TEST] failed rc=%d", rc);
+            } else {
+                GGMLHEXAGON_LOG_ALWAYS("[CHUNKED-TEST] %lld tensors loaded, %lld failed, %zu bytes, pool_usage=%zu MB",
+                                      (long long)ctx->chunked_test_tensors_loaded,
+                                      (long long)ctx->chunked_test_tensors_failed,
+                                      ctx->chunked_test_bytes_loaded,
+                                      ctx->rpc_mempool_usage / SIZE_IN_MB);
+            }
         }
         // Push DSP-side cache optimization bitmask via execute_batch(0xFFFC)
         // special mode (no IDL change). batch_offset = packed payload, batch_size = mode tag.
@@ -3076,6 +3237,11 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
       rpc_mempool_dsp_base(nullptr),
       weights_dirty(false),
       dsp_need_weight_inval_reset(false),
+      enable_chunked_test(false),
+      test_gguf_path{0},
+      chunked_test_bytes_loaded(0),
+      chunked_test_tensors_loaded(0),
+      chunked_test_tensors_failed(0),
       rpc_batch_call_count(0),
       cumulative_graph_us(0),
       last_graph_end_us(0),
