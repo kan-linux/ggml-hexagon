@@ -100,6 +100,7 @@ if (GGML_HEXAGON_JZ)
 
     ggml_add_backend_library(${TARGET_NAME}
         ggml-hexagon-jz.cpp
+        ggmlhexagon_chunked.cpp
         htp-drv.cpp
         htp-drv.h
         libdl.h

@@ -76,6 +76,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "gguf.h"   // Spike A: gguf_init_from_file for chunked streaming test
+#include "ggmlhexagon_chunked.h"   // Spike B: chunked streaming producer-consumer module
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
 #pragma clang diagnostic ignored "-Wgnu-anonymous-struct"
@@ -240,6 +241,10 @@ struct ggml_backend_hexagon_context {
     int64_t  chunked_test_tensors_loaded;          // number of tensors successfully loaded
     int64_t  chunked_test_tensors_failed;          // number of tensors that failed
 
+    // Spike B: chunked streaming producer-consumer state (off by default)
+    struct hexagon_chunked_state * chunked_state;  // opaque pointer, see ggmlhexagon_chunked.c
+    bool     enable_chunked_streaming;             // cfg-controlled; default false
+
     // FastRPC call statistics
     uint64_t rpc_batch_call_count;              // total ggml_dsp_execute_batch calls
     int64_t  cumulative_graph_us;               // cumulative graph inference duration
@@ -380,6 +385,25 @@ struct ggml_backend_hexagon_context {
     ~ggml_backend_hexagon_context();
 };
 
+// Chunked streaming mempool info helper. Implemented here (in the
+// translation unit that owns the JZ context struct) so the chunked
+// module can pull the rpc_mempool base + length without depending on
+// the internal struct layout. Replaces the jz_ctx_min struct-mirror
+// hack. The chunked module's lazy_bind_mempool calls this on first
+// acquire; safe to call before ggmlhexagon_chunked_init has run (in
+// which case *out_base is left at NULL and the chunked module treats
+// the mempool as unavailable).
+void ggmlhexagon_jz_get_mempool_info(void * jz_ctx, void ** out_base, size_t * out_len) {
+    if (out_base != nullptr) *out_base = nullptr;
+    if (out_len  != nullptr) *out_len  = 0;
+    if (jz_ctx == nullptr) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(jz_ctx);
+    if (out_base != nullptr) *out_base = ctx->rpc_mempool;
+    if (out_len  != nullptr) *out_len  = ctx->rpc_mempool_len;
+}
+
 struct hexagon_appcfg_t {
     int dump_debug_info;        // enable/disable dump debug info for troubleshooting issues on AP side
     int thread_counts;          // thread_counts on CDSP side
@@ -419,6 +443,15 @@ struct hexagon_appcfg_t {
     int        enable_chunked_test;                  // 0=off, 1=run ggmlhexagon_test_chunked_load at init
     std::string test_gguf_path;                      // absolute path to gguf, e.g. "/data/local/tmp/Qwen3.5-9B-Q4_0.gguf"
 
+    // Spike B: chunked streaming producer-consumer config
+    int        enable_chunked_streaming;             // 0=off, 1=enable producer-consumer chunked streaming
+    std::string chunked_gguf_path;                  // absolute path to gguf, e.g. "/data/local/tmp/Qwen3.5-9B-Q4_0.gguf"
+    int        chunked_window_mb;                    // sliding window size in MB, default 3072 (3 GiB)
+    int        chunked_slot_mb;                      // single slot size in MB, default 256
+    int        chunked_max_layers;                   // max layers in gguf (preflight hint), default 64
+    int        chunked_permanent_mb;                 // permanent region size in MB (embedding/lm-head/rope), default 300
+    int        chunked_kv_cache_mb;                  // KV cache region size in MB, default 200
+
     const char * cfgfilename;
     const char * runtime_libpath;
     char version[GGMLHEXAGON_TMPBUF_LEN];
@@ -446,6 +479,13 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .enable_graph_optimize  = 1,
         .enable_chunked_test    = 0,
         .test_gguf_path         = "",
+        .enable_chunked_streaming = 0,
+        .chunked_gguf_path      = "",
+        .chunked_window_mb      = 3072,
+        .chunked_slot_mb        = 256,
+        .chunked_max_layers     = 64,
+        .chunked_permanent_mb   = 300,
+        .chunked_kv_cache_mb    = 200,
         .cfgfilename            = "ggml-hexagon.cfg",
 #if defined(__ANDROID__)
         .runtime_libpath        = "/data/local/tmp/",
@@ -643,6 +683,12 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     GGMLHEXAGON_LOG_VERBOSE("enable chunked_test:             %d", g_hexagon_appcfg.enable_chunked_test);
     if (g_hexagon_appcfg.enable_chunked_test) {
         GGMLHEXAGON_LOG_VERBOSE("chunked_test gguf path:          %s", g_hexagon_appcfg.test_gguf_path.c_str());
+    }
+    GGMLHEXAGON_LOG_VERBOSE("enable chunked_streaming:        %d", g_hexagon_appcfg.enable_chunked_streaming);
+    if (g_hexagon_appcfg.enable_chunked_streaming) {
+        GGMLHEXAGON_LOG_VERBOSE("chunked gguf path:               %s", g_hexagon_appcfg.chunked_gguf_path.c_str());
+        GGMLHEXAGON_LOG_VERBOSE("chunked window/slot:             %d MB / %d MB", g_hexagon_appcfg.chunked_window_mb, g_hexagon_appcfg.chunked_slot_mb);
+        GGMLHEXAGON_LOG_VERBOSE("chunked permanent/kv_cache:      %d MB / %d MB", g_hexagon_appcfg.chunked_permanent_mb, g_hexagon_appcfg.chunked_kv_cache_mb);
     }
     if (NULL != ctx) {
         GGMLHEXAGON_LOG_VERBOSE("ggml-dsp use hmx:                 %d", ctx->has_hmx);
@@ -979,6 +1025,15 @@ static void ggmlhexagon_load_cfg() {
     // Spike A: chunked streaming minimal test config
     hexagoncfg_instance.get_intvalue("cdsp", "enable_chunked_test", g_hexagon_appcfg.enable_chunked_test, 0);
     hexagoncfg_instance.get_stringvalue("cdsp", "test_gguf_path", g_hexagon_appcfg.test_gguf_path, "");
+
+    // Spike B: chunked streaming producer-consumer config
+    hexagoncfg_instance.get_intvalue("cdsp", "enable_chunked_streaming", g_hexagon_appcfg.enable_chunked_streaming, 0);
+    hexagoncfg_instance.get_stringvalue("cdsp", "chunked_gguf_path", g_hexagon_appcfg.chunked_gguf_path, "");
+    hexagoncfg_instance.get_intvalue("cdsp", "chunked_window_mb", g_hexagon_appcfg.chunked_window_mb, 3072);
+    hexagoncfg_instance.get_intvalue("cdsp", "chunked_slot_mb", g_hexagon_appcfg.chunked_slot_mb, 256);
+    hexagoncfg_instance.get_intvalue("cdsp", "chunked_max_layers", g_hexagon_appcfg.chunked_max_layers, 64);
+    hexagoncfg_instance.get_intvalue("cdsp", "chunked_permanent_mb", g_hexagon_appcfg.chunked_permanent_mb, 300);
+    hexagoncfg_instance.get_intvalue("cdsp", "chunked_kv_cache_mb", g_hexagon_appcfg.chunked_kv_cache_mb, 200);
 
     memcpy(g_hexagon_appcfg.version, version.c_str(), strlen(version.c_str()));
 
@@ -2017,6 +2072,11 @@ static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
         ctx->ggmlop_handle = 0;
     }
     ggmlhexagon_deinit_rpcmempool(ctx);
+    // Spike B: tear down the chunked streaming state after the mempool is
+    // gone so the producer thread (B-2) cannot race a freed mempool.
+    if (ctx->chunked_state != nullptr) {
+        ggmlhexagon_chunked_deinit(&ctx->chunked_state);
+    }
     //probe before domain_id is invalidated so AP-side domain queries still work
     if (ctx->domain_id >= 0) {
         ggmlhexagon_probe_dspinfo(ctx);
@@ -2170,6 +2230,36 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
                                       (long long)ctx->chunked_test_tensors_failed,
                                       ctx->chunked_test_bytes_loaded,
                                       ctx->rpc_mempool_usage / SIZE_IN_MB);
+            }
+        }
+        // Spike B: chunked streaming producer-consumer init. Only runs when
+        // enable_chunked_streaming=1; otherwise chunked_state stays NULL and
+        // the graph_compute_batch hook becomes a no-op. init validates the
+        // cfg, allocates the state struct, and computes the slot layout; the
+        // actual mempool integration + producer thread + gguf I/O are added
+        // in later spikes.
+        if (g_hexagon_appcfg.enable_chunked_streaming) {
+            if (ctx->chunked_state != nullptr) {
+                GGMLHEXAGON_LOG_WARN("chunked_state already initialized, skipping re-init");
+            } else {
+                // Snapshot cfg fields into a stack-local struct so the chunked
+                // module does not need to know about g_hexagon_appcfg (which
+                // is static in this translation unit and not extern-visible).
+                struct hexagon_chunked_config chunked_cfg;
+                chunked_cfg.gguf_path     = g_hexagon_appcfg.chunked_gguf_path.c_str();
+                chunked_cfg.window_mb     = g_hexagon_appcfg.chunked_window_mb;
+                chunked_cfg.slot_mb       = g_hexagon_appcfg.chunked_slot_mb;
+                chunked_cfg.max_layers    = g_hexagon_appcfg.chunked_max_layers;
+                chunked_cfg.permanent_mb  = g_hexagon_appcfg.chunked_permanent_mb;
+                chunked_cfg.kv_cache_mb   = g_hexagon_appcfg.chunked_kv_cache_mb;
+
+                int rc = ggmlhexagon_chunked_init(&ctx->chunked_state, &chunked_cfg);
+                if (rc != 0) {
+                    GGMLHEXAGON_LOG_ERROR("[CHUNKED] init failed rc=%d, chunked streaming disabled", rc);
+                    ctx->enable_chunked_streaming = false;
+                } else {
+                    GGMLHEXAGON_LOG_ALWAYS("[CHUNKED] init OK: see [CHUNKED, init] log above for slot layout");
+                }
             }
         }
         // Push DSP-side cache optimization bitmask via execute_batch(0xFFFC)
@@ -4106,8 +4196,27 @@ static void * ggml_backend_hexagon_buffer_get_base(ggml_backend_buffer_t buffer)
 
 static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_hexagon_buffer_context * ctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
-    GGML_UNUSED(tensor);
     GGML_UNUSED(ctx);
+    // Chunked streaming: for layer tensors (blk.N.*), the buffer was
+    // allocated with get_base=NULL (a "no-mempool" placeholder). The
+    // ggml-alloc layer set tensor->data to a wild pointer derived from
+    // the NULL base. We override it to NULL here so the rest of the
+    // pipeline (cgraph build, set_tensor guard, our acquire remap)
+    // sees a deterministic value. Permanent tensors keep whatever
+    // ggml-alloc set (their buffers are real mempool-backed).
+    //
+    // Gated on enable_chunked_streaming: when streaming is off the
+    // alloc_buffer path returns a real mempool-backed buffer and
+    // ggml-alloc already wrote valid data, so overwriting to NULL
+    // would corrupt the model load.
+    if (ctx->backend_ctx != nullptr && ctx->backend_ctx->enable_chunked_streaming &&
+        tensor != nullptr && tensor->name[0] != '\0') {
+        extern int ggmlhexagon_chunked_classify_tensor(const char * name);
+        int cls = ggmlhexagon_chunked_classify_tensor(tensor->name);
+        if (cls == 0) {
+            tensor->data = nullptr;
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -4893,6 +5002,32 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             }
         }
     }
+    // Chunked streaming: for layer tensors (blk.N.*), the chunked
+    // module skips bump-alloc and will load bytes from the gguf on
+    // demand into a slot at compute time. The data we would copy here
+    // would either overflow the mempool (9B is 5.1 GiB > 4 GiB cap) or
+    // be wasted (later overwritten by the producer). Skip the memcpy
+    // and the repack path entirely; tensor->data is already NULL from
+    // init_tensor so no wild deref happens.
+    //
+    // Gated on enable_chunked_streaming: when streaming is off the
+    // set_tensor path is the only way the model gets its weights into
+    // mempool, and skipping it would leave every layer tensor with
+    // data=NULL (model load would fail with EFAULT).
+    {
+        ggml_backend_hexagon_buffer_context * bctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
+        if (bctx != nullptr && bctx->backend_ctx != nullptr && bctx->backend_ctx->enable_chunked_streaming) {
+            extern int ggmlhexagon_chunked_classify_tensor(const char * name);
+            int cls = ggmlhexagon_chunked_classify_tensor(tensor->name);
+            if (cls == 0) {
+                // Defensive: nothing to do, but the ggml-alloc layer may
+                // have set data to a non-NULL value; keep it consistent
+                // with init_tensor.
+                tensor->data = nullptr;
+                return;
+            }
+        }
+    }
     if (is_repack) {
         switch (tensor->type) {
             case GGML_TYPE_Q4_0:
@@ -5117,6 +5252,23 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
     buffer_ctx->backend_ctx = ctx;
     buffer_ctx->is_ion_buffer = true;
 
+    // Chunked streaming fast path. When the chunked module is enabled,
+    // we cannot bump-alloc layer tensors into mempool because 9B-class
+    // models (5.1 GiB) overflow the 4 GiB cap. Instead we return a
+    // "no-mempool" placeholder buffer: get_base = NULL, get_size =
+    // SIZE_MAX. The ggml-alloc layer will set tensor->data = NULL +
+    // offset (a wild pointer) which init_tensor then overwrites to
+    // NULL; set_tensor skips the memcpy for layer tensors. At compute
+    // time the chunked module's acquire remaps data to the slot
+    // region; release restores NULL.
+    if (ctx->chunked_state != nullptr) {
+        buffer_ctx->buffer      = nullptr;
+        buffer_ctx->buffer_size = SIZE_MAX;  // pass ggml-alloc's bounds check
+        buffer_ctx->is_ion_buffer = false;
+        // Skip the entire mempool bump-alloc / region-tracking path.
+        // Fall through to the iface wiring at the bottom of the
+        // function.
+    } else {
     size_t size_page = 4096;  // default page size if sysconf is unavailable
 #if defined(__ANDROID__) || defined(__linux__)
     long ps = sysconf(_SC_PAGESIZE);
@@ -5210,8 +5362,26 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
             buffer_ctx->is_ion_buffer = false;
         }
     }
+    }  // close chunked_state==nullptr else branch
 
-    if (nullptr == buffer_ctx->buffer) {
+    // Chunked streaming: buffer_ctx->buffer is intentionally NULL here
+    // (a "no-mempool" placeholder). Skip the null-check failure below
+    // because we WANT to return a buffer whose get_base is NULL; the
+    // ggml-alloc layer's offset counter advances without touching
+    // mempool, and init_tensor overwrites the resulting wild data
+    // pointer to NULL. The standard "allocation failed" branch would
+    // delete the buffer and return nullptr, which breaks the model
+    // load for any tensor that does not fit in mempool (e.g. 9B).
+    if (buffer_ctx->buffer == nullptr && buffer_ctx->buffer_size == SIZE_MAX) {
+        // Chunked mode, no mempool consumption. Log once per N calls
+        // to keep logcat quiet on 9B.
+        static uint64_t chunked_alloc_log_count = 0;
+        if (chunked_alloc_log_count < 10) {
+            GGMLHEXAGON_LOG_ALWAYS("[ALLOC] device=%d chunked no-mempool buffer size=%zu (%.2f MiB)",
+                                   ctx->device, size, (double)size / (1024.0 * 1024.0));
+            chunked_alloc_log_count++;
+        }
+    } else if (nullptr == buffer_ctx->buffer) {
         GGMLHEXAGON_LOG_ERROR("%s: failed to allocate %d MiB\n", __func__, size / SIZE_IN_MB);
         delete buffer_ctx;
         return nullptr;
@@ -5429,6 +5599,20 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
     t_start = ggml_time_us();
 
+    // Spike B: chunked streaming hook. Acquire slots for every layer
+    // referenced by this cgraph; the producer thread will fill them in
+    // parallel. Placed BEFORE the cgraph cache lookup so producer
+    // prefetch starts as early as possible; on cache hit the same wait
+    // still runs (the wait cost is bounded by the producer ahead-of-time,
+    // not by the cached descriptor size). The handle is released at the
+    // very end of this function regardless of cache hit / miss / error
+    // (so slots are returned to the LRU pool even when an early bail
+    // path triggers).
+    int chunked_handle = 0;
+    if (ctx->chunked_state != nullptr) {
+        chunked_handle = ggmlhexagon_chunked_acquire_for_cgraph(ctx->chunked_state, ctx, cgraph);
+    }
+
     // ---- Phase 1: collect unique tensor objects + cgraph cache lookup ----
     // Hash over each node's {op, ne[4], nb[4], non-null src[0..GGML_MAX_SRC-1] ptr, data ptr}.
     // The src slot index is folded into the value so that NULL slots do not
@@ -5460,15 +5644,27 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
     const uint64_t content_hash = compute_content_hash();
     {
-        auto it = ctx->cgraph_cache.find(content_hash);
-        if (it != ctx->cgraph_cache.end() &&
-            it->second.n_nodes == cgraph->n_nodes &&
-            it->second.hex_ops.size() > 0) {
-            cached_entry = &it->second;
-            cache_hit = true;
-            ctx->cgraph_cache_hits++;
-        } else {
+        // Chunked streaming: disable the cgraph cache. The cache key
+        // includes tensor->data pointers which the chunked module
+        // remaps to the slot region on every acquire, so a cache hit
+        // would replay stale (pre-remap) op descriptors against the
+        // new pointers. Skipping the cache forces the cgraph to be
+        // re-walked each batch; the producer prefetch hides most of
+        // the cost on TG-heavy workloads.
+        if (ctx->chunked_state != nullptr) {
+            cache_hit = false;
             ctx->cgraph_cache_misses++;
+        } else {
+            auto it = ctx->cgraph_cache.find(content_hash);
+            if (it != ctx->cgraph_cache.end() &&
+                it->second.n_nodes == cgraph->n_nodes &&
+                it->second.hex_ops.size() > 0) {
+                cached_entry = &it->second;
+                cache_hit = true;
+                ctx->cgraph_cache_hits++;
+            } else {
+                ctx->cgraph_cache_misses++;
+            }
         }
     }
 
@@ -6594,6 +6790,15 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                           (long long)ctx->cum_p10_us, (long long)ctx->cumulative_graph_us,
                           ctx->rpc_batch_call_count ? (long long)(ctx->cum_p10_us / (int64_t)ctx->rpc_batch_call_count) : 0,
                           ctx->rpc_batch_call_count ? (long long)(ctx->cumulative_graph_us / (int64_t)ctx->rpc_batch_call_count) : 0);
+
+    // Release the chunked streaming slots held by this batch. Runs after
+    // all stats so an early bail above still reaches this point (we
+    // re-acquire on the next call). handle=0 is a no-op so this is safe
+    // when chunked streaming is disabled or this batch had no layer
+    // tensors.
+    if (chunked_handle > 0) {
+        ggmlhexagon_chunked_release(chunked_handle);
+    }
 
     return result;
 }

@@ -174,6 +174,114 @@ slot 大小 = ceil(max_layer_size / page_size) * page_size。N = sliding_window_
 
 **关键约束**: 窗口 slot 数 >= 当前 batch 需要的最大层跨度 (典型为 1-3, 因为 attention/KV cache 需要跨层访问)。13 个 slot 对 9B 模型足够。
 
+### 2.6 集成点设计
+
+本节回答 spike B 实现前必须明确的三个关键集成点问题: chunk 检查的 hook 位置、layer 索引推断、mempool 分区布局。
+
+#### 2.6.1 chunk 检查的 hook 位置
+
+**采用方案 B**: 在 [`ggmlhexagon_backend_graph_compute_batch`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5375) 开头按 batch 粒度等待目标 layer 就绪。
+
+理由:
+- cgraph 节点已经按 op 依赖排序, batch 内所有 source tensor 一次性可见
+- producer 一次预取当前 batch 跨度的所有 layer 权重, 减少 round-trip
+- hook 位置单一, 不污染 `ggml_backend_hexagon_buffer_type_alloc_buffer` (line 5111) 的现有 bump-alloc 逻辑
+- 配合现有 cgraph cache 机制 ([`ggmlhexagon_backend_graph_compute_batch`](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L5375) 内的 cgraph_cache_entry 查找), 已 cached 的 batch 跳过等待
+
+具体 hook 位置 (在 cgraph 命中 cache 之前):
+```cpp
+static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    auto * ctx = (ggml_backend_hexagon_context *)backend->context;
+    // chunked streaming hook: ensure target layers are loaded before compute
+    if (g_hexagon_appcfg.enable_chunked_streaming) {
+        ggmlhexagon_chunked_ensure_layers_for_cgraph(ctx, cgraph);
+    }
+    // ... existing cgraph cache lookup ...
+}
+```
+
+**不采用** 选项 A (alloc_buffer 粒度):
+- tensor name 解析需在 alloc 时完成, 但 alloc 阶段 tensor 可能尚未 link 到 layer
+- alloc_buffer 是 GGML core 调用的热路径, 任何卡顿会拖慢所有 alloc
+
+**不采用** 选项 C (两层 hook): 复杂度高, 调试困难, 收益不明确。
+
+#### 2.6.2 layer 索引推断
+
+`ggml_cgraph` 遍历 `cgraph->nodes[i]`, 每个 node 是 op tensor `ggml_tensor`, 通过 `node->src[0..2]` 拿到 source tensor, 从 `source_tensor->name` 解析 `blk.N.` 前缀:
+
+```cpp
+// 解析 "blk.31.attn_q.weight" -> 31
+// 返回 -1 表示非 layer tensor (永久区)
+static int parse_layer_index(const char * name) {
+    static const char PREFIX[] = "blk.";
+    if (strncmp(name, PREFIX, 4) != 0) return -1;
+    int n = 0;
+    for (const char * p = name + 4; isdigit((unsigned char)*p); p++) {
+        n = n * 10 + (*p - '0');
+    }
+    return n;
+}
+```
+
+需要识别**非 layer tensor** (永久区, 不参与 chunking):
+- `token_embd.weight` — embedding
+- `output.weight` / `output_norm.weight` — lm-head + output norm
+- `rope_freqs.weight` — RoPE 频率表
+- 其他模型特定的 norm / projection tensor
+
+非 layer tensor 在 `ggmlhexagon_chunked_ensure_layers_for_cgraph` 中**跳过** (无需预加载, 已驻留永久区)。
+
+#### 2.6.3 mempool 分区布局
+
+```
++----------------------------------+  4 GiB (4024 MB 数据区)
+| permanent region (固定)            |  ~300 MB
+|   token_embd, output, output_norm |
+|   rope_freqs, 其他固定 tensor      |
++----------------------------------+
+| KV cache region (动态)             |  ~200 MB (随 ctx 长度增长)
+|   per-seq K/V cache                |
++----------------------------------+
+| sliding window (layer 权重)        |  ~3.5 GiB
+|   13 slots × 256 MiB              |
+|   LRU 淘汰最旧 slot                |
++----------------------------------+
+```
+
+各 region 容量估算 (Qwen3.5-9B):
+
+| region | 大小估算 | 来源 |
+|--------|----------|------|
+| permanent | ~300 MB | embedding (152K vocab × 256 dim × 2B FP16 = 76 MB) + lm-head (同 embedding) + norm + rope (~5 MB) |
+| KV cache | ~200 MB (max ctx 4K) | 35 layers × 2 (K+V) × 4K ctx × 16 heads × 128 dim × 2B FP16 |
+| sliding window | ~3.5 GiB | 4024 - 300 - 200 = 3524 MB 可用; 13 slots × 256 MiB = 3328 MB (留 196 MB 余量) |
+| 9B 全部权重 | ~5.1 GiB | 35 layers × 130 MB + embedding + lm-head = 4760 MB, **超出** 3.5 GiB window |
+
+**关键结论**: 9B 模型 35 个 layer 中, sliding window 只能同时容纳约 13 个 layer (~3.3 GiB), 必须按 LRU 淘汰。这与 scatter-gather ruled out 后唯一可行的 4 GiB mempool 路径一致。
+
+#### 2.6.4 permanent region 初始化时机
+
+permanent region 在 `ggmlhexagon_init_rpcmempool` ([jz.cpp:1709](file:///home/zhouwg/develop/ggml-hexagon/ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp#L1709)) 末尾初始化:
+
+```cpp
+// 1. 预分配 permanent region offset (类似 spike A 的 head_reserve 8 MB 机制, 扩展为 300 MB)
+ctx->permanent_region_offset = ctx->rpc_mempool_usage;       // 通常 0
+ctx->permanent_region_size   = 300 * SIZE_IN_MB;
+ctx->rpc_mempool_usage      += ctx->permanent_region_size;
+
+// 2. 预分配 KV cache region
+ctx->kv_cache_region_offset  = ctx->rpc_mempool_usage;
+ctx->kv_cache_region_size    = 200 * SIZE_IN_MB;
+ctx->rpc_mempool_usage      += ctx->kv_cache_region_size;
+
+// 3. sliding window 起始 offset
+ctx->chunked_window_offset   = ctx->rpc_mempool_usage;
+ctx->chunked_window_size     = ctx->rpc_mempool_len - ctx->rpc_mempool_usage;
+```
+
+permanent region 在 init 阶段**预加载** (spike A 已验证 alloc 能力), KV cache region 由推理路径动态分配, sliding window 由 producer 调度。
+
 ## 三、Spike 计划
 
 ### 3.1 Spike A: 同步基线 (单线程) — ✅ 已完成
