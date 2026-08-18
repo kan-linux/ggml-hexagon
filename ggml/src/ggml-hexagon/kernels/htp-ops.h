@@ -99,6 +99,7 @@ enum htp_op_code {
     HTP_OP_CONCAT,
     HTP_OP_CLAMP,
     HTP_OP_IM2COL,
+    HTP_OP_MUL_MUL,          // fused MUL(MUL(x, w1), w2) -> x * w1 * w2
 
     HTP_OP_INVALID
 };

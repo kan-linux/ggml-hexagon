@@ -857,6 +857,104 @@ static int execute_op_binary(struct htp_ops_context * octx) {
 
 int op_binary(struct htp_ops_context * octx) {
 
+    // Special case: MUL_MUL fused op (3 src inputs)
+    if (octx->op == HTP_OP_MUL_MUL) {
+        // For now, only support scalar * scalar * vector case
+        // src[0] = x, src[1] = w1 (scalar), src[2] = w2 (scalar)
+        // dst = x * w1 * w2
+        const struct htp_tensor * src2 = octx->src[2];
+        if (!src2) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+
+        // Check that w1 and w2 are scalars (ne[0] == 1)
+        const struct htp_tensor * src1 = octx->src[1];
+        if (src1->ne[0] != 1 || src2->ne[0] != 1) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+
+        // Get scalar values
+        const uint32_t src1_type = src1->type;
+        const uint32_t src2_type = src2->type;
+
+        float w1_val, w2_val;
+        if (src1_type == HTP_TYPE_F32) {
+            w1_val = *(float *)src1->data;
+        } else if (src1_type == HTP_TYPE_F16) {
+            _Float16 v1 = *(_Float16 *)src1->data;
+            w1_val = (float)v1;
+        } else {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+
+        if (src2_type == HTP_TYPE_F32) {
+            w2_val = *(float *)src2->data;
+        } else if (src2_type == HTP_TYPE_F16) {
+            _Float16 v2 = *(_Float16 *)src2->data;
+            w2_val = (float)v2;
+        } else {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+
+        // Combine w1 * w2 into a single scalar
+        float combined_w = w1_val * w2_val;
+
+        // Create a modified context with combined weight
+        // We reuse the existing op_binary mechanism by temporarily modifying src[1]
+        // For simplicity, we'll handle this inline
+
+        const struct htp_tensor * src0 = octx->src[0];
+        const struct htp_tensor * dst  = octx->dst;
+
+        const uint32_t src0_type = src0->type;
+        const uint32_t dst_type  = dst->type;
+
+        if ((src0_type != HTP_TYPE_F32 && src0_type != HTP_TYPE_F16) ||
+            (dst_type != HTP_TYPE_F32 && dst_type != HTP_TYPE_F16)) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+
+        const uint32_t n_elements = src0->ne[0] * src0->ne[1] * src0->ne[2] * src0->ne[3];
+        const uint32_t elem_size = (src0_type == HTP_TYPE_F32) ? sizeof(float) : sizeof(_Float16);
+
+        // Use VTCM for double-buffering
+        const uint32_t vtcm_size = octx->ctx->vtcm_size;
+        const uint32_t row_size = src0->ne[0] * elem_size;
+        const uint32_t row_size_aligned = hex_round_up(row_size, VLEN);
+
+        uint32_t rows_per_buffer = vtcm_size / (2 * row_size_aligned);
+        if (rows_per_buffer < 1) {
+            rows_per_buffer = 1;
+        }
+
+        // Process rows
+        const char * src0_data = (const char *)src0->data;
+        char * dst_data = (char *)dst->data;
+
+        const uint32_t total_rows = n_elements / src0->ne[0];
+
+        for (uint32_t row = 0; row < total_rows; row++) {
+            const char * src_row = src0_data + row * row_size;
+            char * dst_row = dst_data + row * row_size;
+
+            if (src0_type == HTP_TYPE_F32) {
+                const float * src_f32 = (const float *)src_row;
+                float * dst_f32 = (float *)dst_row;
+                for (uint32_t i = 0; i < src0->ne[0]; i++) {
+                    dst_f32[i] = src_f32[i] * combined_w;
+                }
+            } else {
+                const _Float16 * src_f16 = (const _Float16 *)src_row;
+                _Float16 * dst_f16 = (_Float16 *)dst_row;
+                for (uint32_t i = 0; i < src0->ne[0]; i++) {
+                    dst_f16[i] = (_Float16)((float)src_f16[i] * combined_w);
+                }
+            }
+        }
+
+        return HTP_STATUS_OK;
+    }
+
     // Does not support permutations of src1
     const struct htp_tensor * src1 = octx->src[1];
     if (src1->nb[1] < src1->nb[0]) {

@@ -214,6 +214,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_CONCAT:          return "CONCAT";
         case HTP_OP_CLAMP:           return "CLAMP";
         case HTP_OP_IM2COL:          return "IM2COL";
+        case HTP_OP_MUL_MUL:         return "MUL_MUL";
         case HTP_OP_GATED_DELTA_NET: return "GATED_DELTA_NET";
         case HTP_OP_TRI:             return "TRI";
         case HTP_OP_INVALID:         return "INVALID";
@@ -803,6 +804,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_PAD]             = op_pad,
     [HTP_OP_CONCAT]          = op_concat,
     [HTP_OP_IM2COL]          = op_im2col,
+    [HTP_OP_MUL_MUL]         = op_binary,
     [HTP_OP_GATED_DELTA_NET] = op_gated_delta_net,
     [HTP_OP_TRI]             = op_unary,
 };

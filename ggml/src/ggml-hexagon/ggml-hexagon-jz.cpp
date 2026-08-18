@@ -5474,6 +5474,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         size_t n_mul_mat_add  = 0;
         size_t n_mul_mat_qkv  = 0;
         size_t n_mul_mat_ffn  = 0;
+        size_t n_mul_mul      = 0;  // MUL + MUL fused ops
         size_t n_mm_add_skip_use_count    = 0;  // MUL_MAT+ADD candidate but src_use_count > 1
         size_t n_mm_add_skip_not_adjacent = 0;  // MUL_MAT not followed by ADD
         size_t n_mm_add_skip_vtcm         = 0;  // MUL_MAT+ADD candidate but VTCM budget exceeded
@@ -5687,13 +5688,48 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 }
             }
 
+            // MUL + MUL -> MUL_MUL fusion
+            // Detect: MUL(MUL(x, w1), w2) -> x * w1 * w2
+            if (op.opcode == GGML_OP_MUL && i + 1 < hex_ops.size()) {
+                const hex_op_desc & next = hex_ops[i + 1];
+                if (next.opcode == GGML_OP_MUL &&
+                    next.src_idx[0] == op.dst_idx[0] &&
+                    src_use_count[op.dst_idx[0]] == 1) {
+
+                    // Check that both weights are scalars (ne[0] == 1)
+                    bool w1_is_scalar = false, w2_is_scalar = false;
+                    if (op.src_idx[1] >= 0 && op.src_idx[1] < n_tensors) {
+                        ggml_tensor * w1 = tensor_src[op.src_idx[1]];
+                        if (w1 && w1->ne[0] == 1 && w1->ne[1] == 1 && w1->ne[2] == 1 && w1->ne[3] == 1) {
+                            w1_is_scalar = true;
+                        }
+                    }
+                    if (next.src_idx[1] >= 0 && next.src_idx[1] < n_tensors) {
+                        ggml_tensor * w2 = tensor_src[next.src_idx[1]];
+                        if (w2 && w2->ne[0] == 1 && w2->ne[1] == 1 && w2->ne[2] == 1 && w2->ne[3] == 1) {
+                            w2_is_scalar = true;
+                        }
+                    }
+
+                    if (w1_is_scalar && w2_is_scalar) {
+                        op.htp_opcode = HTP_OP_MUL_MUL;
+                        op.src_idx[2] = next.src_idx[1];  // w2
+                        op.dst_idx[0] = next.dst_idx[0]; // final output
+                        fused_ops.push_back(op);
+                        i++;
+                        n_mul_mul++;
+                        continue;
+                    }
+                }
+            }
+
             fused_ops.push_back(op);
         }
 
-        if (n_rms_norm_mul + n_mul_mat_add + n_mul_mat_qkv + n_mul_mat_ffn > 0) {
-            GGMLHEXAGON_LOG_DEBUG("op-fusion: %zu ops -> %zu ops (%zu RMS_NORM_MUL, %zu MUL_MAT_ADD, %zu MUL_MAT_QKV, %zu MUL_MAT_FFN)",
+        if (n_rms_norm_mul + n_mul_mat_add + n_mul_mat_qkv + n_mul_mat_ffn + n_mul_mul > 0) {
+            GGMLHEXAGON_LOG_ALWAYS("op-fusion: %zu ops -> %zu ops (%zu RMS_NORM_MUL, %zu MUL_MAT_ADD, %zu MUL_MAT_QKV, %zu MUL_MAT_FFN, %zu MUL_MUL)",
                                     hex_ops.size(), fused_ops.size(),
-                                    n_rms_norm_mul, n_mul_mat_add, n_mul_mat_qkv, n_mul_mat_ffn);
+                                    n_rms_norm_mul, n_mul_mat_add, n_mul_mat_qkv, n_mul_mat_ffn, n_mul_mul);
             hex_ops = std::move(fused_ops);
         }
         if (n_mm_add_skip_use_count > 0 || n_mm_add_skip_not_adjacent > 0) {
@@ -5701,6 +5737,121 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                                     n_mm_add_skip_use_count, n_mm_add_skip_not_adjacent);
         }
     }  // end if (!cache_hit) for Phase 3
+
+    // Diagnose remaining op distribution after fusion (for optimization guidance)
+    if (!cache_hit) {
+        // Count op types in post-fusion hex_ops
+        uint32_t n_mul_mat = 0, n_add = 0, n_sub = 0, n_mul = 0;
+        uint32_t n_div = 0, n_rms = 0, n_rope = 0, n_softmax = 0;
+        uint32_t n_act = 0, n_other = 0;
+
+        // Recompute src_use_count for post-fusion ops
+        std::vector<int> diag_use_count(n_tensors, 0);
+        for (const auto & op : hex_ops) {
+            for (int k = 0; k < 6; k++) {
+                if (op.src_idx[k] >= 0 && op.src_idx[k] < (int)n_tensors) {
+                    diag_use_count[op.src_idx[k]]++;
+                }
+            }
+        }
+
+        // Count unique-output patterns (output used only once = fuseable)
+        uint32_t rms_single_use = 0;
+        uint32_t mul_single_use = 0;
+        uint32_t mul_mat_single_use = 0;
+        uint32_t add_single_use = 0;
+
+        // Consecutive 2-op patterns with data dependency
+        uint32_t rms_mm = 0, rms_mul = 0, mm_add = 0;
+        uint32_t mul_act = 0, mul_mul = 0, add_mm = 0;
+
+        // Consecutive 3-op patterns with data dependency
+        uint32_t rms_mm_add = 0;
+        uint32_t rms_mul_act = 0;
+        uint32_t mm_add_rms = 0;
+        uint32_t act_mul_mm = 0;
+
+        for (size_t idx = 0; idx < hex_ops.size(); idx++) {
+            const auto & op = hex_ops[idx];
+            switch (op.opcode) {
+                case GGML_OP_MUL_MAT:   n_mul_mat++; break;
+                case GGML_OP_ADD: case GGML_OP_ADD_ID: n_add++; break;
+                case GGML_OP_SUB:       n_sub++; break;
+                case GGML_OP_MUL:       n_mul++; break;
+                case GGML_OP_DIV:       n_div++; break;
+                case GGML_OP_RMS_NORM:  n_rms++; break;
+                case GGML_OP_ROPE:      n_rope++; break;
+                case GGML_OP_SOFT_MAX:  n_softmax++; break;
+                case GGML_OP_UNARY: case GGML_OP_GLU: n_act++; break;
+                default:                n_other++; break;
+            }
+
+            // Check if output is used only once (fuseable)
+            if (op.dst_idx[0] >= 0 && op.dst_idx[0] < (int)n_tensors) {
+                uint32_t use_cnt = diag_use_count[op.dst_idx[0]];
+                if (use_cnt == 1) {
+                    switch (op.opcode) {
+                        case GGML_OP_RMS_NORM:  rms_single_use++; break;
+                        case GGML_OP_MUL:       mul_single_use++; break;
+                        case GGML_OP_MUL_MAT:   mul_mat_single_use++; break;
+                        case GGML_OP_ADD: case GGML_OP_ADD_ID: add_single_use++; break;
+                        default: break;
+                    }
+                }
+            }
+
+            // Check consecutive 2-op patterns with data dependency
+            if (idx + 1 < hex_ops.size()) {
+                const auto & next = hex_ops[idx + 1];
+                bool connected = (op.dst_idx[0] == next.src_idx[0]) &&
+                                 (op.dst_idx[0] >= 0 && op.dst_idx[0] < (int)n_tensors) &&
+                                 (diag_use_count[op.dst_idx[0]] == 1);
+
+                if (connected) {
+                    if (op.opcode == GGML_OP_RMS_NORM && next.opcode == GGML_OP_MUL_MAT) rms_mm++;
+                    if (op.opcode == GGML_OP_RMS_NORM && next.opcode == GGML_OP_MUL) rms_mul++;
+                    if (op.opcode == GGML_OP_MUL_MAT && next.opcode == GGML_OP_ADD) mm_add++;
+                    if (op.opcode == GGML_OP_MUL && (next.opcode == GGML_OP_UNARY || next.opcode == GGML_OP_GLU)) mul_act++;
+                    if (op.opcode == GGML_OP_MUL && next.opcode == GGML_OP_MUL) mul_mul++;
+                    if (op.opcode == GGML_OP_ADD && next.opcode == GGML_OP_MUL_MAT) add_mm++;
+                }
+
+                // Check consecutive 3-op patterns
+                if (idx + 2 < hex_ops.size() && connected) {
+                    const auto & next2 = hex_ops[idx + 2];
+                    bool connected2 = (next.dst_idx[0] == next2.src_idx[0]) &&
+                                      (next.dst_idx[0] >= 0 && next.dst_idx[0] < (int)n_tensors) &&
+                                      (diag_use_count[next.dst_idx[0]] == 1);
+                    if (connected2) {
+                        if (op.opcode == GGML_OP_RMS_NORM && next.opcode == GGML_OP_MUL_MAT && next2.opcode == GGML_OP_ADD) rms_mm_add++;
+                        if (op.opcode == GGML_OP_RMS_NORM && next.opcode == GGML_OP_MUL &&
+                            (next2.opcode == GGML_OP_UNARY || next2.opcode == GGML_OP_GLU)) rms_mul_act++;
+                        if (op.opcode == GGML_OP_MUL_MAT && next.opcode == GGML_OP_ADD && next2.opcode == GGML_OP_RMS_NORM) mm_add_rms++;
+                        if ((op.opcode == GGML_OP_UNARY || op.opcode == GGML_OP_GLU) &&
+                            next.opcode == GGML_OP_MUL && next2.opcode == GGML_OP_MUL_MAT) act_mul_mm++;
+                    }
+                }
+            }
+        }
+
+        if (hex_ops.size() > 0) {
+            GGMLHEXAGON_LOG_ALWAYS("=== Post-Fusion Op Distribution ===");
+            GGMLHEXAGON_LOG_ALWAYS("total=%u MUL_MAT=%u ADD=%u SUB=%u MUL=%u DIV=%u RMS_NORM=%u ROPE=%u SOFTMAX=%u ACT=%u OTHER=%u",
+                                  (uint32_t)hex_ops.size(), n_mul_mat, n_add, n_sub,
+                                  n_mul, n_div, n_rms, n_rope, n_softmax, n_act, n_other);
+            GGMLHEXAGON_LOG_ALWAYS("=== Single-Use Outputs (Fuseable) ===");
+            GGMLHEXAGON_LOG_ALWAYS("RMS_NORM_single=%u MUL_single=%u MUL_MAT_single=%u ADD_single=%u",
+                                  rms_single_use, mul_single_use, mul_mat_single_use, add_single_use);
+            GGMLHEXAGON_LOG_ALWAYS("=== Consecutive 2-Opp Patterns (with dependency) ===");
+            GGMLHEXAGON_LOG_ALWAYS("RMS->MUL_MAT=%u RMS->MUL=%u MUL_MAT->ADD=%u MUL->ACT=%u MUL->MUL=%u ADD->MUL_MAT=%u",
+                                  rms_mm, rms_mul, mm_add, mul_act, mul_mul, add_mm);
+            GGMLHEXAGON_LOG_ALWAYS("=== Consecutive 3-Opp Patterns (with dependency) ===");
+            GGMLHEXAGON_LOG_ALWAYS("RMS->MUL_MAT->ADD=%u RMS->MUL->ACT=%u MUL_MAT->ADD->RMS=%u ACT->MUL->MUL_MAT=%u",
+                                  rms_mm_add, rms_mul_act, mm_add_rms, act_mul_mm);
+            uint32_t max_potential = std::max({rms_mm_add, rms_mul_act, mm_add_rms, act_mul_mm});
+            GGMLHEXAGON_LOG_ALWAYS("=== Max Fusion Potential: %u ops (from best 3-op pattern) ===", max_potential);
+        }
+    }
 
     n_ops = (uint32_t)hex_ops.size();
 
@@ -6047,35 +6198,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
     // Flush CPU cache to DRAM so DSP can read AP-written data.
     {
-        // Collect per-tensor dirty ranges and flush them individually (merged).
-        // A single continuous [min, max] range would also flush the holes
-        // between low-offset activations and high-offset weights (~940MB of
-        // wasted cache-line writes when only a few MB are actually dirty).
-        std::vector<std::pair<uint32_t, uint32_t>> ranges;
-        ranges.reserve(n_tensors + mirrors.size() + (size_t)cgraph->n_nodes + 4);
-
-        // Track data pointers already flushed to avoid duplicate ranges
-        // from the cgraph->nodes loop (which overlaps heavily with tensor_src).
-        std::unordered_set<const void *> flushed_ptrs;
-        flushed_ptrs.reserve(n_tensors + 16);
-
-        // Diagnostic counters (per-call, reset every batch) so we can see which
-        // source is dominating the flush cost. Logged once per call.
-        uint64_t dbg_bytes_tensor = 0, dbg_bytes_mirror = 0;
-        uint64_t dbg_bytes_repack_ion = 0, dbg_bytes_batch = 0, dbg_bytes_cgraph = 0;
-        uint32_t dbg_ranges_tensor = 0, dbg_ranges_cgraph = 0;
-        (void)dbg_bytes_tensor; (void)dbg_bytes_mirror;
-        (void)dbg_bytes_repack_ion; (void)dbg_bytes_batch; (void)dbg_bytes_cgraph;
-        (void)dbg_ranges_tensor; (void)dbg_ranges_cgraph;
-
-        auto add_range = [&](uint32_t off, uint32_t len) {
-            if (len > 0) ranges.push_back({off, off + len});
-        };
-
         // ion_sync_mode=1 path: skip the per-tensor/cgraph range scans
         // entirely; the DMA_BUF_IOCTL_SYNC below handles cache coherency
-        // for the whole mempool. The scan work is pure overhead in this
-        // mode (the collected ranges are never used to drive a DC CVAC).
+        // for the whole mempool.
         if (!do_dc_cvac) {
             if (do_ion_sync) {
                 int ion_fd = ctx->rpc_mempool_handle;
@@ -6087,6 +6212,30 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                                   g_hexagon_appcfg.ion_sync_mode, was_weights_dirty);
             (void)was_weights_dirty;
         } else {
+            // Collect per-tensor dirty ranges and flush them individually (merged).
+            // A single continuous [min, max] range would also flush the holes
+            // between low-offset activations and high-offset weights (~940MB of
+            // wasted cache-line writes when only a few MB are actually dirty).
+            std::vector<std::pair<uint32_t, uint32_t>> ranges;
+            ranges.reserve(n_tensors + mirrors.size() + (size_t)cgraph->n_nodes + 4);
+
+            // Track data pointers already flushed to avoid duplicate ranges
+            // from the cgraph->nodes loop (which overlaps heavily with tensor_src).
+            std::unordered_set<const void *> flushed_ptrs;
+            flushed_ptrs.reserve(n_tensors + 16);
+
+            // Diagnostic counters (per-call, reset every batch) so we can see which
+            // source is dominating the flush cost. Logged once per call.
+            uint64_t dbg_bytes_tensor = 0, dbg_bytes_mirror = 0;
+            uint64_t dbg_bytes_repack_ion = 0, dbg_bytes_batch = 0, dbg_bytes_cgraph = 0;
+            uint32_t dbg_ranges_tensor = 0, dbg_ranges_cgraph = 0;
+            (void)dbg_bytes_tensor; (void)dbg_bytes_mirror;
+            (void)dbg_bytes_repack_ion; (void)dbg_bytes_batch; (void)dbg_bytes_cgraph;
+            (void)dbg_ranges_tensor; (void)dbg_ranges_cgraph;
+
+            auto add_range = [&](uint32_t off, uint32_t len) {
+                if (len > 0) ranges.push_back({off, off + len});
+            };
 
             for (uint32_t i = 0; i < n_tensors; i++) {
                 ggml_tensor * t = tensor_src[i];
