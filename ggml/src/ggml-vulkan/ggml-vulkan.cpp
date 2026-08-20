@@ -16110,7 +16110,18 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
     try {
         dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
     } catch (const vk::SystemError& e) {
-        return nullptr;
+        // device-local allocation failed, fall back to host-visible memory
+        // this can happen on small-VRAM GPUs when -ngl 0 and large compute buffers are requested
+        GGML_LOG_WARN("ggml_vulkan: falling back to host-visible buffer for size %zu (device-local allocation failed: %s)\n", size, e.what());
+        try {
+            dev_buffer = ggml_vk_create_buffer(ctx->device, size, {
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+            });
+        } catch (const vk::SystemError& e2) {
+            // host-visible also failed, fall back to CPU buffer
+            GGML_LOG_WARN("ggml_vulkan: host-visible allocation also failed (%s), falling back to CPU buffer\n", e2.what());
+            return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        }
     }
 
     ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
