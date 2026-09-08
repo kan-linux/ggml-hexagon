@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -92,7 +93,7 @@
 
 #define SIZE_IN_MB                                      (1 << 20)
 
-#define GGML_HEXAGON_VERSION                            "0.10.4"
+#define GGML_HEXAGON_VERSION                            "0.26.5"
 
 // Forward declarations
 static bool                  ggmlhexagon_is_op_on_device(ggml_backend_dev_t dev, const ggml_tensor * op);
@@ -154,6 +155,7 @@ struct ggml_backend_hexagon_context {
 
     int n_threads;
     int dsp_thread_counts = 0;                  // actual worker threads in effect on NPU (max_hw_threads - 2)
+    int dsp_thread_counts_max = 0;              // safe upper bound reported by NPU at init
 
     //HTP resource management
     int physical_idx;           // physical CDSP index (from device config)
@@ -328,7 +330,13 @@ struct hexagon_appcfg_t {
     int dump_diag_info;         // enable/disable dump diag info for troubleshooting issues on HTP side
     int ndev;                   // number of Hexagon devices (PDs), from GGML_HEXAGON_NDEV env
     int rpc_mmap_mode;          // 0=FASTRPC_MAP_FD_DELAYED (default), 1=FASTRPC_MAP_FD (eager pinning)
-    int enable_opfusion;        // 1=enable QKV/FFN op fusion (default), 0=disable (for debugging)
+    int enable_opfusion;        // fusion control bitmask (like Qualcomm's opt_opfusion).
+                                //   0 = all fusions disabled
+                                //   1 = all fusions enabled (backward compatible)
+                                //   bitmask (values >= 2): selective enable
+                                //     bit 0 (0x1): RMS_NORM + MUL
+                                //     bit 1 (0x2): QKV/FFN NX (3x/2x MUL_MAT batched)
+                                //     bit 2 (0x4): MUL_MAT + ADD (bias fusion)
     int fa_select;              // flash attention: 2=HMX->HVX->CPU, 1=HVX->CPU, 0=CPU (default 2)
     int dsp_cache_mode;         // NPU-side entry.c cache optimization bitmask, pushed to NPU at init via
                                 //   execute_batch(0xFFFC) special mode. All four bits
@@ -354,9 +362,11 @@ struct hexagon_appcfg_t {
                                 //   execute_batch(0xFFFC) payload. Pair with dsp_cache_trace_bit0
                                 //   to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
+    int enable_graph_cache;     // enable/disable graph cache (1=enable, 0=disable, default=1)
 
     const char * cfgfilename;
     char version[GGMLHEXAGON_TMPBUF_LEN];
+    std::string enabled_ops;    // comma-separated list of ops to offload (empty = all supported ops)
 };
 
 // designated initializers are a C++20 extension; suppress to keep readability in C++17 builds
@@ -376,9 +386,27 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit0   = 0,
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
+        .enable_graph_cache     = 1,
         .cfgfilename            = "ggml-hexagon.cfg",
         .version                = {GGML_HEXAGON_VERSION},
+        .enabled_ops            = "all",
 };
+
+// Op fusion bitmask flags (mirrors Qualcomm's ggml_hexagon_fusion_flags).
+enum opfusion_flag_t {
+    OPFUSE_RMS_NORM_MUL = (1 << 0),  // 0x1: RMS_NORM + MUL
+    OPFUSE_QKV_FFN_NX   = (1 << 1),  // 0x2: QKV/FFN NX (3x/2x MUL_MAT batched)
+    OPFUSE_MUL_MAT_ADD  = (1 << 2),  // 0x4: MUL_MAT + ADD (bias fusion)
+};
+
+// Selective fusion enable check (mirrors Qualcomm's ggml_hexagon_is_fusion_enabled).
+//   0 = all off, 1 = all on (backward compat), bitmask = selective
+static inline bool is_opfusion_enabled(int flag) {
+    int v = g_hexagon_appcfg.enable_opfusion;
+    if (v <= 0) return false;
+    if (v == 1) return true;
+    return (v & flag) != 0;
+}
 
 //TODO: add descriptors for more supported Snapdragon devices
 static struct qcom_socinfo g_hexagon_soc_info_table[] = {
@@ -539,22 +567,90 @@ static int hexagon_warmup_invoke_timed(ggml_backend_hexagon_context * ctx) {
     return err;
 }
 
+// Logging convention in this function:
+//   VERBOSE -> terminal + adb logcat (key summary for immediate visibility)
+//   ALWAYS  -> adb logcat only (detailed diagnostics for post-analysis)
 static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * ctx) {
     char timestamp[GGMLHEXAGON_TMPBUF_LEN];
     memset(timestamp, 0, GGMLHEXAGON_TMPBUF_LEN);
 
     GGMLHEXAGON_LOG_VERBOSE("ggml_hexagon_version:             %s", g_hexagon_appcfg.version);
     ggmlhexagon_get_timestring(timestamp);
-    GGMLHEXAGON_LOG_VERBOSE("thread_counts on HTP:             %d", g_hexagon_appcfg.thread_counts);
     GGMLHEXAGON_LOG_VERBOSE("rpc_mmap_mode:                    %d", g_hexagon_appcfg.rpc_mmap_mode);
     GGMLHEXAGON_LOG_VERBOSE("dsp_cache_mode:                   %d", g_hexagon_appcfg.dsp_cache_mode);
-    GGMLHEXAGON_LOG_VERBOSE("dsp_cache_trace_bit0:             %d", g_hexagon_appcfg.dsp_cache_trace_bit0);
-    GGMLHEXAGON_LOG_VERBOSE("dsp_cache_trace_bit1:             %d", g_hexagon_appcfg.dsp_cache_trace_bit1);
+    GGMLHEXAGON_LOG_ALWAYS("dsp_cache_trace_bit0:              %d", g_hexagon_appcfg.dsp_cache_trace_bit0);
+    GGMLHEXAGON_LOG_ALWAYS("dsp_cache_trace_bit1:              %d", g_hexagon_appcfg.dsp_cache_trace_bit1);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(NPU):              %d", g_hexagon_appcfg.dump_diag_info);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(AP):               %d", g_hexagon_appcfg.dump_debug_info);
     GGMLHEXAGON_LOG_VERBOSE("enable graph_optimize:            %d", g_hexagon_appcfg.enable_graph_optimize);
-    GGMLHEXAGON_LOG_VERBOSE("enable op_fusion:                 %d", g_hexagon_appcfg.enable_opfusion);
+    GGMLHEXAGON_LOG_VERBOSE("enable graph_cache:               %d", g_hexagon_appcfg.enable_graph_cache);
+    GGMLHEXAGON_LOG_VERBOSE("initial thread_counts on NPU:     %d (runtime -t takes effect at first graph compute)", g_hexagon_appcfg.thread_counts);
+    // 0 = all off, 1 = all on (backward compat), >= 2 = bitmask selective
+    if (g_hexagon_appcfg.enable_opfusion <= 0) {
+        GGMLHEXAGON_LOG_VERBOSE("enable op_fusion:                 %d (all fusions disabled)", g_hexagon_appcfg.enable_opfusion);
+    } else if (g_hexagon_appcfg.enable_opfusion == 1) {
+        GGMLHEXAGON_LOG_VERBOSE("enable op_fusion:                 %d (all fusions enabled, default)", g_hexagon_appcfg.enable_opfusion);
+    } else {
+        GGMLHEXAGON_LOG_VERBOSE("enable op_fusion:                 %d (bitmask: 0x1=RMS_NORM_MUL 0x2=QKV_FFN_NX 0x4=MUL_MAT_ADD)", g_hexagon_appcfg.enable_opfusion);
+    }
+    GGMLHEXAGON_LOG_VERBOSE("enabled_ops:                      %s", g_hexagon_appcfg.enabled_ops.c_str());
     GGMLHEXAGON_LOG_VERBOSE("running timestamp:%s", timestamp);
+}
+
+static inline bool is_all_token(std::string_view s) {
+    if (s.size() != 3)
+        return false;
+
+    return s == "all" || s == "ALL";
+}
+
+// Check if an op is allowed by the enabled_ops config filter.
+// Returns true when:
+//   - enabled_ops is empty or contains "all" or the op name
+static bool ggmlhexagon_op_is_enabled(enum ggml_op op) {
+    if (g_hexagon_appcfg.enabled_ops.empty()) {
+        return true;
+    }
+
+    if (is_all_token(g_hexagon_appcfg.enabled_ops)) {
+        return true;
+    }
+
+    const char * op_name = ggml_op_name(op);
+    // Check if op_name appears as a whole word in the comma-separated list
+    const std::string & list = g_hexagon_appcfg.enabled_ops;
+    size_t pos = 0;
+    while (pos < list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) end = list.size();
+        std::string token = list.substr(pos, end - pos);
+        // trim whitespace
+        size_t start = token.find_first_not_of(" \t");
+        size_t last = token.find_last_not_of(" \t");
+        if (start != std::string::npos && last != std::string::npos) {
+            token = token.substr(start, last - start + 1);
+        }
+        // "all" keyword enables all ops
+        if (token.size() == 3 &&
+            tolower((unsigned char)token[0]) == 'a' &&
+            tolower((unsigned char)token[1]) == 'l' &&
+            tolower((unsigned char)token[2]) == 'l') {
+            return true;
+        }
+        // case-insensitive compare
+        if (token.size() == strlen(op_name)) {
+            bool match = true;
+            for (size_t i = 0; i < token.size(); ++i) {
+                if (tolower((unsigned char)token[i]) != tolower((unsigned char)op_name[i])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        pos = end + 1;
+    }
+    return false;
 }
 
 // =================================================================================================
@@ -759,6 +855,8 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit0", g_hexagon_appcfg.dsp_cache_trace_bit0, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit1", g_hexagon_appcfg.dsp_cache_trace_bit1, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
+    hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_cache", g_hexagon_appcfg.enable_graph_cache, 1);
+    hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
 
     snprintf(g_hexagon_appcfg.version, GGMLHEXAGON_TMPBUF_LEN, "%s", version.c_str());
 
@@ -1890,6 +1988,7 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
         if (ctx->dsp_thread_counts > 0) {
             g_hexagon_appcfg.thread_counts = ctx->dsp_thread_counts;
             ctx->n_threads = ctx->dsp_thread_counts;
+            ctx->dsp_thread_counts_max = ctx->dsp_thread_counts;
         }
         ggmlhexagon_set_rpc_latency(ctx->ggmlop_handle, RPC_PM_QOS, 100);
         if (0 != ggmlhexagon_init_rpcmempool(ctx)) {
@@ -2930,6 +3029,8 @@ static bool ggml_op_to_htp_op_unary(int32_t ggml_op, const int32_t * op_params, 
         case GGML_OP_L2_NORM: *htp_op = HTP_OP_L2_NORM;     return true;
         case GGML_OP_RMS_NORM:*htp_op = HTP_OP_RMS_NORM;    return true;
         case GGML_OP_SCALE:   *htp_op = HTP_OP_SCALE;       return true;
+        case GGML_OP_CLAMP:   *htp_op = HTP_OP_CLAMP;       return true;
+        case GGML_OP_LEAKY_RELU:   *htp_op = HTP_OP_LEAKY_RELU;       return true;
         case GGML_OP_SQR:     *htp_op = HTP_OP_SQR;         return true;
         case GGML_OP_SQRT:    *htp_op = HTP_OP_SQRT;        return true;
         case GGML_OP_LOG:     *htp_op = HTP_OP_UNARY_LOG;   return true;
@@ -2943,6 +3044,7 @@ static bool ggml_op_to_htp_op_unary(int32_t ggml_op, const int32_t * op_params, 
                 case GGML_UNARY_OP_EXP:        *htp_op = HTP_OP_UNARY_EXP;      return true;
                 case GGML_UNARY_OP_SOFTPLUS:   *htp_op = HTP_OP_UNARY_SOFTPLUS; return true;
                 case GGML_UNARY_OP_ABS:        *htp_op = HTP_OP_UNARY_ABS;      return true;
+                case GGML_UNARY_OP_RELU:       *htp_op = HTP_OP_UNARY_RELU;     return true;
                 case GGML_UNARY_OP_SILU:       *htp_op = HTP_OP_UNARY_SILU;     return true;
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_QUICK: *htp_op = HTP_OP_UNARY_GELU;     return true;
@@ -3131,6 +3233,12 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     const int wtype = ggml_hexagon_weight_dsp_type(src0->type);
 
     if (ne01_padded % 32 != 0) {
+        return false;
+    }
+
+    // HMX kernel requires raw src0->ne[1] to be 32-aligned
+    // (ne01_padded is always 32-aligned for repack types, so it alone is insufficient)
+    if (src0->ne[1] % 32 != 0) {
         return false;
     }
 
@@ -3960,7 +4068,8 @@ static bool ggmlhexagon_supported_flash_attn(
         return false;
     }
     if ((q->type != GGML_TYPE_F16 && q->type != GGML_TYPE_F32) ||
-        k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) {
+        (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0) ||
+        (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_Q8_0)) {
         return false;
     }
     if (mask && mask->type != GGML_TYPE_F16) {
@@ -4029,22 +4138,57 @@ static bool hexagon_validate_rms_norm(ggml_backend_hexagon_context * ctx, const 
     return true;
 }
 
-// NORM, L2_NORM: dispatched to op_unary (F32, same shape, contiguous dst)
-static bool hexagon_validate_norm_op(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+// Common validator for unary-family ops (NORM, L2_NORM, SCALE, CLAMP,
+// LEAKY_RELU, SQR, SQRT, LOG, ...).  Mirrors ggml_hexagon_supported_unary()
+// in ggml-hexagon.cpp: F32/F16, same shape, contiguous dst.
+static bool ggml_hexagon_supported_unary(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
-    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || src0->type != op->type)
-        return false;
-    if (!ggml_are_same_shape(src0, op))
-        return false;
-    if (!ggml_is_contiguous(op))
-        return false;
-    return true;
-}
+    const ggml_tensor * dst  = op;
 
-// SQR, SQRT: element-wise unary, same as norm_op
-static bool hexagon_validate_sqr_sqrt(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
-    return hexagon_validate_norm_op(ctx, op);
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (dst->type != src0->type) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(src0)) {
+        return false;
+    }
+
+    // F16 device kernels only cover this explicit whitelist (must stay in sync with
+    // the is_f16 whitelist in execute_op_unary(), unary-ops.c).
+    if (src0->type == GGML_TYPE_F16) {
+        switch (op->op) {
+            case GGML_OP_NORM:
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_L2_NORM:
+            case GGML_OP_SCALE:
+            case GGML_OP_CLAMP:
+            case GGML_OP_SQR:
+            case GGML_OP_SQRT:
+            case GGML_OP_LOG:
+                break;
+            case GGML_OP_UNARY:
+                if (ggml_get_unary_op(op) != GGML_UNARY_OP_ABS) {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+        }
+    }
+
+    if (!ggml_are_same_shape(src0, dst)) {
+        return false;
+    }
+
+    // dst must be contiguous; src0 may be non-contiguous
+    if (!ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    return true;
 }
 
 static bool hexagon_validate_rope(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
@@ -4069,10 +4213,46 @@ static bool hexagon_validate_rope(ggml_backend_hexagon_context * ctx, const ggml
 
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
-    if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+    const ggml_tensor * src2 = op->src[2];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32) {
         return false;
-    if (!src1 || src1->type != GGML_TYPE_I32)
+    }
+    if (dst->type != GGML_TYPE_F32) {
         return false;
+    }
+    if (src1->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (src2) {
+        if (src2->type != GGML_TYPE_F32) {
+            return false;
+        }
+        int n_dims = op_params[1];
+        if (src2->ne[0] < (n_dims / 2)) {
+            return false;
+        }
+    }
+
+    if (src2) {
+        if (!ggml_is_contiguous(src1) || !ggml_is_contiguous(src2)) {
+            return false;
+        }
+    } else {
+        if (!ggml_is_contiguous(src1)) {
+            return false;
+        }
+    }
+
+    // src0/dst elements within a row must be contiguous (nb[0] == sizeof(float)).
+    // nb[1] may exceed ne[0]*sizeof(float) when the tensor is a strided view of a larger one
+    if (src0->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (src0->nb[1] < src0->ne[0] * sizeof(float) || dst->nb[1] < dst->ne[0] * sizeof(float)) {
+        return false;
+    }
     return true;
 }
 
@@ -4080,61 +4260,90 @@ static bool hexagon_validate_soft_max(ggml_backend_hexagon_context * ctx, const 
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
-    if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
-        return false;
-    if (src1 != nullptr && src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F32)
-        return false;
-    if (op->src[2] != nullptr)
-        return false;
-    return true;
-}
+    const ggml_tensor * src2 = op->src[2];
+    const ggml_tensor * dst  = op;
 
-static bool hexagon_validate_unary(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
-    GGML_UNUSED(ctx);
-    const ggml_tensor * src0 = op->src[0];
-    const int unary_op = (int)op->op_params[0];
-    switch (unary_op) {
-        case GGML_UNARY_OP_ABS:
-            if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || src0->type != op->type)
-                return false;
-            if (!ggml_are_same_shape(src0, op))
-                return false;
-            if (!ggml_is_contiguous(op))
-                return false;
-            return true;
-        case GGML_UNARY_OP_SILU:
-        case GGML_UNARY_OP_GELU:
-        case GGML_UNARY_OP_GELU_QUICK:
-        case GGML_UNARY_OP_NEG:
-        case GGML_UNARY_OP_EXP:
-        case GGML_UNARY_OP_SIGMOID:
-        case GGML_UNARY_OP_SOFTPLUS:
-        case GGML_UNARY_OP_TANH:
-            if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
-                return false;
-            if (ggml_is_permuted(src0))
-                return false;
-            if (!ggml_are_same_shape(src0, op))
-                return false;
-            if (!ggml_is_contiguous(op))
-                return false;
-            return true;
-        default:
-            return false;
+    if (src2) {
+        return false;  // FIXME: add support for sinks
     }
+
+    if (src0->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (src1) {
+        if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
+            return false;
+        }
+        if (src0->ne[0] != src1->ne[0]) {
+            return false;
+        }
+        if (src1->ne[1] < src0->ne[1]) {
+            return false;
+        }
+        if (src0->ne[2] % src1->ne[2] != 0) {
+            return false;
+        }
+        if (src0->ne[3] % src1->ne[3] != 0) {
+            return false;
+        }
+    }
+
+    if (src1) {
+        if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+            return false;
+        }
+    } else {
+        if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) {
+            return false;
+        }
+    }
+
+    // Reject non-HVX-aligned sizes when ne[0] > HVX_F32_LANES
+    const int64_t ne0 = src0->ne[0];
+    if (ne0 > 32 && (ne0 & (32 - 1)) != 0) {
+        return false;
+    }
+
+    #define SOFTMAX_MAX_ROW_SIZE 131072
+    if (ne0 > SOFTMAX_MAX_ROW_SIZE) {
+        return false;
+    }
+
+    return true;
 }
 
 static bool hexagon_validate_glu(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
-    if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
         return false;
-    if (!ggml_is_contiguous_1(src0) || !ggml_is_contiguous(op))
+    if (!ggml_is_contiguous_1(src0) || !ggml_is_contiguous(dst))
         return false;
+
+    if (src1) {
+        if (src1->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_are_same_shape(src0, src1)) {
+            return false;
+        }
+        if (!ggml_is_contiguous_1(src1)) {
+            return false;
+        }
+    }
+
     const int glu_op = (int)op->op_params[0];
     switch (glu_op) {
         case GGML_GLU_OP_SWIGLU:
         case GGML_GLU_OP_SWIGLU_OAI:
+        case GGML_GLU_OP_SWIGLU_CLAMP:
         case GGML_GLU_OP_GEGLU:
             return true;
         default:
@@ -4142,22 +4351,25 @@ static bool hexagon_validate_glu(ggml_backend_hexagon_context * ctx, const ggml_
     }
 }
 
-static bool hexagon_validate_scale(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
-    GGML_UNUSED(ctx);
-    const ggml_tensor * src0 = op->src[0];
-    if (src0->type != op->type) return false;
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16)
-        return false;
-    return true;
-}
-
 static bool hexagon_validate_cpy(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
-    if (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32)
-        return false;
-    if (op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_F32)
-        return false;
+    const ggml_tensor * dst  = op;
+
+    // for now we can do f32 -> f16 and f16 -> f32 (without reshaping)
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) return false;
+
+    const bool sametype   = (src0->type == dst->type);
+    const bool transposed = ggml_is_transposed(src0) || ggml_is_transposed(dst);
+    const bool sameshape  = !transposed && ggml_are_same_shape(src0, dst);
+
+    // can handle any shape and any same-type (pretty slow if reshaping is required)
+    if (sametype) return true;
+
+    // cannot handle re-shaping and type conversion at the same time
+    if (!sameshape) return false;
+
     return true;
 }
 
@@ -4165,10 +4377,29 @@ static bool hexagon_validate_get_rows(ggml_backend_hexagon_context * ctx, const 
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
-    if (!src1 || src1->type != GGML_TYPE_I32)
+    const ggml_tensor * dst  = op;
+
+    // Reject repacked tensors – tiled layout is not suitable for row-indexed access
+    if (src0->buffer && ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
         return false;
-    if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+    }
+
+    if (src0->type != GGML_TYPE_F32 && src0->ne[0] < 32) {
         return false;
+    }
+
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+
+    if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
+        return false;
+    }
+
+    if (dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     return true;
 }
 
@@ -4176,39 +4407,66 @@ static bool hexagon_validate_set_rows(ggml_backend_hexagon_context * ctx, const 
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
-    if (!src1 || (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64))
+    const ggml_tensor * dst  = op->src[2] ? op->src[2] : op;
+
+    if (dst->type == GGML_TYPE_Q8_0 && src0->ne[0] < 32) {
         return false;
+    }
+
     if (src0->type != GGML_TYPE_F32)
         return false;
-    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
+
+    if (!src1 || (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64))
         return false;
+
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_Q8_0)
+        return false;
+
     return true;
 }
 
 static bool hexagon_validate_sum_rows(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
-    if (op->src[0]->type != GGML_TYPE_F32)
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32)
         return false;
+    if (dst->type != GGML_TYPE_F32)
+        return false;
+
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst))
+        return false;
+
     return true;
 }
 
 static bool hexagon_validate_cont(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
+    // CONT is same-type only, supports f32 and f16
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16)
-        return false;
-    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
         return false;
     return true;
 }
 
 static bool hexagon_validate_concat(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
-    const ggml_tensor * src0 = op->src[0];
-    if (src0->type != op->type) return false;
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
-        src0->type != GGML_TYPE_I32 && src0->type != GGML_TYPE_I16)
+    int dim = ((const int32_t *) op->op_params)[0];
+    if (dim < 0 || dim >= GGML_MAX_DIMS) {
         return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = op->src[i];
+        if (!src) {
+            continue;
+        }
+        if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_I32 && src->type != GGML_TYPE_F16) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -4243,29 +4501,62 @@ static bool hexagon_validate_diag_mask_inf(ggml_backend_hexagon_context * ctx, c
 
 static bool hexagon_validate_cumsum(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
-    if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
         return false;
+
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst))
+        return false;
+
     return true;
 }
 
 static bool hexagon_validate_diag(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
-    if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
         return false;
+
+    // Input must have ne[1] == 1 (vector input)
+    if (src0->ne[1] != 1)
+        return false;
+
+    // Output must be square in first two dimensions
+    if (dst->ne[0] != dst->ne[1] || dst->ne[0] != src0->ne[0])
+        return false;
+
     return true;
 }
 
 static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
-    if (op->src[0]->type != GGML_TYPE_F32)
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32)
         return false;
+
+    if (dst->type != GGML_TYPE_I32)
+        return false;
+
+    if (src0->ne[0] > (16 * 1024))
+        return false;
+
     return true;
 }
 
 static bool hexagon_validate_pad(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
-    if (op->src[0]->type != GGML_TYPE_F32)
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)
         return false;
+
     return true;
 }
 
@@ -4354,8 +4645,14 @@ static bool hexagon_validate_solve_tri(ggml_backend_hexagon_context * ctx, const
 
 static bool hexagon_validate_tri(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
-    if (op->src[0]->type != GGML_TYPE_F32)
-        return false;
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * dst  = op;
+
+    if (src0->type != GGML_TYPE_F32) return false;
+    if (dst->type  != GGML_TYPE_F32) return false;
+    if (!ggml_are_same_shape(src0, dst)) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(dst)) return false;
+
     return true;
 }
 
@@ -4437,18 +4734,31 @@ static void init_op_validators(void) {
     s_op_validators[GGML_OP_SUB]            = hexagon_validate_binary_op;
     s_op_validators[GGML_OP_MUL]            = hexagon_validate_binary_op;
     s_op_validators[GGML_OP_DIV]            = hexagon_validate_binary_op;
+
     s_op_validators[GGML_OP_MUL_MAT]        = hexagon_validate_mul_mat;
+
+    // unary-family: NORM, L2_NORM, RMS_NORM, SCALE, CLAMP, LEAKY_RELU
+    // (mirrors the ggml_backend_hexagon_device_supports_op grouping)
+    s_op_validators[GGML_OP_NORM]           = ggml_hexagon_supported_unary;
+    s_op_validators[GGML_OP_L2_NORM]        = ggml_hexagon_supported_unary;
+    // RMS_NORM: stricter than ggml_hexagon_supported_unary – F32 only,
+    // accepts non-contiguous views (Qwen3Next per-head reshape).
     s_op_validators[GGML_OP_RMS_NORM]       = hexagon_validate_rms_norm;
-    s_op_validators[GGML_OP_NORM]           = hexagon_validate_norm_op;
-    s_op_validators[GGML_OP_L2_NORM]        = hexagon_validate_norm_op;
-    s_op_validators[GGML_OP_SQR]            = hexagon_validate_sqr_sqrt;
-    s_op_validators[GGML_OP_SQRT]           = hexagon_validate_sqr_sqrt;
-    s_op_validators[GGML_OP_LOG]            = hexagon_validate_sqr_sqrt;
+    s_op_validators[GGML_OP_SCALE]          = ggml_hexagon_supported_unary;
+    s_op_validators[GGML_OP_CLAMP]          = ggml_hexagon_supported_unary;
+    s_op_validators[GGML_OP_LEAKY_RELU]     = ggml_hexagon_supported_unary;
+
+    // unary-family: SQR, SQRT, LOG
+    s_op_validators[GGML_OP_SQR]            = ggml_hexagon_supported_unary;
+    s_op_validators[GGML_OP_SQRT]           = ggml_hexagon_supported_unary;
+    s_op_validators[GGML_OP_LOG]            = ggml_hexagon_supported_unary;
+
+    // GGML_OP_UNARY sub-ops (NEG, TANH, SIGMOID, EXP, SOFTPLUS, ABS, RELU, ...)
+    s_op_validators[GGML_OP_UNARY]          = ggml_hexagon_supported_unary;
+
     s_op_validators[GGML_OP_ROPE]           = hexagon_validate_rope;
     s_op_validators[GGML_OP_SOFT_MAX]       = hexagon_validate_soft_max;
-    s_op_validators[GGML_OP_UNARY]          = hexagon_validate_unary;
     s_op_validators[GGML_OP_GLU]            = hexagon_validate_glu;
-    s_op_validators[GGML_OP_SCALE]          = hexagon_validate_scale;
     s_op_validators[GGML_OP_CPY]            = hexagon_validate_cpy;
     s_op_validators[GGML_OP_GET_ROWS]       = hexagon_validate_get_rows;
     s_op_validators[GGML_OP_SET_ROWS]       = hexagon_validate_set_rows;
@@ -4473,6 +4783,10 @@ static void init_op_validators(void) {
 static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const struct ggml_tensor * op_tensor) {
     if (ggmlhexagon_is_metadata_op(op_tensor->op)) {
         return true;
+    }
+
+    if (!ggmlhexagon_op_is_enabled(op_tensor->op)) {
+        return false;
     }
 
     if (!ggmlhexagon_is_op_on_device(dev, op_tensor)) {
@@ -5322,7 +5636,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     };
 
     const uint64_t content_hash = compute_content_hash();
-    {
+    if (g_hexagon_appcfg.enable_graph_cache) {
         auto it = ctx->cgraph_cache.find(content_hash);
         if (it != ctx->cgraph_cache.end() &&
             it->second.n_nodes == cgraph->n_nodes &&
@@ -5333,6 +5647,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         } else {
             ctx->cgraph_cache_misses++;
         }
+    } else {
+        ctx->cgraph_cache_misses++;
     }
 
     // Bind to cached descriptors on hit, local vectors on miss. This avoids
@@ -5362,6 +5678,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         }
 
         if (supported_nodes.empty()) {
+            GGMLHEXAGON_LOG_ALWAYS("return result %d", result);
             return result;
         }
 
@@ -5490,12 +5807,26 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     //   HMX-eligible MUL_MATs are excluded: fusion redirects to HVX fused
     //   kernels, while HMX-eligible ops benefit more from the HMX pipeline.
     if (!cache_hit) {
-        // Count src usages of each tensor; fusable intermediates must have exactly one consumer
+        // Count src usages of each tensor from the FULL compute graph.
+        // Fusable intermediates must have exactly one consumer in the entire
+        // graph (not just DSP ops), otherwise fusion would break other consumers.
+        // Mirrors Qualcomm's ggml_node_has_n_uses() which scans the full cgraph.
         std::vector<int> src_use_count(n_tensors, 0);
-        for (const auto & op : hex_ops) {
-            for (int k = 0; k < HTP_OP_MAX_INPUTS; k++) {
-                if (op.src_idx[k] >= 0 && op.src_idx[k] < (int)n_tensors) {
-                    src_use_count[op.src_idx[k]]++;
+        {
+            std::unordered_map<const ggml_tensor *, int32_t> ptr_to_idx;
+            ptr_to_idx.reserve(n_tensors);
+            for (uint32_t i = 0; i < n_tensors; i++) {
+                ptr_to_idx[tensor_src[i]] = (int32_t)i;
+            }
+            for (int ni = 0; ni < cgraph->n_nodes; ni++) {
+                const ggml_tensor * node = cgraph->nodes[ni];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (node->src[s]) {
+                        auto it = ptr_to_idx.find(node->src[s]);
+                        if (it != ptr_to_idx.end()) {
+                            src_use_count[it->second]++;
+                        }
+                    }
                 }
             }
         }
@@ -5515,12 +5846,12 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         //   - dispatches via NPU execute_op, which provides
         //     op_matmul_nx as dedicated fused kernel (htp/matmul-ops.c).
         // htp_arch>=V73 is required because op_matmul_nx uses HMX instructions.
-        bool qkv_ffn_enabled = (ctx->socinfo.htp_arch >= V73 && g_hexagon_appcfg.enable_opfusion);
+        bool qkv_ffn_enabled = (ctx->socinfo.htp_arch >= V73 && is_opfusion_enabled(OPFUSE_QKV_FFN_NX));
         for (size_t i = 0; i < hex_ops.size(); i++) {
             hex_op_desc op = hex_ops[i];
 
             // RMS_NORM + MUL -> RMS_NORM_MUL
-            if (op.opcode == GGML_OP_RMS_NORM && i + 1 < hex_ops.size()) {
+            if (is_opfusion_enabled(OPFUSE_RMS_NORM_MUL) && op.opcode == GGML_OP_RMS_NORM && i + 1 < hex_ops.size()) {
                 const hex_op_desc & next = hex_ops[i + 1];
                 if (next.opcode == GGML_OP_MUL &&
                     next.src_idx[0] == op.dst_idx[0] &&
@@ -5685,12 +6016,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             // is immediately followed by residual ADD. Gemma uses post-norm
             // (MUL_MAT -> RMS_NORM -> MUL -> ADD), so this won't trigger there.
             //
-            // Bias (src2) is read from DDR, not VTCM, so the kparams from
-            // Phase 2 (MUL_MAT) are reusable. The VTCM budget check is
-            // defensive: if the matmul already saturates VTCM as a plain
-            // MUL_MAT, fusing into MUL_MAT_ADD cannot save anything; better
-            // to keep it as 2 separate ops than risk silent overflow.
-            if (op.opcode == GGML_OP_MUL_MAT && i + 1 < hex_ops.size()) {
+            // Gate: only fuse for HMX-eligible or single-row (decode).
+            // Multi-row HVX matmuls benefit less from fusing the bias add
+            // and the VTCM layout would need to accommodate src2.
+            if (is_opfusion_enabled(OPFUSE_MUL_MAT_ADD) && op.opcode == GGML_OP_MUL_MAT && i + 1 < hex_ops.size()) {
                 const hex_op_desc & next = hex_ops[i + 1];
                 if (next.opcode == GGML_OP_ADD &&
                     (next.src_idx[0] == op.dst_idx[0] || next.src_idx[1] == op.dst_idx[0])) {
@@ -5706,19 +6035,55 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                         if (bias_idx >= 0) {
                             const struct htp_mm_kernel_params * kparams_mm =
                                 (const struct htp_mm_kernel_params *) op.kernel_params;
-                            if ((size_t) kparams_mm->vtcm_size <= vtcm_budget) {
-                                op.htp_opcode = HTP_OP_MUL_MAT_ADD;
-                                op.src_idx[2]   = bias_idx;
-                                op.dst_idx[0]    = next.dst_idx[0];
-                                fused_ops.push_back(op);
-                                i++;
-                                n_mul_mat_add++;
-                                ctx->n_fused_mm_add_cum++;
-                                continue;
+
+                            const ggml_tensor * src1 = tensor_src[op.src_idx[1]];
+                            const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+                            bool can_fuse = (kparams_mm->n_hmx > 0) || (src1_nrows == 1);
+                            // HVX VTCM kernels add the bias slice at vtcm_src2 + start_row
+                            // with 128B-aligned loads: rows per thread must be a multiple of 32
+                            if (can_fuse && kparams_mm->n_hmx == 0 &&
+                                (kparams_mm->kernel_type == HTP_MM_KERNEL_HVX_F16_F16_VTCM ||
+                                 kparams_mm->kernel_type == HTP_MM_KERNEL_HVX_F32_F32_VTCM)) {
+                                const ggml_tensor * w = tensor_src[op.src_idx[0]];
+                                const uint32_t nrows_total = (uint32_t)(w->ne[1] * w->ne[2] * w->ne[3]);
+                                const uint32_t nth = (uint32_t)ctx->n_threads;
+                                uint32_t rpt = (nrows_total + nth - 1) / nth;
+                                rpt += (rpt & 1);
+                                if (rpt % 32 != 0) {
+                                    can_fuse = false;
+                                    GGMLHEXAGON_LOG_INFO("skip MUL_MAT_ADD fusion: rows/thread %u not 32-aligned (nth=%u), bias slice would be misaligned", rpt, nth);
+                                }
+                            }
+                            if (!can_fuse) {
+                                GGMLHEXAGON_LOG_DEBUG("[AP-FUSE-MM_ADD-SKIP-CANFUSE] src0='%s' src1='%s' "
+                                    "n_hmx=%u src1_nrows=%d kernel_type=%d",
+                                    tensor_src[op.src_idx[0]]->name,
+                                    tensor_src[op.src_idx[1]]->name,
+                                    kparams_mm->n_hmx, src1_nrows, kparams_mm->kernel_type);
+                                n_mm_add_skip_use_count++;
                             } else {
-                                GGMLHEXAGON_LOG_INFO("skip MUL_MAT_ADD fusion: VTCM needed (%d) > budget (%zu)",
-                                                      (int) kparams_mm->vtcm_size, vtcm_budget);
-                                n_mm_add_skip_vtcm++;
+                                // Keep Phase 2 kparams as-is: the DSP-side kernel builds its
+                                // own VTCM layout (including the fused bias slice) and only
+                                // uses kparams->vtcm_size for the reservation check. Rebuilding
+                                // the layout on the AP side regressed Llama-3.2-1B: the rebuilt
+                                // total adds the bias slice on top of an exactly-fitting Phase 2
+                                // total (8388608), the budget check then skipped the fusion, and
+                                // the already-overwritten kparams shipped with the unfused op,
+                                // which the DSP rejected with VTCM_TOO_SMALL (0x80000401).
+                                if ((size_t) kparams_mm->vtcm_size <= vtcm_budget) {
+                                    op.htp_opcode = HTP_OP_MUL_MAT_ADD;
+                                    op.src_idx[2]   = bias_idx;
+                                    op.dst_idx[0]    = next.dst_idx[0];
+                                    fused_ops.push_back(op);
+                                    i++;
+                                    n_mul_mat_add++;
+                                    ctx->n_fused_mm_add_cum++;
+                                    continue;
+                                } else {
+                                    GGMLHEXAGON_LOG_INFO("skip MUL_MAT_ADD fusion: VTCM needed (%d) > budget (%zu)",
+                                                           (int) kparams_mm->vtcm_size, vtcm_budget);
+                                    n_mm_add_skip_vtcm++;
+                                }
                             }
                         }
                     }
@@ -6172,7 +6537,26 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     int64_t t_p9_post = ggml_time_us();
 
     if (AEE_SUCCESS != hexagon_error) {
-        GGMLHEXAGON_LOG_WARN("ggml_htp_execute_batch failed: 0x%x", hexagon_error);
+        GGMLHEXAGON_LOG_ERROR("ggml_htp_execute_batch failed: 0x%x", hexagon_error);
+        // Dump every op of the failed batch: opcode, src/dst tensor indices,
+        // and for MUL_MAT the key kernel params (kernel_type, n_threads, n_hmx,
+        // vtcm carve-out) so fused vs unfused layouts can be compared.
+        for (size_t i = 0; i < hex_ops.size(); i++) {
+            const hex_op_desc & o = hex_ops[i];
+            if (o.opcode == GGML_OP_MUL_MAT) {
+                GGMLHEXAGON_LOG_INFO("failed-batch op[%zu/%zu] %s htp_op=%d src=[%d,%d,%d] dst=%d "
+                                     "ktype=%d nth=%d n_hmx=%d vtcm=%d (s0=%d s1=%d s2=%d s3=%d d=%d)",
+                                     i, hex_ops.size(), ggml_op_name((ggml_op)o.opcode), o.htp_opcode,
+                                     o.src_idx[0], o.src_idx[1], o.src_idx[2], o.dst_idx[0],
+                                     o.kernel_params[0], o.kernel_params[4], o.kernel_params[6],
+                                     o.kernel_params[11], o.kernel_params[12], o.kernel_params[13],
+                                     o.kernel_params[14], o.kernel_params[15], o.kernel_params[16]);
+            } else {
+                GGMLHEXAGON_LOG_INFO("failed-batch op[%zu/%zu] %s htp_op=%d src=[%d,%d,%d] dst=%d",
+                                     i, hex_ops.size(), ggml_op_name((ggml_op)o.opcode), o.htp_opcode,
+                                     o.src_idx[0], o.src_idx[1], o.src_idx[2], o.dst_idx[0]);
+            }
+        }
         result =  GGML_STATUS_FAILED;
     }
 
@@ -6715,17 +7099,38 @@ static void ggml_backend_hexagon_set_n_threads(ggml_backend_t backend, int n_thr
     GGML_ASSERT(ggml_backend_is_hexagon(backend));
 
     struct ggml_backend_hexagon_context * ctx = (struct ggml_backend_hexagon_context *)backend->context;
-    // Prefer NPU-reported cap (set in ggmlhexagon_init_dsp via setclocks
-    // out param, equals max_hw_threads - 2). Fall back to cfg value if
-    // set_n_threads is called before NPU init completes.
-    const int cap = (ctx->dsp_thread_counts > 0) ? ctx->dsp_thread_counts : g_hexagon_appcfg.thread_counts;
+    // Safe cap reported by the NPU at init (max_hw_threads - 2). Fall back to
+    // cfg value if set_n_threads is called before NPU init completes.
+    const int cap = (ctx->dsp_thread_counts_max > 0) ? ctx->dsp_thread_counts_max : g_hexagon_appcfg.thread_counts;
     int new_threads = (n_threads < cap) ? n_threads : cap;
     if (new_threads != ctx->n_threads) {
-        ctx->n_threads = new_threads;
-        // VTCM partitioning depends on thread count. Cached mm params and cached
-        // graph descriptors both embed it, so drop both.
-        ctx->mm_params_cache.clear();
-        ctx->cgraph_cache.clear();
+        // The DSP partitions work (per-thread VTCM slices, row ranges) with its
+        // own worker count, while kparams (VTCM layout, fusion eligibility)
+        // are precomputed on AP with ctx->n_threads. The two must match:
+        // a mismatch left the fused MUL_MAT+ADD bias slice misaligned on DSP
+        // while AP considered it aligned. setclocks re-creates the DSP work
+        // queue and is safe to re-call between graph computes.
+        if (ctx->ggmlop_handle && ctx->dsp_thread_counts > 0 && new_threads != ctx->dsp_thread_counts) {
+            int32_t actual = 0;
+            int rc = ggml_htp_setclocks(ctx->ggmlop_handle, g_hexagon_appcfg.dump_diag_info, new_threads, &actual);
+            if (AEE_SUCCESS == rc && actual > 0) {
+                ctx->dsp_thread_counts = actual;
+                g_hexagon_appcfg.thread_counts = actual;
+                new_threads = actual;
+                GGMLHEXAGON_LOG_INFO("set_n_threads: DSP worker count synced to %d", actual);
+            } else {
+                GGMLHEXAGON_LOG_WARN("set_n_threads: DSP sync failed (0x%x), keeping AP threads at DSP value %d",
+                                     rc, ctx->dsp_thread_counts);
+                new_threads = ctx->dsp_thread_counts;
+            }
+        }
+        if (new_threads != ctx->n_threads) {
+            ctx->n_threads = new_threads;
+            // VTCM partitioning depends on thread count. Cached mm params and cached
+            // graph descriptors both embed it, so drop both.
+            ctx->mm_params_cache.clear();
+            ctx->cgraph_cache.clear();
+        }
     }
 }
 

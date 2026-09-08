@@ -164,6 +164,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_UNARY_TANH:      return "UNARY_TANH";
         case HTP_OP_UNARY_ABS:       return "UNARY_ABS";
         case HTP_OP_UNARY_LOG:       return "UNARY_LOG";
+        case HTP_OP_UNARY_RELU:      return "UNARY_RELU";
         case HTP_OP_UNARY_SILU:      return "UNARY_SILU";
         case HTP_OP_UNARY_GELU:      return "UNARY_GELU";
         case HTP_OP_GLU_SWIGLU:      return "GLU_SWIGLU";
@@ -186,6 +187,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_PAD:             return "PAD";
         case HTP_OP_CONCAT:          return "CONCAT";
         case HTP_OP_CLAMP:           return "CLAMP";
+        case HTP_OP_LEAKY_RELU:      return "LEAKY_RELU";
         case HTP_OP_IM2COL:          return "IM2COL";
         case HTP_OP_GATED_DELTA_NET: return "GATED_DELTA_NET";
         case HTP_OP_TRI:             return "TRI";
@@ -765,12 +767,14 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_MUL_MAT]         = op_matmul,
     [HTP_OP_MUL_MAT_ID]      = op_matmul_id,
     [HTP_OP_MUL_MAT_NX]      = op_matmul_nx,
-    [HTP_OP_MUL_MAT_ID_NX]  = op_matmul_id_nx,
+    [HTP_OP_MUL_MAT_ID_NX]   = op_matmul_id_nx,
     [HTP_OP_MUL_MAT_ADD]     = op_matmul,
     [HTP_OP_NORM]            = op_unary,
     [HTP_OP_RMS_NORM]        = op_unary,
     [HTP_OP_RMS_NORM_MUL]    = op_unary,
     [HTP_OP_SCALE]           = op_unary,
+    [HTP_OP_CLAMP]           = op_unary,
+    [HTP_OP_LEAKY_RELU]      = op_unary,
     [HTP_OP_SQR]             = op_unary,
     [HTP_OP_SQRT]            = op_unary,
     [HTP_OP_UNARY_SOFTPLUS]  = op_unary,
@@ -780,11 +784,13 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_UNARY_TANH]      = op_unary,
     [HTP_OP_UNARY_ABS]       = op_unary,
     [HTP_OP_UNARY_LOG]       = op_unary,
+    [HTP_OP_UNARY_RELU]      = op_unary,
     [HTP_OP_L2_NORM]         = op_unary,
     [HTP_OP_UNARY_SILU]      = op_unary,
     [HTP_OP_UNARY_GELU]      = op_unary,
     [HTP_OP_GLU_SWIGLU]      = op_activations,
     [HTP_OP_GLU_SWIGLU_OAI]  = op_activations,
+    [HTP_OP_GLU_SWIGLU_CLAMP] = op_activations,
     [HTP_OP_GLU_GEGLU]       = op_activations,
     [HTP_OP_SOFTMAX]         = op_softmax,
     [HTP_OP_ADD_ID]          = op_binary,
@@ -915,6 +921,8 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_SQR:     *htp_op = HTP_OP_SQR;         return 0;
         case GGML_OP_SQRT:    *htp_op = HTP_OP_SQRT;        return 0;
         case GGML_OP_LOG:     *htp_op = HTP_OP_UNARY_LOG;   return 0;
+        case GGML_OP_CLAMP:   *htp_op = HTP_OP_CLAMP;       return 0;
+        case GGML_OP_LEAKY_RELU: *htp_op = HTP_OP_LEAKY_RELU; return 0;
         case GGML_OP_ARGSORT: *htp_op = HTP_OP_ARGSORT;     return 0;
         case GGML_OP_PAD:     *htp_op = HTP_OP_PAD;         return 0;
         case GGML_OP_IM2COL:  *htp_op = HTP_OP_IM2COL;      return 0;
@@ -939,6 +947,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
                 case GGML_UNARY_OP_EXP:       *htp_op = HTP_OP_UNARY_EXP;      return 0;
                 case GGML_UNARY_OP_SOFTPLUS: *htp_op = HTP_OP_UNARY_SOFTPLUS; return 0;
                 case GGML_UNARY_OP_ABS:      *htp_op = HTP_OP_UNARY_ABS;      return 0;
+                case GGML_UNARY_OP_RELU:     *htp_op = HTP_OP_UNARY_RELU;     return 0;
                 default:
                     FARF(ERROR, "ggml_op_to_htp_op: unsupported unary_op %d", op_params[0]);
                     return -1;
@@ -950,9 +959,10 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
                 return -1;
             }
             switch (op_params[0]) {
-                case GGML_GLU_OP_SWIGLU:     *htp_op = HTP_OP_GLU_SWIGLU;     return 0;
-                case GGML_GLU_OP_SWIGLU_OAI: *htp_op = HTP_OP_GLU_SWIGLU_OAI; return 0;
-                case GGML_GLU_OP_GEGLU:      *htp_op = HTP_OP_GLU_GEGLU;      return 0;
+                case GGML_GLU_OP_SWIGLU:      *htp_op = HTP_OP_GLU_SWIGLU;      return 0;
+                case GGML_GLU_OP_SWIGLU_OAI:  *htp_op = HTP_OP_GLU_SWIGLU_OAI;  return 0;
+                case GGML_GLU_OP_SWIGLU_CLAMP: *htp_op = HTP_OP_GLU_SWIGLU_CLAMP; return 0;
+                case GGML_GLU_OP_GEGLU:       *htp_op = HTP_OP_GLU_GEGLU;       return 0;
                 default:
                     FARF(ERROR, "ggml_op_to_htp_op: unsupported glu_op %d", op_params[0]);
                     return -1;
@@ -1040,6 +1050,9 @@ static bool build_mm_hmx_params(struct htp_ops_context * octx,
 
     // Eligibility (mirrors ggml_hexagon_matmul_is_hmx_eligible)
     if (ne01_padded % 32 != 0) return false;
+    // HMX kernel requires raw src0->ne[1] to be 32-aligned
+    // (ne01_padded is always 32-aligned for repack types, so it alone is insufficient)
+    if (ne01 % 32 != 0) return false;
     if (ne00 % 32 != 0) return false;
     if (is_batched && wtype != HTP_TYPE_F16) return false;
     if (src0->nb[0] > src0->nb[1] || src1->nb[0] > src1->nb[1]) return false;
