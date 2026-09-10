@@ -1023,6 +1023,8 @@ function prepare_run_on_phone()
     adb shell "rm -f /data/local/tmp/${program}.farf"
     adb shell "touch /data/local/tmp/${program}.farf"
     adb shell "echo 0x1c > /data/local/tmp/${program}.farf"
+    #observe cDSP's log
+    #adb logcat  | grep "CDSP0"
 }
 
 
@@ -1763,6 +1765,8 @@ function show_usage_for_developer()
     echo "      $0 run_ubatchtest                          # gemma4-e2b + 8/16/22/32/64/128/512/1024"
     echo "      $0 run_ubatchtest qwen3-2b                 # qwen3-2b   + 8/16/22/32/64/128/512/1024"
     echo "      $0 run_ubatchtest gemma4-e4b               # gemma4-e4b + 8/16/22/32/64/128/512/1024"
+    echo "      $0 run_ubatchtest spark-1b                 # spark-1b + 8/16/22/32/64/128/512/1024"
+    echo "      $0 run_ubatchtest spark-4b                 # spark-4b + 8/16/22/32/64/128/512/1024"
     echo "    Log capture example:"
     echo "      $0 run_ubatchtest 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"

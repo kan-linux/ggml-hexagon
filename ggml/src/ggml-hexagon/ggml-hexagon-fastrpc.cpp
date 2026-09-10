@@ -579,8 +579,8 @@ static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * c
     ggmlhexagon_get_timestring(timestamp);
     GGMLHEXAGON_LOG_VERBOSE("rpc_mmap_mode:                    %d", g_hexagon_appcfg.rpc_mmap_mode);
     GGMLHEXAGON_LOG_VERBOSE("dsp_cache_mode:                   %d", g_hexagon_appcfg.dsp_cache_mode);
-    GGMLHEXAGON_LOG_ALWAYS("dsp_cache_trace_bit0:              %d", g_hexagon_appcfg.dsp_cache_trace_bit0);
-    GGMLHEXAGON_LOG_ALWAYS("dsp_cache_trace_bit1:              %d", g_hexagon_appcfg.dsp_cache_trace_bit1);
+    GGMLHEXAGON_LOG_ALWAYS("dsp_cache_trace_bit0:             %d", g_hexagon_appcfg.dsp_cache_trace_bit0);
+    GGMLHEXAGON_LOG_ALWAYS("dsp_cache_trace_bit1:             %d", g_hexagon_appcfg.dsp_cache_trace_bit1);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(NPU):              %d", g_hexagon_appcfg.dump_diag_info);
     GGMLHEXAGON_LOG_VERBOSE("dump diag info(AP):               %d", g_hexagon_appcfg.dump_debug_info);
     GGMLHEXAGON_LOG_VERBOSE("enable graph_optimize:            %d", g_hexagon_appcfg.enable_graph_optimize);
@@ -652,6 +652,56 @@ static bool ggmlhexagon_op_is_enabled(enum ggml_op op) {
         pos = end + 1;
     }
     return false;
+}
+
+static void ggmlhexagon_set_runtime_path(const std::string & path) {
+#if defined(__ANDROID__)
+    // Android: LD_LIBRARY_PATH uses ':' as separator
+    std::string lib_runtime_path = path + ":/vendor/dsp/cdsp:/vendor/lib64:/vendor/dsp/dsp:/vendor/dsp/images";
+    if (0 == setenv("LD_LIBRARY_PATH", lib_runtime_path.c_str(), 1)) {
+        GGMLHEXAGON_LOG_DEBUG("setenv LD_LIBRARY_PATH %s successfully", lib_runtime_path.c_str());
+    } else {
+        GGMLHEXAGON_LOG_ERROR("setenv LD_LIBRARY_PATH %s failure", lib_runtime_path.c_str());
+    }
+
+    // ADSP_LIBRARY_PATH uses ';' as separator on all platforms
+    std::string adsp_runtime_path = path + ";/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/vendor/dsp/dsp;/vendor/dsp/images;/dsp";
+    if (0 == setenv("ADSP_LIBRARY_PATH", adsp_runtime_path.c_str(), 1)) {
+        GGMLHEXAGON_LOG_DEBUG("setenv ADSP_LIBRARY_PATH %s successfully", adsp_runtime_path.c_str());
+    } else {
+        GGMLHEXAGON_LOG_ERROR("setenv ADSP_LIBRARY_PATH %s failure", adsp_runtime_path.c_str());
+    }
+#elif defined(__linux__)
+    // Linux: LD_LIBRARY_PATH uses ':' as separator
+    std::string lib_runtime_path = path + ":/usr/local/lib:/usr/lib";
+    if (0 == setenv("LD_LIBRARY_PATH", lib_runtime_path.c_str(), 1)) {
+        GGMLHEXAGON_LOG_DEBUG("setenv LD_LIBRARY_PATH %s successfully", lib_runtime_path.c_str());
+    } else {
+        GGMLHEXAGON_LOG_ERROR("setenv LD_LIBRARY_PATH %s failure", lib_runtime_path.c_str());
+    }
+
+    std::string adsp_runtime_path = path + ";/usr/local/lib;/usr/lib";
+    if (0 == setenv("ADSP_LIBRARY_PATH", adsp_runtime_path.c_str(), 1)) {
+        GGMLHEXAGON_LOG_DEBUG("setenv ADSP_LIBRARY_PATH %s successfully", adsp_runtime_path.c_str());
+    } else {
+        GGMLHEXAGON_LOG_ERROR("setenv ADSP_LIBRARY_PATH %s failure", adsp_runtime_path.c_str());
+    }
+#elif defined(_WIN32)
+    // WoA: PATH uses ';' as separator
+    std::string lib_runtime_path = path + ";C:\\Windows\\System32;C:\\Windows\\SysWOW64";
+    if (0 == _putenv_s("PATH", lib_runtime_path.c_str())) {
+        GGMLHEXAGON_LOG_DEBUG("setenv PATH %s successfully", lib_runtime_path.c_str());
+    } else {
+        GGMLHEXAGON_LOG_ERROR("setenv PATH %s failure", lib_runtime_path.c_str());
+    }
+
+    std::string adsp_runtime_path = path + ";C:\\Windows\\System32";
+    if (0 == _putenv_s("ADSP_LIBRARY_PATH", adsp_runtime_path.c_str())) {
+        GGMLHEXAGON_LOG_DEBUG("setenv ADSP_LIBRARY_PATH %s successfully", adsp_runtime_path.c_str());
+    } else {
+        GGMLHEXAGON_LOG_ERROR("setenv ADSP_LIBRARY_PATH %s failure", adsp_runtime_path.c_str());
+    }
+#endif
 }
 
 // =================================================================================================
@@ -831,6 +881,7 @@ static void ggmlhexagon_load_cfg() {
 #endif
     std::string cfg_filename = (cfg_dir / std::string(g_hexagon_appcfg.cfgfilename)).string();
     GGMLHEXAGON_LOG_ALWAYS("cfg_filename:%s", cfg_filename.c_str());
+    ggmlhexagon_set_runtime_path(cfg_dir.string());
 
     hexagon_appcfg hexagoncfg_instance;
     bool cfg_loaded = hexagoncfg_instance.load(cfg_filename);
@@ -968,7 +1019,6 @@ static void ggmlhexagon_load_cfg() {
                                }
                                return s;
                            }().c_str());
-
     initialized = true;
 }
 
@@ -6120,7 +6170,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                                 rpt += (rpt & 1);
                                 if (rpt % 32 != 0) {
                                     can_fuse = false;
-                                    GGMLHEXAGON_LOG_INFO("skip MUL_MAT_ADD fusion: rows/thread %u not 32-aligned (nth=%u), bias slice would be misaligned", rpt, nth);
+                                    GGMLHEXAGON_LOG_ALWAYS("skip MUL_MAT_ADD fusion: rows/thread %u not 32-aligned (nth=%u), bias slice would be misaligned", rpt, nth);
                                 }
                             }
                             if (!can_fuse) {
@@ -6253,6 +6303,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
     // ---- Phase 5: handle heap tensors -> mirror into mempool ----
     int64_t t_prev = ggml_time_us();
+    if (g_hexagon_appcfg.dump_debug_info) {
+        GGMLHEXAGON_LOG_ALWAYS("[AP-DIAG-ENTRY] batch_call=%llu n_tensors=%u n_ops=%zu",
+            (unsigned long long)ctx->rpc_batch_call_count, n_tensors, hex_ops.size());
+    }
     // Three-step approach:
     //   Step 1: Collect unique data pointers and compute max mirror size per buffer
     //   Step 2: Allocate one mirror per unique buffer (not per tensor)
@@ -6260,11 +6314,12 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // This ensures: (a) shared buffers get one mirror with max size,
     //               (b) each tensor descriptor gets correct ne/nb.
     //
-    // Mirrors are keyed by unique data pointer only; no separate mirror is
-    // allocated for in-place ops. Tensors sharing a pointer (e.g. in-place
-    // op src0 and dst) share one mirror: NPU reads and writes the same
-    // region, so in-place semantics hold. Phase 10 copy-back covers the
-    // full mirror, keeping the heap copy coherent.
+    // Mirrors are keyed by the root parent's data pointer (following the
+    // view_src chain). View tensors with non-zero view_offs share their
+    // parent's mirror: the per-tensor data_offset is parent_mirror_offset +
+    // view_offs. This prevents stale data when a producer op (e.g. MUL_MAT)
+    // writes to the parent mirror and a consumer op (e.g. ROPE) reads via a
+    // view with a non-zero offset.
     struct ion_mirror {
         int32_t  tensor_idx;
         void *   original_data;
@@ -6278,6 +6333,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         uint32_t mirror_offset;
         uint32_t max_data_len;
         bool     allocated;
+        bool     is_f32;
     };
     std::unordered_map<void *, buffer_mirror_info> buffer_mirrors_map;
 
@@ -6290,23 +6346,34 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             continue;  // already in mempool
         }
 
-        uint32_t t_size = (uint32_t)ggml_nbytes(t);
-        // Defensive: set_tensor only repacks weights living inside the pool, so a
-        // heap-resident quantized weight keeps raw layout in practice (the scheduler
-        // routes those ops to the CPU backend). Should one arrive pre-repacked,
-        // mirror its full repacked extent; Phase 6 flags it via warned_non_repack.
-        bool is_quant_weight = is_weight[tidx] && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16;
+        // Find root parent: view tensors with non-zero view_offs must share
+        // their parent's mirror so that producer writes (to parent mirror) are
+        // visible to consumer reads (via view mirror at parent+offset).
+        ggml_tensor * root = t;
+        while (root->view_src) {
+            root = root->view_src;
+        }
+        void * mirror_key = root->data;
+        if (!mirror_key) continue;
+
+        // If root parent lives in the mempool, the view is also in-pool
+        // (view data = root data + view_offs, both within pool bounds).
+        const char * root_ptr = (const char *)mirror_key;
+        if (root_ptr >= pool_base && root_ptr < pool_base + (ptrdiff_t)pool_size) {
+            continue;
+        }
+
+        // Size mirror to cover root parent's full allocation so that all
+        // views (at various offsets) fit within the same mirror region.
+        uint32_t t_size = (uint32_t)ggml_nbytes(root);
+        bool is_quant_weight = is_weight[tidx] && root->type != GGML_TYPE_F32 && root->type != GGML_TYPE_F16 && root->type != GGML_TYPE_BF16;
         if (is_quant_weight) {
-            size_t repacked = ggml_hexagon_repacked_size(t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+            size_t repacked = ggml_hexagon_repacked_size(root->type, root->ne[0], root->ne[1], root->ne[2], root->ne[3]);
             if (repacked > 0) t_size = (uint32_t)repacked;
         }
-        // Tensors sharing a data pointer are views of the same parent ggml
-        // buffer, so reading/writing the largest view's extent never crosses
-        // the parent allocation. This invariant underpins the shared-mirror
-        // sizing here and the max-len copy-back in Phase 10.
-        auto it = buffer_mirrors_map.find(t->data);
+        auto it = buffer_mirrors_map.find(mirror_key);
         if (it == buffer_mirrors_map.end()) {
-            buffer_mirrors_map[t->data] = {0, t_size, false};
+            buffer_mirrors_map[mirror_key] = {0, t_size, false, root->type == GGML_TYPE_F32};
         } else if (t_size > it->second.max_data_len) {
             it->second.max_data_len = t_size;
         }
@@ -6347,6 +6414,20 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         info.mirror_offset = moff;
         info.allocated = true;
 
+        // copy-in integrity: NaN in source heap data, or mirror != source after memcpy
+        if (g_hexagon_appcfg.dump_debug_info && info.is_f32 && mirror_size >= 16) {
+            const float * s4 = (const float *)data_ptr;
+            if (s4[0] != s4[0] || s4[1] != s4[1] || s4[2] != s4[2] || s4[3] != s4[3]) {
+                GGMLHEXAGON_LOG_ALWAYS("[AP-DIAG-P2D-SRC-NAN] root=%p -> mpool=0x%x size=%zu src_first4=[%.4f, %.4f, %.4f, %.4f]",
+                    data_ptr, moff, mirror_size, s4[0], s4[1], s4[2], s4[3]);
+            }
+            if (memcmp(data_ptr, ion_buf, 16) != 0) {
+                const float * m4 = (const float *)ion_buf;
+                GGMLHEXAGON_LOG_ALWAYS("[AP-DIAG-P2D-MISMATCH] root=%p -> mpool=0x%x size=%zu src=[%.4f, %.4f] mirror=[%.4f, %.4f]",
+                    data_ptr, moff, mirror_size, s4[0], s4[1], m4[0], m4[1]);
+            }
+        }
+
         GGMLHEXAGON_LOG_DEBUG("mempool-batch: mirror buffer %p -> mempool offset=0x%x (%u bytes)",
                               data_ptr, moff, info.max_data_len);
     }
@@ -6362,12 +6443,25 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             continue;  // already in mempool
         }
 
-        auto it = buffer_mirrors_map.find(t->data);
+        // Find root parent to locate the shared mirror
+        ggml_tensor * root = t;
+        while (root->view_src) {
+            root = root->view_src;
+        }
+        void * mirror_key = root->data;
+        if (!mirror_key) continue;
+
+        const char * root_ptr = (const char *)mirror_key;
+        if (root_ptr >= pool_base && root_ptr < pool_base + (ptrdiff_t)pool_size) {
+            continue;  // root in mempool, view is also in mempool
+        }
+
+        auto it = buffer_mirrors_map.find(mirror_key);
         if (it == buffer_mirrors_map.end() || !it->second.allocated) {
             GGMLHEXAGON_LOG_ERROR("mempool-batch: Step3 SKIP tensor[%d/%d] '%s' data=%p"
-                " op=%d ne=[%lld,%lld,%lld,%lld] type=%d in_map=%d allocated=%d map_size=%zu",
+                " root=%p op=%d ne=[%lld,%lld,%lld,%lld] type=%d in_map=%d allocated=%d map_size=%zu",
                 tidx, (int)n_tensors, (t->name[0] != 0) ? t->name : "?",
-                t->data, (int)t->op,
+                t->data, (void*)root, (int)t->op,
                 (long long)t->ne[0], (long long)t->ne[1],
                 (long long)t->ne[2], (long long)t->ne[3],
                 (int)t->type,
@@ -6377,13 +6471,16 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             continue;
         }
 
-        local_mirror_offset[tidx] = it->second.mirror_offset;
+        // For view tensors, data_offset must point to root_mirror_offset +
+        // view_offs so the NPU reads the view's data, not the root's start.
+        uint32_t tensor_mirror_offset = it->second.mirror_offset + (uint32_t)t->view_offs;
+        local_mirror_offset[tidx] = tensor_mirror_offset;
 
         ion_mirror m;
         m.tensor_idx    = tidx;
         m.original_data = t->data;
-        m.mirror_offset = it->second.mirror_offset;
-        m.data_len      = it->second.max_data_len;  // use full allocated (possibly repacked) size for flush/copy-back
+        m.mirror_offset = tensor_mirror_offset;
+        m.data_len      = (uint32_t)ggml_nbytes(t);
         mirrors.push_back(m);
     }
 
@@ -6564,6 +6661,13 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 td->flags = 2;  // weight (skip NPU first-touch invalidation)
             }
         }
+
+        if (g_hexagon_appcfg.dump_debug_info) {
+            GGMLHEXAGON_LOG_ALWAYS("[AP-DIAG-TMAP] t[%u] '%s' data=%p mpool_off=0x%x flags=%d ne=[%lld,%lld,%lld,%lld] type=%d len=%u",
+                i, (t->name[0] != 0) ? t->name : "?", t->data, td->data_offset, td->flags,
+                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                (int)t->type, td->data_len);
+        }
     }
 
     GGMLHEXAGON_LOG_DEBUG("mempool-batch: submitted offset=0x%x size=%u (%u ops, %u tensors)", batch_offset, total_desc_size, n_ops, n_tensors);
@@ -6643,27 +6747,71 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     ctx->rpc_mempool_usage = saved_mempool_usage;
 
     // ---- Phase 10: copy-back mirrored results to heap ----
+    // Only copy back tensors that are actual NPU outputs (destinations of ops).
+    // Input-only / weight mirrors must NOT be copied back: when two tensors
+    // share the same heap address (ggml buffer reuse), copying back an input
+    // mirror overwrites the NPU-computed result → garbled output.
     if (hexagon_error == AEE_SUCCESS && !mirrors.empty()) {
-        // One copy-back per unique pointer, sized to the largest sharing view.
-        // Safe under the same-parent-buffer invariant noted in Phase 5 Step 1:
-        // aliases beyond the NPU-written range hold bytes identical to the heap
-        // copy, so rewriting them is a no-op.
-        std::unordered_map<void *, std::pair<uint32_t, uint32_t>> copyback_map;
+        // Build set of NPU output tensor indices (dst_idx[0] of every op).
+        std::unordered_set<uint32_t> npu_output_tensors;
+        npu_output_tensors.reserve(hex_ops.size());
+        for (const auto & op : hex_ops) {
+            uint32_t didx = op.dst_idx[0];
+            if (didx < n_tensors) {
+                npu_output_tensors.insert(didx);
+            }
+        }
+
+        // For each heap address, keep only NPU-output mirrors.
+        // Key: orig_data -> {mirror_offset, data_len, tensor_idx}
+        struct copyback_entry {
+            uint32_t moff;
+            uint32_t len;
+            uint32_t tidx;
+        };
+        std::unordered_map<void *, copyback_entry> copyback_map;
         for (const auto & m : mirrors) {
+            // Skip non-output tensors: weight or input-only mirrors
+            if (!npu_output_tensors.count(m.tensor_idx)) continue;
+
             auto it = copyback_map.find(m.original_data);
             if (it == copyback_map.end()) {
-                copyback_map[m.original_data] = {m.mirror_offset, m.data_len};
+                copyback_map[m.original_data] = {m.mirror_offset, m.data_len, static_cast<uint32_t>(m.tensor_idx)};
             } else {
-                if (m.data_len > it->second.second) {
-                    it->second.second = m.data_len;
+                // Multiple outputs share same heap address: keep largest
+                if (m.data_len > it->second.len) {
+                    it->second = {m.mirror_offset, m.data_len, static_cast<uint32_t>(m.tensor_idx)};
                 }
             }
         }
+
         for (const auto & kv : copyback_map) {
-            void * orig_data = kv.first;
-            uint32_t moff = kv.second.first;
-            uint32_t max_len = kv.second.second;
-            memmove(orig_data, (const char *)ctx->rpc_mempool + moff, max_len);
+            void *  orig_data = kv.first;
+            uint32_t moff    = kv.second.moff;
+            uint32_t max_len = kv.second.len;
+            uint32_t tidx    = kv.second.tidx;
+
+            if (g_hexagon_appcfg.dump_debug_info && max_len >= 16 &&
+                tidx < n_tensors && tensor_src[tidx]->type == GGML_TYPE_F32) {
+                const float * f4 = (const float *)((const char *)ctx->rpc_mempool + moff);
+                GGMLHEXAGON_LOG_ALWAYS("[AP-DIAG-D2P] mpool=0x%x -> heap=%p tidx=%u len=%u first4=[%.4f, %.4f, %.4f, %.4f]",
+                    moff, orig_data, tidx, max_len, f4[0], f4[1], f4[2], f4[3]);
+            }
+
+            // NaN guard: skip copyback if mirror contains NaN
+            bool skip_copyback = false;
+            if (max_len >= 16) {
+                const float * f4 = (const float *)((const char *)ctx->rpc_mempool + moff);
+                bool has_nan = (f4[0] != f4[0] || f4[1] != f4[1] || f4[2] != f4[2] || f4[3] != f4[3]);
+                if (has_nan) {
+                    GGMLHEXAGON_LOG_ALWAYS("P10 NaN-guard: mpool=0x%x -> heap=%p len=%u SKIPPING",
+                        moff, orig_data, max_len);
+                    skip_copyback = true;
+                }
+            }
+            if (!skip_copyback) {
+                memmove(orig_data, (const char *)ctx->rpc_mempool + moff, max_len);
+            }
         }
     }
 
