@@ -364,6 +364,8 @@ function build_arm64
     # clear dspqueue skels left by a prior build_dspqueue, else detect_build_type()
     # misreports hexagon-dspqueue
     rm -f ${LOCAL_BUILD_DIR}/ggml/src/ggml-hexagon/libggml-htp-*.so
+    # clear stale fastrpc skels from bin/ so build can regenerate them
+    rm -f ${LOCAL_BUILD_DIR}/bin/libggml-htp-v*.so
 
     #ARMv8.7a+i8mm CPU tuning flags, moved here from CMakeLists.txt to keep it aligned with upstream master
     local arm_cpu_flags="-march=armv8.7a+fp16+dotprod+i8mm -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE"
@@ -899,7 +901,8 @@ function update_cpu_libs()
 function detect_build_type()
 {
     if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so ]; then
-        if ls ${LOCAL_BUILD_DIR}/bin/libggml-htp-*.so 1>/dev/null 2>&1; then
+        # both variants produce libggml-htp-vXX.so; the differentiator is which RPC handle the AP lib references
+        if grep -q "ggml_htp_skel_handle_invoke" ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so 2>/dev/null; then
             echo "hexagon-fastrpc"
         else
             echo "hexagon-dspqueue"

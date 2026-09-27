@@ -139,4 +139,8 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 ## Introducing FastRPC-based ggml-hexagon
 
-Pls refer to https://github.com/ggml-hexagon
+Pls refer to [Introducing FastRPC-based ggml-hexagon](https://github.com/kan-linux/ggml-hexagon/discussions/84)
+
+## Sync Policy with Upstream
+Since upstream llama.cpp updates rapidly, this project synchronizes with upstream every weekend (Saturday or Sunday) barring unexpected issues.
+
