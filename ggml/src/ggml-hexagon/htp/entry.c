@@ -790,6 +790,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_UNARY_ABS]       = op_unary,
     [HTP_OP_UNARY_LOG]       = op_unary,
     [HTP_OP_UNARY_RELU]      = op_unary,
+    [HTP_OP_UNARY_STEP]      = op_unary,
     [HTP_OP_L2_NORM]         = op_unary,
     [HTP_OP_UNARY_SILU]      = op_unary,
     [HTP_OP_UNARY_GELU]      = op_unary,
@@ -804,11 +805,13 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_FLASH_ATTN_EXT]  = op_flash_attn_ext,
     [HTP_OP_SET_ROWS]        = op_set_rows,
     [HTP_OP_GET_ROWS]        = op_get_rows,
+    [HTP_OP_SUM]             = op_sum,
     [HTP_OP_SUM_ROWS]        = op_sum_rows,
     [HTP_OP_CPY]             = op_cpy,
     [HTP_OP_REPEAT]          = op_repeat,
     [HTP_OP_ARGSORT]         = op_argsort,
     [HTP_OP_TOP_K]           = op_top_k,
+    [HTP_OP_ARGMAX]          = op_argmax,
     [HTP_OP_SSM_CONV]        = op_ssm_conv,
     [HTP_OP_CUMSUM]          = op_cumsum,
     [HTP_OP_FILL]            = op_fill,
@@ -920,6 +923,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_CPY:     *htp_op = HTP_OP_CPY;         return 0;
         case GGML_OP_GET_ROWS: *htp_op = HTP_OP_GET_ROWS;   return 0;
         case GGML_OP_SET_ROWS: *htp_op = HTP_OP_SET_ROWS;   return 0;
+        case GGML_OP_SUM:     *htp_op = HTP_OP_SUM;         return 0;
         case GGML_OP_SUM_ROWS: *htp_op = HTP_OP_SUM_ROWS;   return 0;
         case GGML_OP_SSM_CONV: *htp_op = HTP_OP_SSM_CONV;   return 0;
         case GGML_OP_CONT:    *htp_op = HTP_OP_CPY;         return 0;
@@ -957,6 +961,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
                 case GGML_UNARY_OP_SOFTPLUS: *htp_op = HTP_OP_UNARY_SOFTPLUS; return 0;
                 case GGML_UNARY_OP_ABS:      *htp_op = HTP_OP_UNARY_ABS;      return 0;
                 case GGML_UNARY_OP_RELU:     *htp_op = HTP_OP_UNARY_RELU;     return 0;
+                case GGML_UNARY_OP_STEP:     *htp_op = HTP_OP_UNARY_STEP;     return 0;
                 default:
                     FARF(ERROR, "ggml_op_to_htp_op: unsupported unary_op %d", op_params[0]);
                     return -1;
@@ -979,6 +984,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
             }
         }
         case GGML_OP_TOP_K:    *htp_op = HTP_OP_TOP_K;        return 0;
+        case GGML_OP_ARGMAX:   *htp_op = HTP_OP_ARGMAX;       return 0;
         default:
             FARF(ERROR, "ggml_op_to_htp_op: unsupported ggml_op %d", ggml_op);
             return -1;
