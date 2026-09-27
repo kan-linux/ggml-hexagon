@@ -98,7 +98,7 @@
 
 #define SIZE_IN_MB                                      (1 << 20)
 
-#define GGML_HEXAGON_VERSION                            "0.4.9"
+#define GGML_HEXAGON_VERSION                            "0.5.0"
 
 // Forward declarations
 static bool                  ggmlhexagon_is_op_on_device(ggml_backend_dev_t dev, const ggml_tensor * op);
@@ -3369,58 +3369,60 @@ static void ggml_hexagon_precompute_get_rows_params(
 ) {
     memset(kparams, 0, sizeof(*kparams));
 
-    const uint32_t ne00 = (uint32_t)src0->ne[0];
-    const uint32_t ne02 = (uint32_t)src0->ne[2];
-    const uint32_t ne03 = (uint32_t)src0->ne[3];
+    const uint32_t ne00 = src0->ne[0];
+    const uint32_t ne02 = src0->ne[2];
+    const uint32_t ne03 = src0->ne[3];
 
-    const uint32_t ne10 = (uint32_t)src1->ne[0];
-    const uint32_t ne11 = (uint32_t)src1->ne[1];
-    const uint32_t ne12 = (uint32_t)src1->ne[2];
+    const uint32_t ne10 = src1->ne[0];
+    const uint32_t ne11 = src1->ne[1];
+    const uint32_t ne12 = src1->ne[2];
     const uint32_t nr = ne10 * ne11 * ne12;
 
-    const size_t nb01 = src0->nb[1];
-    const size_t nb1 = dst->nb[1];
+    const ggml_tensor * src0_base = src0->view_src ? src0->view_src : src0;
+    const bool tiled = src0->type == GGML_TYPE_Q4_0 ||
+                       (src0_base->buffer && ggml_backend_buffer_is_hexagon_repack(src0_base->buffer)) ||
+                       (src0->buffer && ggml_backend_buffer_is_hexagon_repack(src0->buffer));
 
-    const bool can_use_dma = (src0->type == dst->type) && (nb01 == nb1);
-    const bool use_dma = can_use_dma && (ne00 >= 2048);
-
-    kparams->use_dma = use_dma ? 1 : 0;
-
-    uint32_t chunks_per_row = 1;
-    uint32_t chunk_size = ne00;
-    uint32_t total_tasks = nr;
-
-    if (use_dma) {
-        kparams->n_threads = (std::min)((uint32_t)ctx->n_threads, nr);
-        kparams->tasks_per_thread = (nr + kparams->n_threads - 1) / kparams->n_threads;
+    if (src0->type == dst->type) {
+        kparams->kernel_type = HTP_GET_ROWS_KERNEL_SAMETYPE;
+    } else if (tiled) {
+        kparams->kernel_type = HTP_GET_ROWS_KERNEL_TILED;
     } else {
-        if (src0->type == GGML_TYPE_F32 && nr < (uint32_t)ctx->n_threads) {
-            const uint32_t min_chunk_size = 1024;
-            uint32_t max_chunks = ne00 / min_chunk_size;
-            if (max_chunks == 0) {
-                max_chunks = 1;
-            }
-            chunks_per_row = (std::min)(((uint32_t)ctx->n_threads + nr - 1) / nr, max_chunks);
-            chunk_size = (ne00 + chunks_per_row - 1) / chunks_per_row;
-            total_tasks = nr * chunks_per_row;
-        }
-        kparams->n_threads = (std::min)(total_tasks, (uint32_t)ctx->n_threads);
-        kparams->tasks_per_thread = (total_tasks + kparams->n_threads - 1) / kparams->n_threads;
+        kparams->kernel_type = HTP_GET_ROWS_KERNEL_FLAT;
     }
+
+    const uint32_t chunks_per_row = 1;
+    const uint32_t chunk_size = ne00;
+    const uint32_t total_tasks = nr;
+
+    kparams->n_threads = (std::min)((uint32_t)ctx->n_threads, total_tasks);
+
+    struct htp_get_rows_vtcm_layout vtcm_layout = {};
+    const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb * 1024ull * 1024ull;
+    while (kparams->n_threads > 0) {
+        htp_get_rows_vtcm_layout_build(&vtcm_layout, kparams->kernel_type, src0->type, ne00, kparams->n_threads);
+        if (vtcm_layout.total_bytes <= vtcm_budget) {
+            break;
+        }
+        --kparams->n_threads;
+    }
+
+    if (kparams->n_threads == 0 && total_tasks > 0) {
+        htp_get_rows_vtcm_layout_build(&vtcm_layout, kparams->kernel_type, src0->type, ne00, 1);
+    }
+
+    kparams->vtcm_size = (total_tasks == 0) ? 0 : vtcm_layout.total_bytes;
+    kparams->tasks_per_thread = kparams->n_threads > 0 ? (total_tasks + kparams->n_threads - 1) / kparams->n_threads : 0;
 
     kparams->chunks_per_row = chunks_per_row;
     kparams->chunk_size = chunk_size;
     kparams->total_tasks = total_tasks;
 
-    kparams->div_ne10 = init_fastdiv_values(ne10);
-    kparams->div_ne10_ne11 = init_fastdiv_values(ne10 * ne11);
-    kparams->div_chunks_per_row = init_fastdiv_values(chunks_per_row);
-    kparams->div_ne02 = init_fastdiv_values(ne02);
-    kparams->div_ne03 = init_fastdiv_values(ne03);
-
-    struct htp_get_rows_vtcm_layout vtcm_layout;
-    htp_get_rows_vtcm_layout_build(&vtcm_layout, src0->type, ne00, kparams->n_threads);
-    kparams->vtcm_size = vtcm_layout.total_bytes;
+    kparams->div_ne10 = ne10 > 0 ? init_fastdiv_values(ne10) : fastdiv_values{0, 0};
+    kparams->div_ne10_ne11 = (ne10 * ne11) > 0 ? init_fastdiv_values(ne10 * ne11) : fastdiv_values{0, 0};
+    kparams->div_chunks_per_row = chunks_per_row > 0 ? init_fastdiv_values(chunks_per_row) : fastdiv_values{0, 0};
+    kparams->div_ne02 = ne02 > 0 ? init_fastdiv_values(ne02) : fastdiv_values{0, 0};
+    kparams->div_ne03 = ne03 > 0 ? init_fastdiv_values(ne03) : fastdiv_values{0, 0};
 }
 
 // Precompute htp_set_rows_kernel_params on AP side for SET_ROWS.
@@ -4753,17 +4755,34 @@ static bool hexagon_validate_get_rows(ggml_backend_hexagon_context * ctx, const 
     const ggml_tensor * src1 = op->src[1];
     const ggml_tensor * dst  = op;
 
-    // Reject repacked tensors – tiled layout is not suitable for row-indexed access
-    if (src0->buffer && ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+    if (src0->type == GGML_TYPE_Q4_0 && src0->view_src) {
         return false;
     }
 
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_I32 && src0->ne[0] < 32) {
+    const ggml_tensor * src0_base = src0->view_src ? src0->view_src : src0;
+    bool is_repacked = false;
+    if (src0_base->buffer && ggml_backend_buffer_is_hexagon_repack(src0_base->buffer)) {
+        is_repacked = true;
+        if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q8_0) {
+            return false;
+        }
+    }
+
+    // View offsets use the raw quantized layout and cannot address a tiled allocation.
+    if (src0->view_src && is_repacked) {
+        return false;
+    }
+
+    if (src0->type == GGML_TYPE_Q4_0 && src0->buffer && !is_repacked) {
+        return false;
+    }
+
+    if (src0->type != dst->type && src0->ne[0] < 32) {
         return false;
     }
 
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
-        src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_I32) {
+        src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_I32) {
         return false;
     }
 
@@ -4771,12 +4790,25 @@ static bool hexagon_validate_get_rows(ggml_backend_hexagon_context * ctx, const 
         return false;
     }
 
-    if (src0->type == GGML_TYPE_I32) {
-        if (dst->type != GGML_TYPE_I32) {
+    if (src0->type == dst->type) {
+        if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_I32 && src0->type != GGML_TYPE_F16) {
             return false;
         }
+    } else if (src0->type == GGML_TYPE_I32) {
+        return false;
+    } else if (dst->type != GGML_TYPE_F32) {
+        return false;
     }
-    else if (dst->type != GGML_TYPE_F32) {
+
+    // Empty recurrent-state gathers are skipped at execution; do not split the graph for them.
+    if (ggml_is_empty(op)) {
+        return true;
+    }
+
+    struct htp_get_rows_kernel_params kparams;
+    ggml_hexagon_precompute_get_rows_params(ctx, src0, src1, dst, &kparams);
+    const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb * 1024ull * 1024ull;
+    if (kparams.n_threads == 0 || (size_t) kparams.vtcm_size > vtcm_budget) {
         return false;
     }
 
