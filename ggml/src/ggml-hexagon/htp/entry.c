@@ -19,6 +19,8 @@
 #include "dsp-ctx.h"
 #include "hmx-queue.h"
 #include "htp-ctx.h"
+#include "htp-tensor.h"
+#include "htp-fence.h"
 #include "matmul-ops.h"
 #include "flash-attn-ops.h"
 
@@ -32,7 +34,7 @@
 #define HEX_OP_PROF_DUMP_INTERVAL       25
 
 // Queue capacity/stack sizes: mirror htp/main.c
-#define HMX_QUEUE_CAPACITY              16
+#define HMX_QUEUE_CAPACITY              128
 #define HMX_QUEUE_STACK_SIZE            16384
 #define WORK_QUEUE_CAPACITY             16
 #define WORK_QUEUE_STACK_SIZE           16384
@@ -170,6 +172,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_GLU_SWIGLU:      return "GLU_SWIGLU";
         case HTP_OP_GLU_SWIGLU_OAI:  return "GLU_SWIGLU_OAI";
         case HTP_OP_GLU_GEGLU:       return "GLU_GEGLU";
+        case HTP_OP_GLU_GEGLU_QUICK: return "GLU_GEGLU_QUICK";
         case HTP_OP_SOFTMAX:         return "SOFTMAX";
         case HTP_OP_ROPE:            return "ROPE";
         case HTP_OP_FLASH_ATTN_EXT:  return "FLASH_ATTN_EXT";
@@ -179,6 +182,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_CPY:             return "CPY";
         case HTP_OP_REPEAT:          return "REPEAT";
         case HTP_OP_ARGSORT:         return "ARGSORT";
+        case HTP_OP_TOP_K:           return "TOP_K";
         case HTP_OP_SSM_CONV:        return "SSM_CONV";
         case HTP_OP_CUMSUM:          return "CUMSUM";
         case HTP_OP_FILL:            return "FILL";
@@ -190,6 +194,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_LEAKY_RELU:      return "LEAKY_RELU";
         case HTP_OP_IM2COL:          return "IM2COL";
         case HTP_OP_GATED_DELTA_NET: return "GATED_DELTA_NET";
+        case HTP_OP_ROLL:            return "ROLL";
         case HTP_OP_TRI:             return "TRI";
         case HTP_OP_INVALID:         return "INVALID";
         default:                     return NULL;
@@ -785,6 +790,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_UNARY_ABS]       = op_unary,
     [HTP_OP_UNARY_LOG]       = op_unary,
     [HTP_OP_UNARY_RELU]      = op_unary,
+    [HTP_OP_UNARY_STEP]      = op_unary,
     [HTP_OP_L2_NORM]         = op_unary,
     [HTP_OP_UNARY_SILU]      = op_unary,
     [HTP_OP_UNARY_GELU]      = op_unary,
@@ -792,16 +798,20 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_GLU_SWIGLU_OAI]  = op_activations,
     [HTP_OP_GLU_SWIGLU_CLAMP] = op_activations,
     [HTP_OP_GLU_GEGLU]       = op_activations,
+    [HTP_OP_GLU_GEGLU_QUICK] = op_activations,
     [HTP_OP_SOFTMAX]         = op_softmax,
     [HTP_OP_ADD_ID]          = op_binary,
     [HTP_OP_ROPE]            = op_rope,
     [HTP_OP_FLASH_ATTN_EXT]  = op_flash_attn_ext,
     [HTP_OP_SET_ROWS]        = op_set_rows,
     [HTP_OP_GET_ROWS]        = op_get_rows,
+    [HTP_OP_SUM]             = op_sum,
     [HTP_OP_SUM_ROWS]        = op_sum_rows,
     [HTP_OP_CPY]             = op_cpy,
     [HTP_OP_REPEAT]          = op_repeat,
     [HTP_OP_ARGSORT]         = op_argsort,
+    [HTP_OP_TOP_K]           = op_top_k,
+    [HTP_OP_ARGMAX]          = op_argmax,
     [HTP_OP_SSM_CONV]        = op_ssm_conv,
     [HTP_OP_CUMSUM]          = op_cumsum,
     [HTP_OP_FILL]            = op_fill,
@@ -811,6 +821,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_CONCAT]          = op_concat,
     [HTP_OP_IM2COL]          = op_im2col,
     [HTP_OP_GATED_DELTA_NET] = op_gated_delta_net,
+    [HTP_OP_ROLL]            = op_roll,
     [HTP_OP_TRI]             = op_unary,
     [HTP_OP_FENCE]           = op_fence,
     [HTP_OP_ALLREDUCE]       = op_allreduce,
@@ -878,7 +889,7 @@ static inline void hex_tensor_to_dsptensor(const hex_tensor_desc * ht,
 static inline void hex_tensor_to_htp_tensor(const hex_tensor_desc * ht,
                                              const char * ion_base,
                                              struct htp_tensor * htp) {
-    htp->data  = (uint32_t)(uintptr_t)(ion_base + ht->data_offset);
+    htp->data  = (uint64_t)(uintptr_t)(ion_base + ht->data_offset);
     htp->size  = (uint32_t)ht->data_len;
     htp->flags = HTP_TENSOR_FLUSHED;
     htp->type  = (uint16_t)ht->type;
@@ -912,6 +923,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_CPY:     *htp_op = HTP_OP_CPY;         return 0;
         case GGML_OP_GET_ROWS: *htp_op = HTP_OP_GET_ROWS;   return 0;
         case GGML_OP_SET_ROWS: *htp_op = HTP_OP_SET_ROWS;   return 0;
+        case GGML_OP_SUM:     *htp_op = HTP_OP_SUM;         return 0;
         case GGML_OP_SUM_ROWS: *htp_op = HTP_OP_SUM_ROWS;   return 0;
         case GGML_OP_SSM_CONV: *htp_op = HTP_OP_SSM_CONV;   return 0;
         case GGML_OP_CONT:    *htp_op = HTP_OP_CPY;         return 0;
@@ -927,6 +939,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_PAD:     *htp_op = HTP_OP_PAD;         return 0;
         case GGML_OP_IM2COL:  *htp_op = HTP_OP_IM2COL;      return 0;
         case GGML_OP_GATED_DELTA_NET: *htp_op = HTP_OP_GATED_DELTA_NET; return 0;
+        case GGML_OP_ROLL:   *htp_op = HTP_OP_ROLL;        return 0;
         case GGML_OP_CUMSUM:  *htp_op = HTP_OP_CUMSUM;      return 0;
         case GGML_OP_FILL:    *htp_op = HTP_OP_FILL;        return 0;
         case GGML_OP_DIAG:    *htp_op = HTP_OP_DIAG;        return 0;
@@ -948,6 +961,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
                 case GGML_UNARY_OP_SOFTPLUS: *htp_op = HTP_OP_UNARY_SOFTPLUS; return 0;
                 case GGML_UNARY_OP_ABS:      *htp_op = HTP_OP_UNARY_ABS;      return 0;
                 case GGML_UNARY_OP_RELU:     *htp_op = HTP_OP_UNARY_RELU;     return 0;
+                case GGML_UNARY_OP_STEP:     *htp_op = HTP_OP_UNARY_STEP;     return 0;
                 default:
                     FARF(ERROR, "ggml_op_to_htp_op: unsupported unary_op %d", op_params[0]);
                     return -1;
@@ -963,11 +977,14 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
                 case GGML_GLU_OP_SWIGLU_OAI:  *htp_op = HTP_OP_GLU_SWIGLU_OAI;  return 0;
                 case GGML_GLU_OP_SWIGLU_CLAMP: *htp_op = HTP_OP_GLU_SWIGLU_CLAMP; return 0;
                 case GGML_GLU_OP_GEGLU:       *htp_op = HTP_OP_GLU_GEGLU;       return 0;
+                case GGML_GLU_OP_GEGLU_QUICK: *htp_op = HTP_OP_GLU_GEGLU_QUICK; return 0;
                 default:
                     FARF(ERROR, "ggml_op_to_htp_op: unsupported glu_op %d", op_params[0]);
                     return -1;
             }
         }
+        case GGML_OP_TOP_K:    *htp_op = HTP_OP_TOP_K;        return 0;
+        case GGML_OP_ARGMAX:   *htp_op = HTP_OP_ARGMAX;       return 0;
         default:
             FARF(ERROR, "ggml_op_to_htp_op: unsupported ggml_op %d", ggml_op);
             return -1;
@@ -1013,7 +1030,9 @@ static void build_htp_octx(
         octx->dsts[i] = (dst_idx[i] >= 0) ? &g_dsp_ctx->pre_ht[dst_idx[i]] : NULL;
     }
 
-    octx->n_threads = (uint32_t)g_dsp_ctx->thread_counts;
+    octx->n_threads     = (uint32_t)g_dsp_ctx->thread_counts;
+    octx->n_threads_div = g_dsp_ctx->htp_ctx->n_threads_div;
+    octx->status        = HTP_STATUS_OK;
 }
 
 // Try HMX precompute (simple 2D path). Mirrors ggml_hexagon_precompute_hmx_mm_params
@@ -1086,9 +1105,10 @@ static bool build_mm_hmx_params(struct htp_ops_context * octx,
                                       (size_t) ne01_padded * HTP_MM_HMX_COST_W_DEQUANT,
                                       (size_t) ne11 * HTP_MM_HMX_COST_A_CONVERT,
                                       &m_chunk_cand, &n_chunk_cand, &vtcm_size_cand) == 0) {
+            // DSP-side rebuild only handles plain matmul; src2_size=0.
             size_t exact_size = htp_mm_hmx_get_2d_vtcm_size(
                 wtype, ne00_padded, m_chunk_cand, n_chunk_cand, pipeline,
-                act_threads, aligned_tile_size);
+                act_threads, aligned_tile_size, /*src2_size=*/0);
             if (exact_size <= vtcm_budget) {
                 size_t mblocks = ((size_t) ne11 + m_chunk_cand - 1) / m_chunk_cand;
                 if (mblocks < best_mblocks ||
@@ -1178,47 +1198,29 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
     size_t vtcm_src0_size = 0, vtcm_src1_size = 0, vtcm_dst_size = 0;
 
     if (wtype == HTP_TYPE_F32) {
+        // PR #29197 removed the HVX_F32_F32_DDR kernel; only VTCM path remains.
+        if (is_batched || is_permuted) return -1;
         size_t vtcm_size = htp_mm_hvx_get_vtcm_sizes(
             HTP_MM_KERNEL_HVX_F32_F32_VTCM, wtype, ne10, src1_nrows, octx->n_threads,
             dst->nb[1], src0->nb[1], src1->nb[1], 16,
             &vtcm_src0_size, &vtcm_src1_size, &vtcm_dst_size);
-
-        if (!is_batched && !is_permuted && vtcm_size <= g_dsp_ctx->vtcm_size) {
-            kparams->kernel_type    = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
-            kparams->src1_row_size  = hex_round_up(ne10 * 4, 128);
-        } else {
-            kparams->kernel_type    = HTP_MM_KERNEL_HVX_F32_F32_DDR;
-            kparams->src1_row_size  = src1->nb[1];
-            vtcm_size = htp_mm_hvx_get_vtcm_sizes(
-                kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
-                dst->nb[1], src0->nb[1], src1->nb[1], 16,
-                &vtcm_src0_size, &vtcm_src1_size, &vtcm_dst_size);
-        }
+        if (vtcm_size > g_dsp_ctx->vtcm_size) return -1;
+        kparams->kernel_type    = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
+        kparams->src1_row_size  = hex_round_up(ne10 * 4, 128);
         kparams->vtcm_size      = (int32_t) vtcm_size;
         kparams->vtcm_src0_size = (int32_t) vtcm_src0_size;
         kparams->vtcm_src1_size = (int32_t) vtcm_src1_size;
         kparams->vtcm_dst_size  = (int32_t) vtcm_dst_size;
     } else if (wtype == HTP_TYPE_F16) {
+        // PR #29197 removed the HVX_F16_F16_DDR and HVX_F16_F32_DDR kernels.
+        if (is_batched || is_permuted) return -1;
         size_t vtcm_size = htp_mm_hvx_get_vtcm_sizes(
             HTP_MM_KERNEL_HVX_F16_F16_VTCM, wtype, ne10, src1_nrows, octx->n_threads,
             dst->nb[1], src0->nb[1], src1->nb[1], 16,
             &vtcm_src0_size, &vtcm_src1_size, &vtcm_dst_size);
-
-        if (!is_batched && !is_permuted && vtcm_size <= g_dsp_ctx->vtcm_size) {
-            kparams->kernel_type    = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
-            kparams->src1_row_size  = hex_round_up(ne10 * 2, 128);
-        } else {
-            if (src1->type == HTP_TYPE_F32) {
-                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F32_DDR;
-            } else {
-                kparams->kernel_type = HTP_MM_KERNEL_HVX_F16_F16_DDR;
-            }
-            kparams->src1_row_size  = src1->nb[1];
-            vtcm_size = htp_mm_hvx_get_vtcm_sizes(
-                kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
-                dst->nb[1], src0->nb[1], src1->nb[1], 16,
-                &vtcm_src0_size, &vtcm_src1_size, &vtcm_dst_size);
-        }
+        if (vtcm_size > g_dsp_ctx->vtcm_size) return -1;
+        kparams->kernel_type    = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
+        kparams->src1_row_size  = hex_round_up(ne10 * 2, 128);
         kparams->vtcm_size      = (int32_t) vtcm_size;
         kparams->vtcm_src0_size = (int32_t) vtcm_src0_size;
         kparams->vtcm_src1_size = (int32_t) vtcm_src1_size;
@@ -1230,65 +1232,42 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
 
         const bool k_align   = (ne10 % 32 == 0);
         const bool try_tiled = k_align && kparams->tile_size > 0;
-        bool tiled_ok = false;
 
-        if (try_tiled) {
-            kparams->src1_row_size = (int32_t)((wtype == HTP_TYPE_Q4_1)
-                ? htp_mm_q8_1_tiled_row_size(ne10)
-                : htp_mm_q8_0_tiled_row_size(ne10));
-            kparams->kernel_type = (src1_nrows < octx->n_threads)
-                ? HTP_MM_KERNEL_HVX_QUANT_BLOCK
-                : HTP_MM_KERNEL_HVX_QUANT_ROW;
+        if (!try_tiled) return -1;
+        kparams->src1_row_size = (int32_t)((wtype == HTP_TYPE_Q4_1)
+            ? htp_mm_q8_1_tiled_row_size(ne10)
+            : htp_mm_q8_0_tiled_row_size(ne10));
+        kparams->kernel_type = (src1_nrows < octx->n_threads)
+            ? HTP_MM_KERNEL_HVX_QUANT_BLOCK
+            : HTP_MM_KERNEL_HVX_QUANT_ROW;
 
-            const uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
-            uint32_t best_n_prefetch = 2;
-            size_t vs0 = 0, vs1 = 0, vd = 0;
-            size_t total_size = 0;
-            for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
-                total_size = htp_mm_hvx_get_vtcm_sizes(
-                    kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
-                    dst->nb[1], src0->nb[1], src1->nb[1], d,
-                    &vs0, &vs1, &vd);
-                if (total_size <= g_dsp_ctx->vtcm_size) {
-                    best_n_prefetch = d;
-                    break;
-                }
-            }
-            if (best_n_prefetch == 2 && total_size > g_dsp_ctx->vtcm_size) {
-                total_size = htp_mm_hvx_get_vtcm_sizes(
-                    kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
-                    dst->nb[1], src0->nb[1], src1->nb[1], 2,
-                    &vs0, &vs1, &vd);
-            }
-            kparams->n_prefetch = (int32_t) best_n_prefetch;
-
-            if (total_size <= g_dsp_ctx->vtcm_size) {
-                kparams->vtcm_size      = (int32_t) total_size;
-                kparams->vtcm_src0_size = (int32_t) vs0;
-                kparams->vtcm_src1_size = (int32_t) vs1;
-                kparams->vtcm_dst_size  = (int32_t) vd;
-                tiled_ok = true;
-            }
-        }
-
-        if (!tiled_ok) {
-            kparams->src1_row_size = (int32_t)((wtype == HTP_TYPE_Q4_1)
-                ? htp_mm_q8_1_flat_row_size(ne10)
-                : htp_mm_q8_0_flat_row_size(ne10));
-            kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
-
-            size_t vs0 = 0, vs1 = 0, vd = 0;
-            const size_t total_size = htp_mm_hvx_get_vtcm_sizes(
+        const uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+        uint32_t best_n_prefetch = 2;
+        size_t vs0 = 0, vs1 = 0, vd = 0;
+        size_t total_size = 0;
+        for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
+            total_size = htp_mm_hvx_get_vtcm_sizes(
                 kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
-                dst->nb[1], src0->nb[1], src1->nb[1], 16,
+                dst->nb[1], src0->nb[1], src1->nb[1], d,
                 &vs0, &vs1, &vd);
-
-            kparams->n_prefetch     = 16;
-            kparams->vtcm_size      = (int32_t) total_size;
-            kparams->vtcm_src0_size = (int32_t) vs0;
-            kparams->vtcm_src1_size = (int32_t) vs1;
-            kparams->vtcm_dst_size  = (int32_t) vd;
+            if (total_size <= g_dsp_ctx->vtcm_size) {
+                best_n_prefetch = d;
+                break;
+            }
         }
+        if (best_n_prefetch == 2 && total_size > g_dsp_ctx->vtcm_size) {
+            total_size = htp_mm_hvx_get_vtcm_sizes(
+                kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
+                dst->nb[1], src0->nb[1], src1->nb[1], 2,
+                &vs0, &vs1, &vd);
+        }
+        // PR #29197 removed the HVX_QUANT_ROW_FLAT kernel; tiled is mandatory.
+        if (total_size > g_dsp_ctx->vtcm_size) return -1;
+        kparams->n_prefetch     = (int32_t) best_n_prefetch;
+        kparams->vtcm_size      = (int32_t) total_size;
+        kparams->vtcm_src0_size = (int32_t) vs0;
+        kparams->vtcm_src1_size = (int32_t) vs1;
+        kparams->vtcm_dst_size  = (int32_t) vd;
     }
 
 mm_finalize:
@@ -1296,7 +1275,6 @@ mm_finalize:
     kparams->div_ne1      = init_fastdiv_values(ne11);
     kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
     kparams->div_r3       = init_fastdiv_values(ne03 > 0 ? ne13 / ne03 : 1);
-    kparams->div_ne11     = init_fastdiv_values(ne11);
 
     return 0;
 }
@@ -1584,20 +1562,12 @@ int ggml_htp_close(remote_handle64 handle) {
         }
         for (int i = 0; i < HTP_MAX_NTHREADS; i++) {
             if (ctx->htp_ctx->dma[i]) {
-                dma_queue_alias_free(ctx->htp_ctx->dma[i]);
+                dma_queue_free(ctx->htp_ctx->dma[i]);
                 ctx->htp_ctx->dma[i] = NULL;
             }
             if (ctx->dma_alias_bufs[i]) {
                 free(ctx->dma_alias_bufs[i]);
                 ctx->dma_alias_bufs[i] = NULL;
-            }
-            if (ctx->htp_ctx->dma_cached[i]) {
-                dma_queue_free(ctx->htp_ctx->dma_cached[i]);
-                ctx->htp_ctx->dma_cached[i] = NULL;
-            }
-            if (ctx->dma_queue_bufs[i]) {
-                free(ctx->dma_queue_bufs[i]);
-                ctx->dma_queue_bufs[i] = NULL;
             }
         }
         free(ctx->htp_ctx);
@@ -1685,20 +1655,12 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
         }
         for (int i = 0; i < HTP_MAX_NTHREADS; i++) {
             if (g_dsp_ctx->htp_ctx->dma[i]) {
-                dma_queue_alias_free(g_dsp_ctx->htp_ctx->dma[i]);
+                dma_queue_free(g_dsp_ctx->htp_ctx->dma[i]);
                 g_dsp_ctx->htp_ctx->dma[i] = NULL;
             }
             if (g_dsp_ctx->dma_alias_bufs[i]) {
                 free(g_dsp_ctx->dma_alias_bufs[i]);
                 g_dsp_ctx->dma_alias_bufs[i] = NULL;
-            }
-            if (g_dsp_ctx->htp_ctx->dma_cached[i]) {
-                dma_queue_free(g_dsp_ctx->htp_ctx->dma_cached[i]);
-                g_dsp_ctx->htp_ctx->dma_cached[i] = NULL;
-            }
-            if (g_dsp_ctx->dma_queue_bufs[i]) {
-                free(g_dsp_ctx->dma_queue_bufs[i]);
-                g_dsp_ctx->dma_queue_bufs[i] = NULL;
             }
         }
         memset(g_dsp_ctx->htp_ctx, 0, sizeof(*g_dsp_ctx->htp_ctx));
@@ -1737,56 +1699,37 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
         }
         printf("htp_ctx work_queue_init returned %d (n_threads=%d)\n", wp, g_dsp_ctx->thread_counts);
 
-        // dma queues: one main queue (dma_cached) + one nocache alias (dma) per
-        // thread, mirroring main.c. Ops use the alias with nocache=1 so DMA DDR
-        // accesses bypass L2 (same semantics as the pre-b2dd28a3b hex-dma, which
-        // hardcoded bypass=1) and stay coherent with our manual dcinva/dccleaninva
-        // cache management. dma_queue_init must get a valid (zeroed) trace:
-        // htp_trace_event_start/stop dereference it unconditionally on every
-        // push/pop.
-        size_t dma_size       = dma_queue_sizeof(256);
-        size_t dma_alias_size = dma_queue_alias_sizeof();
-        size_t dma_align      = dma_queue_alignof();
+        // dma queues: one main queue per thread. After PR #29197 the upstream
+        // main.c stopped using dma_queue_alias_* and the dma_cached[] backing
+        // array; the single dma[i] queue is initialized via dma_queue_init with
+        // the simplified 3-arg signature (no vtcm_base/vtcm_size, those are
+        // captured internally by the queue). dma_queue_init still needs a
+        // valid (zeroed) trace because htp_trace_event_start/stop dereference
+        // it unconditionally on every push/pop.
+        size_t dma_size  = dma_queue_sizeof(256);
+        size_t dma_align = dma_queue_alignof();
         for (int i = 0; i < g_dsp_ctx->thread_counts; i++) {
             void * dma_buf = memalign(dma_align, dma_size);
             if (dma_buf) {
-                g_dsp_ctx->htp_ctx->dma_cached[i] = dma_queue_init(dma_buf, 256,
-                                                                   (uintptr_t)g_dsp_ctx->vtcm_base,
-                                                                   g_dsp_ctx->vtcm_size,
-                                                                   &g_dsp_ctx->htp_ctx->trace[i]);
-                if (g_dsp_ctx->htp_ctx->dma_cached[i]) {
-                    g_dsp_ctx->dma_queue_bufs[i] = dma_buf;
+                g_dsp_ctx->htp_ctx->dma[i] = dma_queue_init(dma_buf, 256,
+                                                            &g_dsp_ctx->htp_ctx->trace[i]);
+                if (g_dsp_ctx->htp_ctx->dma[i]) {
+                    g_dsp_ctx->dma_alias_bufs[i] = dma_buf;
                 } else {
                     free(dma_buf);
                     dma_buf = NULL;
-                    g_dsp_ctx->dma_queue_bufs[i] = NULL;
+                    g_dsp_ctx->dma_alias_bufs[i] = NULL;
                     wp = AEE_EFAILED;
                     break;
                 }
             } else {
-                g_dsp_ctx->htp_ctx->dma_cached[i] = NULL;
-                g_dsp_ctx->dma_queue_bufs[i]      = NULL;
+                g_dsp_ctx->htp_ctx->dma[i]      = NULL;
+                g_dsp_ctx->dma_alias_bufs[i]    = NULL;
                 wp = AEE_ENOMEMORY;
                 break;
             }
-
-            void * alias_buf = memalign(dma_align, dma_alias_size);
-            if (alias_buf && g_dsp_ctx->htp_ctx->dma_cached[i]) {
-                g_dsp_ctx->htp_ctx->dma[i] = dma_queue_alias_init(alias_buf,
-                                                                  g_dsp_ctx->htp_ctx->dma_cached[i], 1);
-                if (g_dsp_ctx->htp_ctx->dma[i]) {
-                    g_dsp_ctx->dma_alias_bufs[i] = alias_buf;
-                } else {
-                    free(alias_buf);
-                    g_dsp_ctx->dma_alias_bufs[i] = NULL;
-                }
-            } else {
-                if (alias_buf) free(alias_buf);
-                g_dsp_ctx->htp_ctx->dma[i]   = NULL;
-                g_dsp_ctx->dma_alias_bufs[i] = NULL;
-            }
         }
-        printf("htp_ctx dma_queue created x%d (main+alias)\n", g_dsp_ctx->thread_counts);
+        printf("htp_ctx dma_queue created x%d (single)\n", g_dsp_ctx->thread_counts);
         if (wp != AEE_SUCCESS) {
             GGMLHEXAGON_LOG_ERROR("dma_queue_init failed (wp=%d)", wp);
             return wp;
@@ -2165,6 +2108,10 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
 
         GGMLHEXAGON_LOG_DEBUG("mempool-op %u: htp_op=%u opcode=%d", i, htp_op, op->opcode);
 
+        if (1 == g_dsp_ctx->dump_diag_info) {
+            GGMLHEXAGON_LOG_INFO("[DSP-DIAG] op%u opcode=%d htp_op=%d", i, op->opcode, htp_op);
+        }
+
         struct htp_ops_context octx;
 
         build_htp_octx(&octx, htp_op, op->params, op->kernel_params,
@@ -2175,6 +2122,7 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
             if (kp_kernel_type == 0) {
                 if (build_mm_kernel_params(&octx) != 0) {
                     dsp_queues_suspend();
+                    GGMLHEXAGON_LOG_ERROR("error");
                     return AEE_EFAILED;
                 }
             }
@@ -2220,8 +2168,11 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
                 octx.kernel_params[16]);
         }
 #endif
+        htp_mdev_group_barrier(&octx);
 
         int op_ret = execute_op(&octx);
+
+        htp_ops_context_set_status(&octx, op_ret);
 
 #ifndef NDEBUG
         /* F32 MUL_MAT diagnostic: dump dst[0..3] and dst[16..19] AFTER execute_op. */

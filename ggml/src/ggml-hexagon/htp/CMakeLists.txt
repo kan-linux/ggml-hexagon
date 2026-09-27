@@ -54,6 +54,7 @@ if (GGML_HEXAGON_USE_MEMPOOL)
     add_library(${HTP_LIB} SHARED
         entry.c
         ${CMAKE_CURRENT_BINARY_DIR}/ggml_htp_skel.c
+        htp-tensor.c
         ${HTP_OPS_SRCS}
     )
 

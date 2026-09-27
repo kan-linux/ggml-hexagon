@@ -49,6 +49,10 @@ extern "C" {
 #define DSP_OPT_MAX_BATCH_DSTS          (DSP_OPT_MAX_TENSORS * 4 * 4)
 #endif
 
+#ifndef HTP_OP_MAX_INPUTS
+#define HTP_OP_MAX_INPUTS               10
+#endif
+
 #ifndef HTP_OP_MAX_OUTPUTS
 #define HTP_OP_MAX_OUTPUTS              4
 #endif
@@ -230,11 +234,11 @@ struct dsp_context {
     // memory to *_queue_init and does not free it in *_queue_free, so we
     // must track these buffers separately to avoid leaking them.
     //   work_queue_buf         : backing for htp_ctx->work_queue
-    //   dma_queue_bufs[i]      : backing for htp_ctx->dma_cached[i] (NULL when slot unused)
-    //   dma_alias_bufs[i]      : backing for htp_ctx->dma[i] alias (NULL when slot unused)
+    //   dma_alias_bufs[i]      : backing for htp_ctx->dma[i] (single queue
+    //                            since PR #29197; the historic "dma_cached"
+    //                            and dma_queue_alias_* layers were dropped).
     void * work_queue_buf;
-    void * dma_queue_bufs[16];  // HTP_MAX_NTHREADS == 10, but use 16 for safety
-    void * dma_alias_bufs[16];
+    void * dma_alias_bufs[16];  // HTP_MAX_NTHREADS == 10, but use 16 for safety
 
     // Per-session state (moved from file-static globals for multi-session isolation).
     // Small arrays are embedded; large arrays are allocated from arrays_pool.
