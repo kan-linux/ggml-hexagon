@@ -169,10 +169,12 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_UNARY_RELU:      return "UNARY_RELU";
         case HTP_OP_UNARY_SILU:      return "UNARY_SILU";
         case HTP_OP_UNARY_GELU:      return "UNARY_GELU";
+        case HTP_OP_UNARY_GELU_ERF:  return "UNARY_GELU_ERF";
         case HTP_OP_GLU_SWIGLU:      return "GLU_SWIGLU";
         case HTP_OP_GLU_SWIGLU_OAI:  return "GLU_SWIGLU_OAI";
         case HTP_OP_GLU_GEGLU:       return "GLU_GEGLU";
         case HTP_OP_GLU_GEGLU_QUICK: return "GLU_GEGLU_QUICK";
+        case HTP_OP_GLU_GEGLU_ERF:   return "GLU_GEGLU_ERF";
         case HTP_OP_SOFTMAX:         return "SOFTMAX";
         case HTP_OP_ROPE:            return "ROPE";
         case HTP_OP_FLASH_ATTN_EXT:  return "FLASH_ATTN_EXT";
@@ -794,11 +796,13 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_L2_NORM]         = op_unary,
     [HTP_OP_UNARY_SILU]      = op_unary,
     [HTP_OP_UNARY_GELU]      = op_unary,
+    [HTP_OP_UNARY_GELU_ERF]  = op_unary,
     [HTP_OP_GLU_SWIGLU]      = op_activations,
     [HTP_OP_GLU_SWIGLU_OAI]  = op_activations,
     [HTP_OP_GLU_SWIGLU_CLAMP] = op_activations,
     [HTP_OP_GLU_GEGLU]       = op_activations,
     [HTP_OP_GLU_GEGLU_QUICK] = op_activations,
+    [HTP_OP_GLU_GEGLU_ERF]   = op_activations,
     [HTP_OP_SOFTMAX]         = op_softmax,
     [HTP_OP_ADD_ID]          = op_binary,
     [HTP_OP_ROPE]            = op_rope,
