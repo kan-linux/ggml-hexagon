@@ -306,13 +306,14 @@ struct ggml_backend_hexagon_context {
     std::unordered_map<const void *, uint32_t> tiled_pool_offsets;
     std::unordered_set<const void *> warned_non_repack;
 
-    // Persistent mirror cache for weight tensors: data_ptr -> {mirror_offset, mirror_size}
+    // Persistent mirror cache for weight tensors: data_ptr -> {mirror_offset, mirror_size, dirty}
     // Weight tensors are read-only and don't change between calls, so their mirror
     // allocations can be reused across graph_compute calls. This eliminates redundant
     // memcpy for large weight matrices during TG (token generation) steps.
     struct weight_mirror_cache_entry {
         uint32_t mirror_offset;
         uint32_t mirror_size;
+        bool     dirty;  // set by set_tensor; next graph_compute re-copies into same region
     };
     std::unordered_map<const void *, weight_mirror_cache_entry> weight_mirror_cache;
 
@@ -378,6 +379,11 @@ struct hexagon_appcfg_t {
                                 //   to localize the stale-L2-read culprit.
     int enable_graph_optimize;  // enable/disable cgraph reorder pass
     int enable_graph_cache;     // enable/disable graph cache (1=enable, 0=disable, default=1)
+    float mirror_threshold;     // ION mempool utilization (usage/len) above which QKV/FFN NX
+                                //   fusion is skipped to avoid the mirror-window stale-read
+                                //   regime. Config [cdsp] mirror_threshold. Default 0.9;
+                                //   lower (e.g. 0.7) on pool-constrained devices to fall back
+                                //   to independent MUL_MATs earlier.
 
     const char * cfgfilename;
     char version[GGMLHEXAGON_TMPBUF_LEN];
@@ -402,6 +408,7 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
         .enable_graph_cache     = 1,
+        .mirror_threshold       = 0.9f,
         .cfgfilename            = "ggml-hexagon.cfg",
         .version                = {GGML_HEXAGON_VERSION},
         .enabled_ops            = "all",
@@ -788,6 +795,17 @@ public:
         value = atol(_hexagon_appcfg[section][key].c_str());
     }
 
+    void get_floatvalue(const std::string & section, const std::string & key, float & value, float default_value) {
+        value = default_value;
+        if (_hexagon_appcfg.find(section) == _hexagon_appcfg.end()) {
+            return;
+        }
+        if (_hexagon_appcfg[section].find(key) == _hexagon_appcfg[section].end()) {
+            return;
+        }
+        value = (float)atof(_hexagon_appcfg[section][key].c_str());
+    }
+
 private:
     void ltrim(std::string & str) {
         if (str.empty()) return;
@@ -922,6 +940,7 @@ static void ggmlhexagon_load_cfg() {
     hexagoncfg_instance.get_intvalue("cdsp", "dsp_cache_trace_bit1", g_hexagon_appcfg.dsp_cache_trace_bit1, 0);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_optimize", g_hexagon_appcfg.enable_graph_optimize, 1);
     hexagoncfg_instance.get_intvalue("cdsp", "enable_graph_cache", g_hexagon_appcfg.enable_graph_cache, 1);
+    hexagoncfg_instance.get_floatvalue("cdsp", "mirror_threshold", g_hexagon_appcfg.mirror_threshold, 0.9f);
     hexagoncfg_instance.get_stringvalue("cdsp", "enabled_ops", g_hexagon_appcfg.enabled_ops, "");
 
     snprintf(g_hexagon_appcfg.version, GGMLHEXAGON_TMPBUF_LEN, "%s", version.c_str());
@@ -1060,6 +1079,11 @@ static void ggmlhexagon_check_valid_appcfg() {
     if (g_hexagon_appcfg.fa_select < 0 || g_hexagon_appcfg.fa_select > 2) {
         GGMLHEXAGON_LOG_WARN("invalid fa_select %d, reset to 2", g_hexagon_appcfg.fa_select);
         g_hexagon_appcfg.fa_select = 2;
+    }
+
+    if (g_hexagon_appcfg.mirror_threshold < 0.0f || g_hexagon_appcfg.mirror_threshold > 1.0f) {
+        GGMLHEXAGON_LOG_WARN("invalid mirror_threshold %.3f, reset to 0.9", (double)g_hexagon_appcfg.mirror_threshold);
+        g_hexagon_appcfg.mirror_threshold = 0.9f;
     }
 }
 
@@ -6058,6 +6082,27 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                ggml_nbytes(tensor), (int)is_repack, offset, size);
         memcpy((char *)tensor->data + offset, data, size);
     }
+
+    // Invalidate the weight mirror cache entry for this tensor. Runtime weight
+    // updates (e.g. LoRA) overwrite the host buffer; without this the next
+    // graph_compute would reuse the stale cached mirror offset and read old data.
+    //
+    // We mark the entry dirty (rather than erasing it) so the next
+    // graph_compute re-copies the updated host data into the SAME persistent
+    // mirror region. Erasing would orphan the old region: persistent regions
+    // are never reclaimed by the end-of-call bump-pointer rollback, so each
+    // runtime update would leak one mirror_size until the pool is exhausted.
+    //
+    // Walk to the root tensor: cache keys are root->data, and a view tensor
+    // shares its root's mirror region.
+    ggml_tensor * root = tensor;
+    while (root->view_src) {
+        root = root->view_src;
+    }
+    auto wm_it = hctx->weight_mirror_cache.find(root->data);
+    if (wm_it != hctx->weight_mirror_cache.end()) {
+        wm_it->second.dirty = true;
+    }
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -7109,10 +7154,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                                 // span the per-batch mirror window in ways Phase 3 cannot predict
                                 // and the fuse path can produce stale or overlapping reads. Skip
                                 // NX and fall back to three independent MUL_MATs when utilization
-                                // crosses 0.7.
+                                // crosses mirror_threshold (config [cdsp] mirror_threshold).
                                 const bool mempool_overflow =
                                     ctx->rpc_mempool_len > 0 &&
-                                    (double) ctx->rpc_mempool_usage / (double) ctx->rpc_mempool_len > 0.9;
+                                    (double) ctx->rpc_mempool_usage / (double) ctx->rpc_mempool_len > (double) g_hexagon_appcfg.mirror_threshold;
                                 if (mempool_overflow) {
                                     GGMLHEXAGON_LOG_ALWAYS("skip QKV fusion: mempool pressure (usage=%zu/%zu)",
                                         (size_t) ctx->rpc_mempool_usage, (size_t) ctx->rpc_mempool_len);
@@ -7167,10 +7212,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                             ggml_hexagon_precompute_fused_ffn_params(ctx, n_gate->src[0], n_gate->src[1], &kparams);
                             kparams.n_weights = 2;
                             // Mempool-pressure guard: see QKV fusion comment for rationale;
-                            // skip NX when ION mempool utilization crosses 0.7.
+                            // crosses mirror_threshold (config [cdsp] mirror_threshold).
                             const bool mempool_overflow =
                                 ctx->rpc_mempool_len > 0 &&
-                                (double) ctx->rpc_mempool_usage / (double) ctx->rpc_mempool_len > 0.9;
+                                (double) ctx->rpc_mempool_usage / (double) ctx->rpc_mempool_len > (double) g_hexagon_appcfg.mirror_threshold;
                             if (mempool_overflow) {
                                 GGMLHEXAGON_LOG_ALWAYS("skip FFN fusion: mempool pressure (usage=%zu/%zu)",
                                     (size_t) ctx->rpc_mempool_usage, (size_t) ctx->rpc_mempool_len);
@@ -7472,6 +7517,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         // Weight mirror cache: skip re-mirroring unchanged weight tensors.
         // Weights are read-only and their data doesn't change between calls,
         // so reuse the mirror allocation from a previous graph_compute call.
+        // Dirty entries (set_tensor since last compute) also skip allocation;
+        // Step 3 re-copies the updated host data into the existing region.
         if (is_weight[tidx]) {
             auto cache_it = ctx->weight_mirror_cache.find((const void *)mirror_key);
             if (cache_it != ctx->weight_mirror_cache.end() &&
@@ -7488,30 +7535,18 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         }
     }
 
-    // Step 2: Allocate mirrors for each unique data pointer
+    // Step 2: Allocate mirrors for each unique data pointer.
+    // Weight (persistent) mirrors are allocated before temp mirrors so persistent
+    // regions stay contiguous at low offsets: buffer_mirrors_map is unordered, so
+    // a single interleaved pass would let saved_mempool_usage swallow temp space
+    // allocated before a weight mirror (leaking it on every call).
     size_t data_limit = pool_size;
+
+    // Partition data pointers into weight (persistent) and temp mirrors.
+    std::vector<void *> weight_bufs;
+    std::vector<void *> temp_bufs;
     for (auto & kv : buffer_mirrors_map) {
         void * data_ptr = kv.first;
-        buffer_mirror_info & info = kv.second;
-        size_t mirror_size = info.max_data_len;
-        size_t aligned_offset = (ctx->rpc_mempool_usage + 127u) & ~127u;
-
-        if (aligned_offset + mirror_size > data_limit) {
-            GGMLHEXAGON_LOG_ERROR("mempool-batch: mempool full for mirror (%zu bytes)", mirror_size);
-            std::sort(temp_region_indices.begin(), temp_region_indices.end(), std::greater<size_t>());
-            for (size_t ri : temp_region_indices) {
-                ctx->ion_regions.erase(ctx->ion_regions.begin() + ri);
-            }
-            ctx->rpc_mempool_usage = saved_mempool_usage;
-            return GGML_STATUS_ALLOC_FAILED;
-        }
-
-        uint32_t moff = (uint32_t)aligned_offset;
-        void * ion_buf = (char *)ctx->rpc_mempool + moff;
-        ctx->rpc_mempool_usage = aligned_offset + mirror_size;
-
-        // Determine if this mirror is for a weight tensor (read-only, persistent)
-        // vs a non-weight tensor (activation, temp).
         bool is_weight_mirror = false;
         for (int32_t tidx = 0; tidx < (int32_t)n_tensors; tidx++) {
             ggml_tensor * t = tensor_src[tidx];
@@ -7520,6 +7555,23 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             while (root->view_src) root = root->view_src;
             if (root->data == data_ptr) { is_weight_mirror = true; break; }
         }
+        (is_weight_mirror ? weight_bufs : temp_bufs).push_back(data_ptr);
+    }
+
+    // Allocate one mirror; returns false on pool exhaustion.
+    auto alloc_mirror = [&](void * data_ptr, bool is_weight_mirror) -> bool {
+        buffer_mirror_info & info = buffer_mirrors_map[data_ptr];
+        size_t mirror_size = info.max_data_len;
+        size_t aligned_offset = (ctx->rpc_mempool_usage + 127u) & ~127u;
+
+        if (aligned_offset + mirror_size > data_limit) {
+            GGMLHEXAGON_LOG_ERROR("mempool-batch: mempool full for mirror (%zu bytes)", mirror_size);
+            return false;
+        }
+
+        uint32_t moff = (uint32_t)aligned_offset;
+        void * ion_buf = (char *)ctx->rpc_mempool + moff;
+        ctx->rpc_mempool_usage = aligned_offset + mirror_size;
 
         // Record mirror region. Weight mirrors are persistent (survive across calls);
         // non-weight mirrors are temporary (freed after each call).
@@ -7530,8 +7582,6 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         ctx->ion_regions.push_back(mirror_region);
         if (is_weight_mirror) {
             persistent_region_indices.push_back(ctx->ion_regions.size() - 1);
-            // Update saved_mempool_usage so the bump-pointer reset preserves persistent regions.
-            saved_mempool_usage = ctx->rpc_mempool_usage;
         } else {
             temp_region_indices.push_back(ctx->ion_regions.size() - 1);
         }
@@ -7543,7 +7593,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
         // Store weight mirrors in cache for reuse on subsequent calls.
         if (is_weight_mirror) {
-            ctx->weight_mirror_cache[(const void *)data_ptr] = {moff, (uint32_t)mirror_size};
+            ctx->weight_mirror_cache[(const void *)data_ptr] = {moff, (uint32_t)mirror_size, false};
             GGMLHEXAGON_LOG_DEBUG("mempool-batch: weight cache store %p (size=%zu, offset=0x%x)",
                                   data_ptr, mirror_size, moff);
         }
@@ -7564,6 +7614,30 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
         GGMLHEXAGON_LOG_DEBUG("mempool-batch: mirror buffer %p -> mempool offset=0x%x (%zu bytes) %s",
                               data_ptr, moff, mirror_size, is_weight_mirror ? "[persistent]" : "[temp]");
+        return true;
+    };
+
+    bool mirror_alloc_ok = true;
+    // Pass 1: weight (persistent) mirrors, contiguous at low offsets.
+    for (void * data_ptr : weight_bufs) {
+        if (!alloc_mirror(data_ptr, true)) { mirror_alloc_ok = false; break; }
+    }
+    if (mirror_alloc_ok) {
+        // Weight mirrors now occupy a contiguous low range; raise the rollback point
+        // once so the temp mirrors allocated below are fully reclaimed at call end.
+        saved_mempool_usage = ctx->rpc_mempool_usage;
+        // Pass 2: temp mirrors, reclaimed by the end-of-call bump-pointer rollback.
+        for (void * data_ptr : temp_bufs) {
+            if (!alloc_mirror(data_ptr, false)) { mirror_alloc_ok = false; break; }
+        }
+    }
+    if (!mirror_alloc_ok) {
+        std::sort(temp_region_indices.begin(), temp_region_indices.end(), std::greater<size_t>());
+        for (size_t ri : temp_region_indices) {
+            ctx->ion_regions.erase(ctx->ion_regions.begin() + ri);
+        }
+        ctx->rpc_mempool_usage = saved_mempool_usage;
+        return GGML_STATUS_ALLOC_FAILED;
     }
 
     // Step 3: Build per-tensor mirror offset lookup and mirrors list for copy-back.
@@ -7577,9 +7651,12 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             continue;  // already in mempool
         }
 
-        // Find root parent to locate the shared mirror
+        // Find root parent to locate the shared mirror; accumulate view_offs
+        // along the view chain (each view_offs is relative to its direct parent).
         ggml_tensor * root = t;
+        uint32_t accumulated_view_offs = 0;
         while (root->view_src) {
+            accumulated_view_offs += (uint32_t)root->view_offs;
             root = root->view_src;
         }
         void * mirror_key = root->data;
@@ -7595,8 +7672,16 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         if (is_weight[tidx]) {
             auto cache_it = ctx->weight_mirror_cache.find((const void *)mirror_key);
             if (cache_it != ctx->weight_mirror_cache.end()) {
-                uint32_t tensor_mirror_offset = cache_it->second.mirror_offset + (uint32_t)t->view_offs;
+                uint32_t tensor_mirror_offset = cache_it->second.mirror_offset + accumulated_view_offs;
                 local_mirror_offset[tidx] = tensor_mirror_offset;
+                if (cache_it->second.dirty) {
+                    // set_tensor ran since the last compute: re-copy the updated
+                    // host data into the SAME persistent region (avoids leaking a
+                    // new persistent mirror per runtime weight update).
+                    void * ion_buf = (char *)ctx->rpc_mempool + cache_it->second.mirror_offset;
+                    memcpy(ion_buf, mirror_key, cache_it->second.mirror_size);
+                    cache_it->second.dirty = false;
+                }
                 // Cached weight mirrors are NOT added to the mirrors list:
                 // they must not be copied back in Phase 10 (weights are read-only).
                 continue;
@@ -7618,9 +7703,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             continue;
         }
 
-        // For view tensors, data_offset must point to root_mirror_offset +
-        // view_offs so the NPU reads the view's data, not the root's start.
-        uint32_t tensor_mirror_offset = it->second.mirror_offset + (uint32_t)t->view_offs;
+        // For view tensors, data_offset must point to root_mirror_offset + the
+        // accumulated view_offs (sum along the view chain) so the NPU reads the
+        // view's data, not the root's start.
+        uint32_t tensor_mirror_offset = it->second.mirror_offset + accumulated_view_offs;
         local_mirror_offset[tidx] = tensor_mirror_offset;
 
         ion_mirror m;
