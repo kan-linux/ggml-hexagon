@@ -202,6 +202,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_POOL_2D:         return "POOL_2D";
         case HTP_OP_POOL_1D:         return "POOL_1D";
         case HTP_OP_TRI:             return "TRI";
+        case HTP_OP_HADAMARD:        return "HADAMARD";
         case HTP_OP_INVALID:         return "INVALID";
         default:                     return NULL;
     }
@@ -916,6 +917,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_POOL_2D]         = op_pool_2d,
     [HTP_OP_POOL_1D]         = op_pool_1d,
     [HTP_OP_TRI]             = op_unary,
+    [HTP_OP_HADAMARD]        = op_unary,
     [HTP_OP_FENCE]           = op_fence,
     [HTP_OP_ALLREDUCE]       = op_allreduce,
     [HTP_OP_ALLREDUCE_ADD]   = op_allreduce,

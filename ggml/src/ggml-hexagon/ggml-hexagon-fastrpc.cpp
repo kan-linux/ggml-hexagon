@@ -107,7 +107,7 @@
 
 #define SIZE_IN_MB                                      (1 << 20)
 
-#define GGML_HEXAGON_VERSION                            "0.5.9"
+#define GGML_HEXAGON_VERSION                            "0.5.11"
 
 // Forward declarations
 static bool                  ggmlhexagon_is_op_on_device(ggml_backend_dev_t dev, const ggml_tensor * op);
@@ -4041,7 +4041,7 @@ static void ggml_hexagon_precompute_unary_params(
 
     const size_t elem_size = ggml_type_size(src0->type);
     const size_t src0_data_row_size = (size_t) src0->ne[0] * elem_size;
-    const size_t dst_data_row_size  = (size_t) dst->ne[0]  * elem_size;
+    const size_t dst_data_row_size  = (size_t) dst->ne[0]  * ggml_type_size(dst->type);
 
     const size_t src0_row_size_aligned = hex_round_up((uint32_t) src0_data_row_size, 128);
     const size_t dst_row_size_aligned  = hex_round_up((uint32_t) dst_data_row_size,  128);
@@ -4375,6 +4375,7 @@ static bool mm_is_hmx_eligible(const ggml_backend_hexagon_context * ctx, const g
 // NOTE: fusion is only attempted for MUL_MATs that match the QKV/FFN pattern.
 static bool is_mergeable_mul_mat(const ggml_backend_hexagon_context * ctx, const ggml_tensor * t) {
     if (!t || t->op != GGML_OP_MUL_MAT)   return false;
+    if (ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD) return false;
     if (t->src[1]->type != GGML_TYPE_F32) return false;
     if (t->src[0]->ne[2] != 1 || t->src[0]->ne[3] != 1) return false;
     return ggml_is_quantized(t->src[0]->type) && !mm_is_hmx_eligible(ctx, t);
@@ -4952,6 +4953,27 @@ finalize:
     }
 }
 
+// A MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD is an FWHT over src1, not a
+// real matmul: src0 is only a Hadamard-matrix hint and is never read.
+static bool ggml_hexagon_op_mul_mat_use_fwht(const struct ggml_tensor * dst) {
+    if (dst->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    const int64_t n = src1->ne[0];
+    if (n < 32 || (n & (n - 1)) != 0) {
+        return false;
+    }
+
+    return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+           ggml_is_contiguous_rows(src1) && ggml_is_contiguous(dst) &&
+           ggml_are_same_shape(src1, dst);
+}
+
 // =================================================================================================
 //  section-9: backend implementation
 // =================================================================================================
@@ -4959,6 +4981,16 @@ static bool ggmlhexagon_supported_mul_mat(const struct ggml_tensor * dst,
                                           ggml_backend_hexagon_context * ctx) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        if (!ggml_hexagon_op_mul_mat_use_fwht(dst)) {
+            return false;
+        }
+        struct htp_unary_kernel_params ukparams;
+        ggml_hexagon_precompute_unary_params(ctx, HTP_OP_HADAMARD, src1, nullptr, dst, &ukparams);
+        return ukparams.vtcm_row_per_thread > 0 &&
+               (size_t) ukparams.vtcm_size <= (size_t) ctx->socinfo.vtcm_size_in_mb * 1024 * 1024;
+    }
 
     const int64_t m                 = src0->ne[1];
     const int64_t k                 = src0->ne[0];
@@ -5494,6 +5526,7 @@ static bool hexagon_validate_get_rows(ggml_backend_hexagon_context * ctx, const 
     }
 
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
+        src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_Q2_0 &&
         src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_K &&
         src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_I32) {
         return false;
@@ -7833,6 +7866,19 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 for (int k = 0; k < HTP_OP_MAX_INPUTS; k++) op.src_idx[k] = -1;
                 op.opcode   = node->op;
                 memcpy(op.params, node->op_params, sizeof(op.params));
+                if (node->op == GGML_OP_MUL_MAT &&
+                    ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                    // FWHT over src1; src0 is only a Hadamard-matrix hint and is not transferred.
+                    ggml_hexagon_precompute_unary_params(ctx, HTP_OP_HADAMARD,
+                        node->src[1], nullptr, node,
+                        (struct htp_unary_kernel_params *) op.kernel_params);
+                    op.htp_opcode = HTP_OP_HADAMARD;
+                    op.src_idx[0] = get_or_add_tensor_idx(node->src[1]);
+                    for (int k = 1; k < HTP_OP_MAX_INPUTS; k++) op.src_idx[k] = -1;
+                    op.dst_idx[0] = get_or_add_tensor_idx(node);
+                    hex_ops.push_back(op);
+                    continue;
+                }
                 if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
                     const bool is_matmul_id = (node->op == GGML_OP_MUL_MAT_ID);
                     ggml_hexagon_precompute_mm_params(ctx, node->src[0], node->src[1], node, op, is_matmul_id, NULL);
@@ -7975,7 +8021,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                     if (didx < n_tensors) dst_indices[didx] = 1;
                 }
                 for (const auto & op : hex_ops) {
-                    if (op.opcode == GGML_OP_MUL_MAT) {
+                    if (op.opcode == GGML_OP_MUL_MAT && op.htp_opcode != HTP_OP_HADAMARD) {
                         uint32_t sidx = op.src_idx[0];
                         if (sidx < n_tensors && !dst_indices[sidx] &&
                             !ctx->ever_dst_ptrs.count(tensor_src[sidx]->data)) {
@@ -7993,6 +8039,13 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             // indices. This ensures Phase 5/8 see live tensor pointers and
             // ne/nb/data from the current graph state.
             for (auto * node : supported_nodes) {
+                if (node->op == GGML_OP_MUL_MAT &&
+                    ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                    // match the miss path: only the activation and dst are transferred
+                    get_or_add_tensor_idx(node->src[1]);
+                    get_or_add_tensor_idx(node);
+                    continue;
+                }
                 get_or_add_tensor_idx(node->src[0]);
                 if (node->src[1]) get_or_add_tensor_idx(node->src[1]);
                 if (node->src[2]) get_or_add_tensor_idx(node->src[2]);
@@ -8092,7 +8145,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 }
             }
 
-            if (qkv_ffn_enabled && op.opcode == GGML_OP_MUL_MAT) {
+            if (qkv_ffn_enabled && op.opcode == GGML_OP_MUL_MAT && op.htp_opcode != HTP_OP_HADAMARD) {
                 // QKV fusion: 3 MUL_MAT (Q,K,V) -> HTP_OP_MUL_MAT_NX.
                 // The Q/K/V MUL_MATs may appear in either Q,K,V or Q,V,K order
                 // depending on the model (e.g. Gemma4/Llama3 uses Q,K,V, Qwen3 uses Q,V,K).
@@ -8260,7 +8313,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             // Gate: only fuse for HMX-eligible or single-row (decode).
             // Multi-row HVX matmuls benefit less from fusing the bias add
             // and the VTCM layout would need to accommodate src2.
-            if (is_opfusion_enabled(OPFUSE_MUL_MAT_ADD) && op.opcode == GGML_OP_MUL_MAT && i + 1 < hex_ops.size()) {
+            if (is_opfusion_enabled(OPFUSE_MUL_MAT_ADD) && op.opcode == GGML_OP_MUL_MAT &&
+                op.htp_opcode != HTP_OP_HADAMARD && i + 1 < hex_ops.size()) {
                 const hex_op_desc & next = hex_ops[i + 1];
                 if (next.opcode == GGML_OP_ADD &&
                     (next.src_idx[0] == op.dst_idx[0] || next.src_idx[1] == op.dst_idx[0])) {
