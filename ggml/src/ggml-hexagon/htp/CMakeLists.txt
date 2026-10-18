@@ -12,12 +12,15 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR})
 
-# Op sources shared by both skel variants (dspqueue entry via main.c and
-# mempool/FastRPC-invoke entry via entry.c). Entry points and glue differ per variant.
-set(HTP_OPS_SRCS
+set(HTP_LIB ggml-htp-${DSP_VERSION})
+
+add_library(${HTP_LIB} SHARED
+    main.c
+    htp_iface_skel.c
     work-queue.c
     dma-queue.c
     hmx-queue.c
+    htp-dcache.c
     matmul-ops.c
     flash-attn-ops.c
     gated-delta-net-ops.c
@@ -30,6 +33,7 @@ set(HTP_OPS_SRCS
     set-rows-ops.c
     get-rows-ops.c
     cpy-ops.c
+    gather-rows.c
     repeat-ops.c
     ssm-conv.c
     cumsum-ops.c
@@ -45,51 +49,13 @@ set(HTP_OPS_SRCS
     allreduce-ops.c
 )
 
-# Both variants build ggml-htp-${DSP_VERSION} (libggml-htp-vXX.so); only one
-# is built per configuration.
-option(GGML_HEXAGON_USE_MEMPOOL "Build the mempool/FastRPC-invoke skel variant (entry.c) instead of the dspqueue variant (main.c)" OFF)
+target_compile_definitions(${HTP_LIB} PRIVATE
+    $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
+    $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>)
 
-if (GGML_HEXAGON_USE_MEMPOOL)
-    set(HTP_LIB ggml-htp-${DSP_VERSION})
 
-    add_library(${HTP_LIB} SHARED
-        entry.c
-        ${CMAKE_CURRENT_BINARY_DIR}/ggml_htp_skel.c
-        htp-tensor.c
-        ${HTP_OPS_SRCS}
-    )
+build_idl(htp_iface.idl ${HTP_LIB})
 
-    target_compile_definitions(${HTP_LIB} PRIVATE
-        GGML_HEXAGON_USE_MEMPOOL=1
-        $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
-        $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>
-    )
+set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
 
-    target_compile_options(${HTP_LIB} PRIVATE -Wno-error)
-
-    build_idl(ggml_htp.idl ${HTP_LIB})
-
-    set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
-
-    install(TARGETS ${HTP_LIB})
-else()
-    set(HTP_LIB ggml-htp-${DSP_VERSION})
-
-    add_library(${HTP_LIB} SHARED
-        main.c
-        htp_iface_skel.c
-        htp-tensor.c
-        ${HTP_OPS_SRCS}
-    )
-
-    target_compile_definitions(${HTP_LIB} PRIVATE
-        $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
-        $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>
-    )
-
-    build_idl(htp_iface.idl ${HTP_LIB})
-
-    set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
-
-    install(TARGETS ${HTP_LIB})
-endif()
+install(TARGETS ${HTP_LIB})
