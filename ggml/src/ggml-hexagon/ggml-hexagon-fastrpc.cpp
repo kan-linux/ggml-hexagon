@@ -13,6 +13,7 @@
 
 #include <string>
 #include <string_view>
+#include <deque>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -105,6 +106,7 @@
 #include "htp-drv.h"
 #include "htp-common.h"
 #include "htp-kparams.h"
+#include "htp-opnode.h"
 
 // =================================================================================================
 //  section-1: forward declarations and special global vars
@@ -4143,163 +4145,6 @@ static bool ggml_hexagon_precompute_binary_params(
     return true;
 }
 
-// Collapse adjacent dims of elementwise unary ops so the kernel can treat the
-// tensor as fewer, larger rows. Mirrors htp_unary_collapse_dims() in htp-kparams.cpp.
-static void ggml_hexagon_unary_collapse_dims(struct ggml_tensor * src, struct ggml_tensor * dst, size_t elem_size) {
-    if (src->nb[0] != elem_size || dst->nb[0] != elem_size) {
-        return;
-    }
-
-    while (src->ne[1] > 1 || src->ne[2] > 1 || src->ne[3] > 1) {
-        const size_t row_size    = (size_t) src->ne[0] * elem_size;
-        const bool   rows_contig = src->nb[1] == row_size && dst->nb[1] == (size_t) dst->ne[0] * elem_size;
-        const bool   can_merge   = (src->ne[1] == 1 && dst->ne[1] == 1) ||
-                                   (rows_contig && (src->ne[0] == 1 || (row_size < 128 && row_size * src->ne[1] <= 2048)));
-        if (!can_merge) {
-            break;
-        }
-        src->ne[0] *= src->ne[1];
-        src->ne[1]  = src->ne[2];
-        src->ne[2]  = src->ne[3];
-        src->ne[3]  = 1;
-        dst->ne[0] *= dst->ne[1];
-        dst->ne[1]  = dst->ne[2];
-        dst->ne[2]  = dst->ne[3];
-        dst->ne[3]  = 1;
-        src->nb[1]  = src->nb[2];
-        src->nb[2]  = src->nb[3];
-        dst->nb[1]  = dst->nb[2];
-        dst->nb[2]  = dst->nb[3];
-    }
-
-    // ne1 too big to merge in full: merge it in chunks of k rows (k divides ne1)
-    const size_t row_size = (size_t) src->ne[0] * elem_size;
-    if (src->ne[1] > 1 && row_size < 128 && src->nb[1] == row_size && dst->nb[1] == row_size) {
-        int64_t k = 2048 / row_size;
-        while (k > 1 && src->ne[1] % k != 0) {
-            k--;
-        }
-        if (k > 1) {
-            src->ne[0] *= k;
-            src->ne[1] /= k;
-            src->nb[1] *= k;
-            dst->ne[0] *= k;
-            dst->ne[1] /= k;
-            dst->nb[1] *= k;
-        }
-    }
-}
-
-// Precompute htp_unary_kernel_params on AP side for unary ops (NORM, RMS_NORM,
-// RMS_NORM_MUL, SCALE, SQR, SQRT, UNARY_*, L2_NORM, TRI, HADAMARD).
-// Mirrors htp_kparams_solve_unary_impl() in htp-kparams.cpp.
-static void ggml_hexagon_precompute_unary_params(
-    const ggml_hexagon_session * ctx,
-    uint32_t op,
-    const ggml_tensor * src0,
-    const ggml_tensor * src1,
-    const ggml_tensor * dst,
-    struct htp_unary_kernel_params * kparams
-) {
-    memset(kparams, 0, sizeof(*kparams));
-
-    if (op == HTP_OP_HADAMARD) {
-        const int64_t n = src0->ne[0];
-        if (n < 32 || (n & (n - 1)) != 0) {
-            return;
-        }
-        if (!dst->src[0] || dst->src[0]->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-            (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16)) {
-            return;
-        }
-    } else {
-        if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) || dst->type != src0->type) {
-            return;
-        }
-        if (op == HTP_OP_TRI && (src0->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0))) {
-            return;
-        }
-        if (src0->type == GGML_TYPE_F16) {
-            switch (op) {
-                case HTP_OP_NORM:
-                case HTP_OP_RMS_NORM:
-                case HTP_OP_L2_NORM:
-                case HTP_OP_SCALE:
-                case HTP_OP_CLAMP:
-                case HTP_OP_SQR:
-                case HTP_OP_SQRT:
-                case HTP_OP_UNARY_LOG:
-                case HTP_OP_UNARY_ABS:
-                case HTP_OP_UNARY_STEP:
-                case HTP_OP_UNARY_CEIL:
-                case HTP_OP_UNARY_SGN:
-                    break;
-                default:
-                    return;
-            }
-        }
-    }
-
-    if (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous(dst) || !ggml_are_same_shape(src0, dst)) {
-        return;
-    }
-
-    const size_t elem_size = ggml_type_size(src0->type);
-
-    struct ggml_tensor src0_c = *src0;
-    struct ggml_tensor dst_c  = *dst;
-    if (htp_unary_is_elementwise(op)) {
-        ggml_hexagon_unary_collapse_dims(&src0_c, &dst_c, elem_size);
-        src0 = &src0_c;
-        dst  = &dst_c;
-        for (int i = 0; i < HTP_OP_MAX_DIMS; i++) {
-            kparams->ne[i]      = (uint32_t) src0->ne[i];
-            kparams->src0_nb[i] = (uint32_t) src0->nb[i];
-            kparams->dst_nb[i]  = (uint32_t) dst->nb[i];
-        }
-    }
-
-    const size_t dst_data_row_size = dst->ne[0] * ggml_type_size(dst->type);
-
-    const uint32_t src0_nrows          = (uint32_t)(src0->ne[1] * src0->ne[2] * src0->ne[3]);
-    const uint32_t min_rows_per_thread = (uint32_t)(std::max<size_t>(1, (128 + dst_data_row_size - 1) / dst_data_row_size));
-    const uint32_t max_threads         = (std::max)(1u, src0_nrows / min_rows_per_thread);
-    const uint32_t n_threads           = (std::min)((uint32_t) ctx->n_threads, max_threads);
-    const size_t   vtcm_size           = ctx->socinfo.vtcm_size_in_mb * 1024ull * 1024ull;
-
-    kparams->n_threads = n_threads;
-
-    const bool broadcast_weight = (op == HTP_OP_RMS_NORM_MUL) && (src1->ne[1] * src1->ne[2] * src1->ne[3] == 1);
-    kparams->broadcast_weight   = broadcast_weight;
-
-    const bool     src0_contig = ggml_is_contiguous_1(src0);
-    const bool     src1_contig = (op == HTP_OP_RMS_NORM_MUL && !broadcast_weight) ? ggml_is_contiguous_1(src1) : true;
-    const uint32_t max_block   = (src0_contig && src1_contig) ? src0_nrows : (uint32_t) src0->ne[1];
-
-    kparams->src0_contig = src0_contig ? 1 : 0;
-    kparams->src1_contig = src1_contig ? 1 : 0;
-
-    struct htp_unary_vtcm_layout L;
-    uint32_t col_tile            = 0;
-    uint32_t vtcm_row_per_thread = 0;
-
-    htp_unary_solve_layout(&L, op, (uint32_t) src0->ne[0], (uint32_t) dst->ne[0],
-                           op == HTP_OP_RMS_NORM_MUL ? (uint32_t) src1->ne[0] : 0,
-                           max_block, broadcast_weight, n_threads, vtcm_size, elem_size,
-                           &col_tile, &vtcm_row_per_thread);
-
-    kparams->col_tile  = col_tile;
-    kparams->vtcm_size = (uint32_t) L.total_bytes;
-    kparams->block     = col_tile ? 0 : vtcm_row_per_thread;
-
-    const uint32_t tiles_per_row = col_tile > 0 ? ((uint32_t) src0->ne[0] + col_tile - 1) / col_tile : 1;
-    kparams->tiles_per_row       = tiles_per_row;
-    kparams->div_ne01  = init_fastdiv_values((uint32_t) src0->ne[1]);
-    kparams->div_ne02  = init_fastdiv_values((uint32_t) src0->ne[2]);
-    kparams->div_ne012 = init_fastdiv_values((uint32_t)(src0->ne[1] * src0->ne[2]));
-    kparams->div_tpr   = init_fastdiv_values(tiles_per_row);
-}
-
 // Precompute htp_glu_kernel_params on AP side for GLU ops. Mirrors
 // htp_kparams_solve_unary_mul_glu() in htp-kparams.cpp.
 static bool ggml_hexagon_precompute_glu_params(
@@ -5068,6 +4913,17 @@ static void ggml_hexagon_precompute_mm_params(
     const int ne01 = src0->ne[1];
     const int ne02 = src0->ne[2];
     const int ne03 = src0->ne[3];
+
+    // PR-31071: collapse is host-side; DSP no longer rewrites shapes.
+    // Mirror htp_kparams_solve_matmul() and feed the solver the collapsed view.
+    ggml_tensor src1_c;
+    ggml_tensor dst_c;
+    if (!is_matmul_id && src1 && dst && htp_matmul_can_collapse(src0, src1, dst)) {
+        src1_c = htp_tensor_collapse_rows(src1);
+        dst_c  = htp_tensor_collapse_rows(dst);
+        src1   = &src1_c;
+        dst    = &dst_c;
+    }
 
     const int ne10 = src1->ne[0];
     const int ne11 = src1->ne[1];
@@ -8054,6 +7910,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // Storage for cache-miss path; on cache hit we reference cached vectors
     // directly to avoid copying ~20-110 KB of descriptors per call.
     std::vector<ggml_tensor *>  local_tensor_src;
+    // PR-31071 collapsed views referenced by local_tensor_src. Must outlive all
+    // phases that walk tensor_src (same lifetime as local_tensor_src).
+    std::deque<ggml_tensor>     collapsed_pool;
     std::vector<hex_op_desc>    local_hex_ops;
     std::vector<uint8_t>        local_is_weight;
     std::vector<uint32_t>       local_mirror_offset;  // per-tensor heap mirror mempool offset, UINT32_MAX = none
@@ -8193,6 +8052,81 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             tensor_src.push_back(t);
             return idx;
         };
+        // PR-31071: pack a node-local collapsed view so the DSP sees the same
+        // shape the solver used. Copy out of the htp_opnode dummy pool before
+        // the node goes out of scope.
+        auto get_or_add_dummy_idx = [&](const ggml_tensor * t) -> int32_t {
+            if (!t) return -1;
+            collapsed_pool.push_back(*t);
+            return get_or_add_tensor_idx(&collapsed_pool.back());
+        };
+        auto get_or_add_collapsed_idx = [&](ggml_tensor * t) -> int32_t {
+            if (!t) return -1;
+            collapsed_pool.push_back(htp_tensor_collapse_rows(t));
+            return get_or_add_tensor_idx(&collapsed_pool.back());
+        };
+
+        // Register this node's tensors in a fixed order so cache-hit rebuild
+        // produces the same indices as cache-miss. Writes src_idx/dst_idx when
+        // op_out is non-null. Returns false if the node should be skipped.
+        auto register_node_tensors = [&](ggml_tensor * node, hex_op_desc * op_out) -> bool {
+            auto set_src = [&](int s, int32_t idx) { if (op_out) op_out->src_idx[s] = idx; };
+            auto set_dst = [&](int d, int32_t idx) { if (op_out) op_out->dst_idx[d] = idx; };
+
+            if (node->op == GGML_OP_MUL_MAT &&
+                ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                htp_opnode tmp(HTP_OP_HADAMARD, node);
+                if (!htp_kparams_solve(ctx, tmp)) {
+                    return false;
+                }
+                if (op_out) {
+                    memcpy(op_out->kernel_params, tmp.kernel_params, sizeof(op_out->kernel_params));
+                    op_out->htp_opcode = HTP_OP_HADAMARD;
+                }
+                set_src(0, get_or_add_dummy_idx(tmp.inputs.empty() ? nullptr : tmp.inputs[0]));
+                for (int k = 1; k < HTP_OP_MAX_INPUTS; k++) set_src(k, -1);
+                set_dst(0, get_or_add_dummy_idx(tmp.outputs.empty() ? nullptr : tmp.outputs[0]));
+                return true;
+            }
+
+            if (node->op == GGML_OP_MUL_MAT && htp_matmul_can_collapse(node->src[0], node->src[1], node)) {
+                set_src(0, get_or_add_tensor_idx(node->src[0]));
+                for (int s = 1; s < HTP_OP_MAX_INPUTS; s++) {
+                    set_src(s, node->src[s] ? get_or_add_tensor_idx(node->src[s]) : -1);
+                }
+                set_dst(0, get_or_add_tensor_idx(node));
+                set_src(1, get_or_add_collapsed_idx(node->src[1]));
+                set_dst(0, get_or_add_collapsed_idx(node));
+                return true;
+            }
+
+            if (htp_op_is_unary(htp_op_remap(node)) || htp_op_is_glu(htp_op_remap(node))) {
+                htp_opnode tmp(htp_op_remap(node), node);
+                if (!htp_kparams_solve(ctx, tmp)) {
+                    return false;
+                }
+                if (op_out) {
+                    memcpy(op_out->kernel_params, tmp.kernel_params, sizeof(op_out->kernel_params));
+                    op_out->htp_opcode = (int32_t) htp_op_remap(node);
+                }
+                for (int s = 0; s < HTP_OP_MAX_INPUTS; s++) {
+                    set_src(s, (s < (int) tmp.inputs.size()) ? get_or_add_dummy_idx(tmp.inputs[s]) : -1);
+                }
+                for (int d = 0; d < HTP_OP_MAX_OUTPUTS; d++) {
+                    set_dst(d, (d < (int) tmp.outputs.size())
+                                   ? get_or_add_dummy_idx(tmp.outputs[d])
+                                   : (d == 0 ? get_or_add_tensor_idx(node) : -1));
+                }
+                return true;
+            }
+
+            set_src(0, get_or_add_tensor_idx(node->src[0]));
+            for (int s = 1; s < HTP_OP_MAX_INPUTS; s++) {
+                set_src(s, node->src[s] ? get_or_add_tensor_idx(node->src[s]) : -1);
+            }
+            set_dst(0, get_or_add_tensor_idx(node));
+            return true;
+        };
 
         if (!cache_hit) {
             for (auto * node : supported_nodes) {
@@ -8204,14 +8138,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 memcpy(op.params, node->op_params, sizeof(op.params));
                 if (node->op == GGML_OP_MUL_MAT &&
                     ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-                    // FWHT over src1; src0 is only a Hadamard-matrix hint and is not transferred.
-                    // kparams via the shared solver (it swaps src for HADAMARD internally).
-                    ggmlhexagon_solve_kparams(ctx, node,
-                        (struct htp_unary_kernel_params *) op.kernel_params);
-                    op.htp_opcode = HTP_OP_HADAMARD;
-                    op.src_idx[0] = get_or_add_tensor_idx(node->src[1]);
-                    for (int k = 1; k < HTP_OP_MAX_INPUTS; k++) op.src_idx[k] = -1;
-                    op.dst_idx[0] = get_or_add_tensor_idx(node);
+                    if (!register_node_tensors(node, &op)) {
+                        continue;
+                    }
                     hex_ops.push_back(op);
                     continue;
                 }
@@ -8232,6 +8161,12 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                     if (fa_op != HTP_OP_INVALID) {
                         op.htp_opcode = (int32_t) fa_op;
                     }
+                } else if (htp_op_is_unary(htp_op_remap(node)) || htp_op_is_glu(htp_op_remap(node))) {
+                    if (!register_node_tensors(node, &op)) {
+                        continue;
+                    }
+                    hex_ops.push_back(op);
+                    continue;
                 } else {
                     // Base kparams for every non-fused op through the shared
                     // upstream solver (htp-kparams.cpp). This is the single source
@@ -8250,13 +8185,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                         continue;
                     }
                 }
-                op.src_idx[0] = get_or_add_tensor_idx(node->src[0]);
-                op.src_idx[1] = (node->src[1]) ? get_or_add_tensor_idx(node->src[1]) : -1;
-                op.src_idx[2] = (node->src[2]) ? get_or_add_tensor_idx(node->src[2]) : -1;
-                op.src_idx[3] = (node->src[3]) ? get_or_add_tensor_idx(node->src[3]) : -1;
-                op.src_idx[4] = (node->src[4]) ? get_or_add_tensor_idx(node->src[4]) : -1;
-                op.src_idx[5] = (node->src[5]) ? get_or_add_tensor_idx(node->src[5]) : -1;
-                op.dst_idx[0]  = get_or_add_tensor_idx(node);
+                if (!register_node_tensors(node, &op)) {
+                    continue;
+                }
                 hex_ops.push_back(op);
             }
 
@@ -8309,26 +8240,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 }
             }
         } else {
-            // Cache hit: rebuild tensor_src from current cgraph. The content
-            // hash guarantees the graph structure is identical, so the tensor
-            // ordering from get_or_add_tensor_idx will match the cached hex_ops
-            // indices. This ensures Phase 5/8 see live tensor pointers and
-            // ne/nb/data from the current graph state.
+            // Cache hit: rebuild tensor_src with the same register_node_tensors
+            // order as the miss path so hex_ops indices still line up.
             for (auto * node : supported_nodes) {
-                if (node->op == GGML_OP_MUL_MAT &&
-                    ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-                    // match the miss path: only the activation and dst are transferred
-                    get_or_add_tensor_idx(node->src[1]);
-                    get_or_add_tensor_idx(node);
-                    continue;
-                }
-                get_or_add_tensor_idx(node->src[0]);
-                if (node->src[1]) get_or_add_tensor_idx(node->src[1]);
-                if (node->src[2]) get_or_add_tensor_idx(node->src[2]);
-                if (node->src[3]) get_or_add_tensor_idx(node->src[3]);
-                if (node->src[4]) get_or_add_tensor_idx(node->src[4]);
-                if (node->src[5]) get_or_add_tensor_idx(node->src[5]);
-                get_or_add_tensor_idx(node);
+                register_node_tensors(node, nullptr);
             }
 
             // Verify rebuilt tensor_src matches cached n_tensors (sanity check).
