@@ -55,8 +55,8 @@ OPENCL_HEADERS_PATH=${OPENCL_SDK_PATH}/OpenCL-Headers
 
 #fully Qualcomm Hexagon SDK can be found at https://developer.qualcomm.com/software/hexagon-dsp-sdk/tools.
 #fully Hexagon SDK must be obtained with Qualcomm Developer Account and follow PKLA&ECA.
-HEXAGON_SDK_VERSION=6.6.0.0
-HEXAGON_TOOLS_VERSION=19.0.07
+HEXAGON_SDK_VERSION=6.7.0.0
+HEXAGON_TOOLS_VERSION=21.0.04
 HEXAGON_SDK_PATH=${TOOLCHAIN_PATH}/Hexagon_SDK/${HEXAGON_SDK_VERSION}
 HEXAGON_TOOLS_PATH=${HEXAGON_SDK_PATH}/tools/HEXAGON_Tools/${HEXAGON_TOOLS_VERSION}
 
@@ -229,21 +229,21 @@ function check_and_download_hexagon_sdk()
 
     if [ ${is_hexagon_llvm_exist} -eq 0 ]; then
         mkdir -p ${TOOLCHAIN_PATH}/Hexagon_SDK/
-        if [ -f ${TOOLCHAIN_PATH}/Hexagon_SDK/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz ]; then
-            echo -e "hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz already exist\n"
+        if [ -f ${TOOLCHAIN_PATH}/Hexagon_SDK/hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz ]; then
+            echo -e "hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz already exist\n"
         else
-            echo -e "begin downloading hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz \n"
-            wget --no-config --quiet --show-progress -O ${TOOLCHAIN_PATH}/Hexagon_SDK/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
+            echo -e "begin downloading hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz \n"
+            wget --no-config --quiet --show-progress -O ${TOOLCHAIN_PATH}/Hexagon_SDK/hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v${HEXAGON_SDK_VERSION}/hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz
             if [ $? -ne 0 ]; then
-                printf "failed to download hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz\n"
+                printf "failed to download hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz\n"
                 exit 1
             fi
         fi
 
-        echo -e "begin decompressing hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz \n"
-        xzcat ${TOOLCHAIN_PATH}/Hexagon_SDK/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz | tar -C ${TOOLCHAIN_PATH}/Hexagon_SDK/ -xf -
+        echo -e "begin decompressing hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz \n"
+        xzcat ${TOOLCHAIN_PATH}/Hexagon_SDK/hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz | tar -C ${TOOLCHAIN_PATH}/Hexagon_SDK/ -xf -
         if [ $? -ne 0 ]; then
-            printf "failed to decompress hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz\n"
+            printf "failed to decompress hexagon-sdk-v${HEXAGON_SDK_VERSION}-amd64-lnx.tar.xz\n"
             exit 1
         fi
         printf "install minimal-hexagon-sdk successfully\n\n"
