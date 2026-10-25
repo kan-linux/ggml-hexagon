@@ -216,8 +216,15 @@ static uint32_t fa_scan_active_blocks(
     }
 
     const dma_addr_t m_src = mask->data + q_start * mask->nb[1] + im2 * mask->nb[2] + im3 * mask->nb[3];
-    dma_queue_push(dma_q, dma_make_data(vtcm_scratch, m_src), row_stride, mask->nb[1], row_bytes, n_rows_q);
+    if (!dma_queue_push(dma_q, dma_make_data(vtcm_scratch, m_src), row_stride, mask->nb[1], row_bytes, n_rows_q)) {
+        for (uint32_t b = 0; b < n_kv_blocks; ++b) active_blocks[b] = (uint16_t) b;
+        return n_kv_blocks;
+    }
     const uint8_t * m_buf = (const uint8_t *) dma_queue_pop(dma_q).dst;
+    if (!m_buf) {
+        for (uint32_t b = 0; b < n_kv_blocks; ++b) active_blocks[b] = (uint16_t) b;
+        return n_kv_blocks;
+    }
 
     const HVX_Vector v_ninf   = Q6_Vh_vsplat_R(0xFC00);
     uint32_t         n_active = 0;
@@ -451,6 +458,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
         // Pop all Q rows
         for (uint32_t g = 0; g < G_local; ++g) {
             uint8_t * q_ptr_vtcm = (void *) dma_queue_pop(dma_q).dst;
+            if (!q_ptr_vtcm) continue; // DMA ring underflow
             if (factx->is_q_fp32) {
                 hvx_copy_f16_f32_aa(q_ptr_vtcm, q_ptr_vtcm, DK);
             }
@@ -473,6 +481,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             uint8_t * k_base = (void *) dma_queue_pop(dma_q).dst; // K
             uint8_t * v_base = (void *) dma_queue_pop(dma_q).dst; // V
             __fp16  * m_base = mask ? (__fp16 *) dma_queue_pop(dma_q).dst : NULL; // M
+            if (!k_base || !v_base || (mask && !m_base)) continue; // DMA ring underflow
 
             if (factx->k->type == HTP_TYPE_Q8_0) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
@@ -2344,6 +2353,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                     // Prep and start QK-dot(0)
                     void * curr_k0 = (void *) dma_queue_pop(dma_q).dst;
+                    if (!curr_k0) continue; // DMA ring underflow
                     fa_phase_k_interleave(&factx, b0_rows, k_src_stride, curr_k0, b0_start, 0);
 
                     qk_job[0].q_tiles        = factx.vtcm_q_tiles;
@@ -2364,6 +2374,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // ---- 1. Pop and run V-prep for current block ----
                         void * curr_v = (void *) dma_queue_pop(dma_q).dst;
+                        if (!curr_v) continue;
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
 
                         // ---- 2. Pop and run mask-prep for current block ----
@@ -2409,6 +2420,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             const size_t   next_buf   = 1 - buf_idx;
 
                             void * next_k = (void *) dma_queue_pop(dma_q).dst;
+                            if (!next_k) continue;
                             fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k, next_start, next_buf);
 
                             qk_job[next_buf].q_tiles        = factx.vtcm_q_tiles;
@@ -2522,6 +2534,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Wait for current K DMA and interleave
                         void * curr_k = (void *) dma_queue_pop(dma_q).dst;
+                        if (!curr_k) continue;
                         fa_phase_k_interleave(&factx, kv_rows, k_src_stride, curr_k, kv_start, 0);
 
                         {
@@ -2540,6 +2553,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Wait for current V DMA and interleave
                         void * curr_v = (void *) dma_queue_pop(dma_q).dst;
+                        if (!curr_v) continue;
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[0], n_tiles_per_bc, kv_start);
 
                         // ---- Phase 3: softmax + build_D ----

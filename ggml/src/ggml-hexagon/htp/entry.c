@@ -23,6 +23,7 @@
 #include "htp-fence.h"
 #include "matmul-ops.h"
 #include "flash-attn-ops.h"
+#include "gated-delta-net-ops.h"
 
 // =================================================================================================
 // forward declarations, global vars, macros
@@ -173,9 +174,15 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_UNARY_GELU_QUICK:return "UNARY_GELU_QUICK";
         case HTP_OP_GLU_SWIGLU:      return "GLU_SWIGLU";
         case HTP_OP_GLU_SWIGLU_OAI:  return "GLU_SWIGLU_OAI";
+        case HTP_OP_GLU_SWIGLU_CLAMP:return "GLU_SWIGLU_CLAMP";
         case HTP_OP_GLU_GEGLU:       return "GLU_GEGLU";
         case HTP_OP_GLU_GEGLU_QUICK: return "GLU_GEGLU_QUICK";
         case HTP_OP_GLU_GEGLU_ERF:   return "GLU_GEGLU_ERF";
+        case HTP_OP_GLU_REGLU:       return "GLU_REGLU";
+        case HTP_OP_GLU_SIGMOID:     return "GLU_SIGMOID";
+        case HTP_OP_UNARY_CEIL:      return "UNARY_CEIL";
+        case HTP_OP_UNARY_SGN:       return "UNARY_SGN";
+        case HTP_OP_SUM:             return "SUM";
         case HTP_OP_SOFTMAX:         return "SOFTMAX";
         case HTP_OP_ROPE:            return "ROPE";
         case HTP_OP_FLASH_ATTN_EXT:  return "FLASH_ATTN_EXT";
@@ -884,12 +891,16 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_UNARY_GELU]      = op_unary,
     [HTP_OP_UNARY_GELU_ERF]  = op_unary,
     [HTP_OP_UNARY_GELU_QUICK]= op_unary,
-    [HTP_OP_GLU_SWIGLU]      = op_activations,
-    [HTP_OP_GLU_SWIGLU_OAI]  = op_activations,
-    [HTP_OP_GLU_SWIGLU_CLAMP] = op_activations,
-    [HTP_OP_GLU_GEGLU]       = op_activations,
-    [HTP_OP_GLU_GEGLU_QUICK] = op_activations,
-    [HTP_OP_GLU_GEGLU_ERF]   = op_activations,
+    [HTP_OP_UNARY_CEIL]      = op_unary,
+    [HTP_OP_UNARY_SGN]       = op_unary,
+    [HTP_OP_GLU_SWIGLU]      = op_glu,
+    [HTP_OP_GLU_SWIGLU_OAI]  = op_glu,
+    [HTP_OP_GLU_SWIGLU_CLAMP] = op_glu,
+    [HTP_OP_GLU_GEGLU]       = op_glu,
+    [HTP_OP_GLU_GEGLU_QUICK] = op_glu,
+    [HTP_OP_GLU_GEGLU_ERF]   = op_glu,
+    [HTP_OP_GLU_REGLU]       = op_glu,
+    [HTP_OP_GLU_SIGMOID]     = op_glu,
     [HTP_OP_SOFTMAX]         = op_softmax,
     [HTP_OP_ADD_ID]          = op_binary,
     [HTP_OP_ROPE]            = op_rope,
@@ -1091,6 +1102,8 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
                 case GGML_UNARY_OP_ABS:      *htp_op = HTP_OP_UNARY_ABS;      return 0;
                 case GGML_UNARY_OP_RELU:     *htp_op = HTP_OP_UNARY_RELU;     return 0;
                 case GGML_UNARY_OP_STEP:     *htp_op = HTP_OP_UNARY_STEP;     return 0;
+                case GGML_UNARY_OP_CEIL:     *htp_op = HTP_OP_UNARY_CEIL;     return 0;
+                case GGML_UNARY_OP_SGN:      *htp_op = HTP_OP_UNARY_SGN;      return 0;
                 default:
                     FARF(ERROR, "ggml_op_to_htp_op: unsupported unary_op %d", op_params[0]);
                     return -1;
@@ -1108,6 +1121,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
                 case GGML_GLU_OP_GEGLU:       *htp_op = HTP_OP_GLU_GEGLU;       return 0;
                 case GGML_GLU_OP_GEGLU_QUICK: *htp_op = HTP_OP_GLU_GEGLU_QUICK; return 0;
                 case GGML_GLU_OP_GEGLU_ERF:   *htp_op = HTP_OP_GLU_GEGLU_ERF;   return 0;
+                case GGML_GLU_OP_REGLU:       *htp_op = HTP_OP_GLU_REGLU;       return 0;
                 default:
                     FARF(ERROR, "ggml_op_to_htp_op: unsupported glu_op %d", op_params[0]);
                     return -1;
@@ -1139,8 +1153,6 @@ static void build_htp_octx(
     octx->flags = 0;
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;
-    octx->src2_spad.src = NULL;
-    octx->src3_spad.src = NULL;
     octx->dst_spad.src  = NULL;
 
     octx->ctx = g_dsp_ctx->htp_ctx;
@@ -1270,9 +1282,6 @@ static bool build_mm_hmx_params(struct htp_ops_context * octx,
     kparams->aligned_tile_size  = (int32_t) aligned_tile_size;
     kparams->act_row_size       = (int32_t) htp_mm_tiled_act_row_size(wtype, ne10);
     kparams->vtcm_size          = (int32_t) best_vtcm_size;
-    kparams->vtcm_src0_size     = 0;
-    kparams->vtcm_act_size      = 0;
-    kparams->vtcm_dst_size      = 0;
     kparams->n_prefetch         = 16;
     kparams->kernel_type        = is_batched ? HTP_MM_KERNEL_HMX_BATCHED
                                              : HTP_MM_KERNEL_HMX_2D;
@@ -1339,9 +1348,6 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
         kparams->kernel_type    = HTP_MM_KERNEL_HVX_F32_F32_VTCM;
         kparams->act_row_size   = hex_round_up(ne10 * 4, 128);
         kparams->vtcm_size      = (int32_t) vtcm_size;
-        kparams->vtcm_src0_size = (int32_t) vtcm_src0_size;
-        kparams->vtcm_act_size  = (int32_t) vtcm_src1_size;
-        kparams->vtcm_dst_size  = (int32_t) vtcm_dst_size;
     } else if (wtype == HTP_TYPE_F16) {
         // PR #29197 removed the HVX_F16_F16_DDR and HVX_F16_F32_DDR kernels.
         if (is_batched || is_permuted) return -1;
@@ -1353,9 +1359,6 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
         kparams->kernel_type    = HTP_MM_KERNEL_HVX_F16_F16_VTCM;
         kparams->act_row_size   = hex_round_up(ne10 * 2, 128);
         kparams->vtcm_size      = (int32_t) vtcm_size;
-        kparams->vtcm_src0_size = (int32_t) vtcm_src0_size;
-        kparams->vtcm_act_size  = (int32_t) vtcm_src1_size;
-        kparams->vtcm_dst_size  = (int32_t) vtcm_dst_size;
     } else {
         // Quantized HVX path (Q4_0, Q4_1, Q8_0, IQ4_NL, MXFP4, K-quants, Q1_0, Q2_0)
         kparams->tile_size         = (int32_t) htp_tensor_get_tile_size(wtype);
@@ -1394,9 +1397,6 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
         if (total_size > g_dsp_ctx->vtcm_size) return -1;
         kparams->n_prefetch     = (int32_t) best_n_prefetch;
         kparams->vtcm_size      = (int32_t) total_size;
-        kparams->vtcm_src0_size = (int32_t) vs0;
-        kparams->vtcm_act_size  = (int32_t) vs1;
-        kparams->vtcm_dst_size  = (int32_t) vd;
     }
 
 mm_finalize:
@@ -1429,6 +1429,19 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
     ctx->htp_ctx = (struct htp_context *)calloc(1, sizeof(struct htp_context));
     GGML_ASSERT(NULL != ctx->htp_ctx);
 
+    // Large FA scratch lives here to keep stack usage low (PR-30843).
+    // fa_get_ddr_spad() returns NULL when this is missing and FLASH_ATTN_EXT
+    // then fails with INTERNAL_ERR.
+    ctx->htp_ctx->ddr_spad_size = 512 * 1024;
+    ctx->htp_ctx->ddr_spad_base = memalign(128, ctx->htp_ctx->ddr_spad_size);
+    if (!ctx->htp_ctx->ddr_spad_base) {
+        GGMLHEXAGON_LOG_ERROR("ddr_spad memalign failed\n");
+        free(ctx->htp_ctx);
+        free(ctx);
+        *handle = 0;
+        return AEE_EFAILED;
+    }
+
     // Allocate large per-session arrays from a single mempool.
     // pre_dt and pre_ht are [DSP_OPT_MAX_TENSORS]; prior_dst_ranges and
     // bulk_flush_ranges are [DSP_OPT_MAX_BATCH_DSTS].
@@ -1447,6 +1460,7 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
         ctx->arrays_pool = memalign(128, pool_sz);
         if (!ctx->arrays_pool) {
             GGMLHEXAGON_LOG_ERROR("arrays_pool memalign failed\n");
+            free(ctx->htp_ctx->ddr_spad_base);
             free(ctx->htp_ctx);
             free(ctx);
             *handle = 0;
@@ -1562,6 +1576,7 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
     if (ctx->compute_res_ctx_id == 0) {
         GGMLHEXAGON_LOG_ERROR("HAP_compute_res_acquire failed, no VTCM available\n");
         free(ctx->arrays_pool);
+        free(ctx->htp_ctx->ddr_spad_base);
         free(ctx->htp_ctx);
         free(ctx);
         *handle = 0;
@@ -1574,6 +1589,7 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
             GGMLHEXAGON_LOG_ERROR("HAP_compute_res_attr_get_vtcm_ptr_v2 failed\n");
             HAP_compute_res_release(ctx->compute_res_ctx_id);
             free(ctx->arrays_pool);
+            free(ctx->htp_ctx->ddr_spad_base);
             free(ctx->htp_ctx);
             free(ctx);
             *handle = 0;
@@ -1702,6 +1718,11 @@ int ggml_htp_close(remote_handle64 handle) {
                 ctx->dma_alias_bufs[i] = NULL;
             }
         }
+        if (ctx->htp_ctx->ddr_spad_base) {
+            free(ctx->htp_ctx->ddr_spad_base);
+            ctx->htp_ctx->ddr_spad_base = NULL;
+            ctx->htp_ctx->ddr_spad_size = 0;
+        }
         free(ctx->htp_ctx);
         ctx->htp_ctx = NULL;
     }
@@ -1795,6 +1816,11 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
                 g_dsp_ctx->dma_alias_bufs[i] = NULL;
             }
         }
+        if (g_dsp_ctx->htp_ctx->ddr_spad_base) {
+            free(g_dsp_ctx->htp_ctx->ddr_spad_base);
+            g_dsp_ctx->htp_ctx->ddr_spad_base = NULL;
+            g_dsp_ctx->htp_ctx->ddr_spad_size = 0;
+        }
         memset(g_dsp_ctx->htp_ctx, 0, sizeof(*g_dsp_ctx->htp_ctx));
         g_dsp_ctx->htp_ctx->vtcm_base      = (uint8_t *)g_dsp_ctx->vtcm_base;
         g_dsp_ctx->htp_ctx->vtcm_size      = g_dsp_ctx->vtcm_size;
@@ -1803,6 +1829,16 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
         g_dsp_ctx->htp_ctx->n_threads      = (uint32_t)g_dsp_ctx->thread_counts;
         g_dsp_ctx->htp_ctx->n_threads_div  = init_fastdiv_values((uint32_t)g_dsp_ctx->thread_counts);
         g_dsp_ctx->htp_ctx->hmx_enabled    = g_dsp_ctx->hmx_available ? true : false;
+
+        // Large FA scratch lives here to keep stack usage low (PR-30843).
+        // fa_get_ddr_spad() returns NULL when this is missing and FLASH_ATTN_EXT
+        // then fails with INTERNAL_ERR. Must be after the memset above.
+        g_dsp_ctx->htp_ctx->ddr_spad_size = 512 * 1024;
+        g_dsp_ctx->htp_ctx->ddr_spad_base = memalign(128, g_dsp_ctx->htp_ctx->ddr_spad_size);
+        if (!g_dsp_ctx->htp_ctx->ddr_spad_base) {
+            GGMLHEXAGON_LOG_ERROR("ddr_spad memalign failed\n");
+            g_dsp_ctx->htp_ctx->ddr_spad_size = 0;
+        }
 
         // work_queue: backing buffer holds worker stacks + queue struct.
         size_t wq_size  = work_queue_sizeof((uint32_t)g_dsp_ctx->thread_counts,
@@ -2286,6 +2322,16 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
             }
         }
 
+        if (htp_op == HTP_OP_GATED_DELTA_NET) {
+            const struct htp_gdn_kernel_params * gk = (const struct htp_gdn_kernel_params *) octx.kernel_params;
+            GGMLHEXAGON_LOG_DEBUG("[DSP-GDN-KP] op%u ktype=%u pipe=%u ch=%u nch=%u bh=%u nth=%u",
+                                    i, gk->kernel_type, gk->pipeline, gk->chunk_size, gk->n_chunks,
+                                    gk->n_heads_batch, gk->n_threads);
+            GGMLHEXAGON_LOG_DEBUG("[DSP-GDN-KP] op%u Sv=%u H=%u nt=%u ns=%u K=%u rows=%u kda=%u vtcm=%u",
+                                    i, gk->S_v, gk->H, gk->n_tokens, gk->n_seqs, gk->K,
+                                    gk->total_rows, gk->kda, gk->vtcm_size);
+        }
+
 #ifndef NDEBUG
         /* F32 MUL_MAT diagnostic: dump src0 row 0/16, src1 row 0, dst[16] BEFORE execute_op. */
         if (htp_op == HTP_OP_MUL_MAT && src0_dt->type == 0 /*F32*/ &&
@@ -2333,8 +2379,6 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         // Clear spad refs (matches proc_op_req post-execute cleanup)
         octx.src0_spad.src = NULL;
         octx.src1_spad.src = NULL;
-        octx.src2_spad.src = NULL;
-        octx.src3_spad.src = NULL;
         octx.dst_spad.src  = NULL;
 
         if (op_ret != HTP_STATUS_OK) {
