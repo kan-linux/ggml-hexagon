@@ -56,6 +56,8 @@ if (GGML_HEXAGON_USE_MEMPOOL)
 
     ggml_add_backend_library(${TARGET_NAME}
         ggml-hexagon-fastrpc.cpp
+        htp-kparams.cpp
+        htp-kparams.h
         htp-drv.cpp
         htp-drv.h
         libdl.h
