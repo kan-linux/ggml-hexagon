@@ -216,8 +216,17 @@ static uint32_t fa_scan_active_blocks(
     }
 
     const dma_addr_t m_src = mask->data + q_start * mask->nb[1] + im2 * mask->nb[2] + im3 * mask->nb[3];
-    dma_queue_push(dma_q, dma_make_data(vtcm_scratch, m_src), row_stride, mask->nb[1], row_bytes, n_rows_q);
+    FARF(ERROR, "fa-scan-IN q_start=%u n_rows_q=%u n_kv_blocks=%u ring=%u/%u", q_start, n_rows_q, n_kv_blocks, dma_q->ring0->push_idx, dma_q->ring0->pop_idx); // TEMP DEBUG
+    if (!dma_queue_push(dma_q, dma_make_data(vtcm_scratch, m_src), row_stride, mask->nb[1], row_bytes, n_rows_q)) {
+        for (uint32_t b = 0; b < n_kv_blocks; ++b) active_blocks[b] = (uint16_t) b;
+        return n_kv_blocks;
+    }
     const uint8_t * m_buf = (const uint8_t *) dma_queue_pop(dma_q).dst;
+    FARF(ERROR, "fa-scan-POP m_buf=%p", m_buf); // TEMP DEBUG
+    if (!m_buf) {
+        for (uint32_t b = 0; b < n_kv_blocks; ++b) active_blocks[b] = (uint16_t) b;
+        return n_kv_blocks;
+    }
 
     const HVX_Vector v_ninf   = Q6_Vh_vsplat_R(0xFC00);
     uint32_t         n_active = 0;
@@ -257,6 +266,7 @@ static uint32_t fa_scan_active_blocks(
         active_blocks[0] = 0;
         n_active = 1;
     }
+    FARF(ERROR, "fa-scan-OUT n_active=%u ring=%u/%u", n_active, dma_q->ring0->push_idx, dma_q->ring0->pop_idx); // TEMP DEBUG
     return n_active;
 }
 
@@ -451,6 +461,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
         // Pop all Q rows
         for (uint32_t g = 0; g < G_local; ++g) {
             uint8_t * q_ptr_vtcm = (void *) dma_queue_pop(dma_q).dst;
+            if (!q_ptr_vtcm) continue; // DMA ring underflow
             if (factx->is_q_fp32) {
                 hvx_copy_f16_f32_aa(q_ptr_vtcm, q_ptr_vtcm, DK);
             }
@@ -473,6 +484,7 @@ static void flash_attn_ext_f16_thread(unsigned int nth, unsigned int ith, void *
             uint8_t * k_base = (void *) dma_queue_pop(dma_q).dst; // K
             uint8_t * v_base = (void *) dma_queue_pop(dma_q).dst; // V
             __fp16  * m_base = mask ? (__fp16 *) dma_queue_pop(dma_q).dst : NULL; // M
+            if (!k_base || !v_base || (mask && !m_base)) continue; // DMA ring underflow
 
             if (factx->k->type == HTP_TYPE_Q8_0) {
                 htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_FA_K_PREP, ir);
@@ -777,6 +789,8 @@ typedef struct {
 static void fa_k_interleave_thread(unsigned int n, unsigned int i, void * data) {
     fa_k_int_args_t *       args  = (fa_k_int_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
+    // TEMP DEBUG: curr_k comes from dma_queue_pop().dst — NULL means empty ring
+    FARF(ERROR, "fa-hmx-worker k-int i=%u curr_k=%p buf_idx=%u kv_rows=%u src_stride=%u", i, args->curr_k, (unsigned) args->buf_idx, args->kv_rows, (unsigned) args->src_stride);
 
     const uint32_t total_rows = args->kv_rows;
     const uint32_t rows_per_t = args->rows_per_t;
@@ -827,6 +841,8 @@ typedef struct {
 } fa_v_int_args_t;
 
 static void fa_v_interleave_thread(unsigned int n, unsigned int i, void * data) {
+    { fa_v_int_args_t * _a = (fa_v_int_args_t *) data; FARF(ERROR, "fa-vint-DBG i=%u v_src=%p v_dst=%p kv_rows=%u", i, _a->v_src, _a->v_tiles_dst, _a->kv_rows); } // TEMP DEBUG
+    FARF(ERROR, "fa-hmx-worker v-int i=%u data=%p", i, data); // TEMP DEBUG
     fa_v_int_args_t *       args  = (fa_v_int_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
 
@@ -889,6 +905,7 @@ typedef struct {
 } fa_q_load_args_t;
 
 static void fa_q_load_thread(unsigned int n, unsigned int i, void * data) {
+    FARF(ERROR, "fa-hmx-worker q-load i=%u data=%p", i, data); // TEMP DEBUG
     fa_q_load_args_t *      args  = (fa_q_load_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
 
@@ -950,6 +967,11 @@ static void fa_q_load_thread(unsigned int n, unsigned int i, void * data) {
 
         __fp16 * q_tiles = factx->vtcm_q_tiles;
         const size_t DK_pad = factx->DK_pad;
+        // TEMP DEBUG: dump computed pointers before prep (remove after)
+        FARF(ERROR, "fa-qload-DBG i=%u start=%zu end=%u g_rows_end=%u q_tiles=%p q_dma=%p DK=%u G=%u n_rows_q=%u q_t=%d",
+             i, start, (unsigned) hex_smin(end, n_rows_g), (unsigned) n_rows_g,
+             (void *) q_tiles, (void *) factx->vtcm_q_dma, (unsigned) DK, (unsigned) G,
+             args->n_rows_q, (int) args->q_transposed);
         if (use_q_dma) {
             const size_t g_rows_end = hex_smin(end, n_rows_g);
             const uint32_t d_limit = factx->is_q_fp32 ? DK / 32 : DK / 64;
@@ -1047,6 +1069,8 @@ typedef struct {
 } fa_o_store_args_t;
 
 static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
+    FARF(ERROR, "fa-ostore-DBG i=%u n=%u", i, n); // TEMP DEBUG
+    FARF(ERROR, "fa-hmx-worker o-store-f32 i=%u data=%p", i, data); // TEMP DEBUG
     fa_o_store_args_t *     args  = (fa_o_store_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
 
@@ -1114,6 +1138,7 @@ static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
 }
 
 static void fa_o_store_thread_f16(unsigned int n, unsigned int i, void * data) {
+    FARF(ERROR, "fa-hmx-worker o-store-f16 i=%u data=%p", i, data); // TEMP DEBUG
     fa_o_store_args_t *     args  = (fa_o_store_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
 
@@ -1246,6 +1271,13 @@ static inline void fa_softmax_impl(
     const size_t n_tiles_per_bc = args->n_tiles_per_bc;
     const size_t n_row_vec_cnt  = hmx_ceil_div(n_rows_g, 64);
     const uint32_t im3          = has_mask ? fastmodulo(args->ib3, args->mask->ne[3], &factx->src3_div3) : 0;
+
+    FARF(ERROR, "fa-sfm-DBG i=%u n=%u buf_idx=%u mask_vtcm=%p s=%p p=%p m_vec=%p l_vec=%p row_bufs=%p d=%p n_rows_g=%u kv_rows=%u n_row_vec_cnt=%u",
+         i, n, (unsigned) args->buf_idx, (void *) args->mask_vtcm,
+         (void *) factx->vtcm_s_tiles[args->buf_idx], (void *) factx->vtcm_p_tiles[args->buf_idx],
+         (void *) factx->vtcm_m_vec, (void *) factx->vtcm_l_vec, (void *) factx->vtcm_row_bufs,
+         (void *) factx->vtcm_d_tiles[args->buf_idx],
+         (unsigned) n_rows_g, (unsigned) kv_rows, (unsigned) n_row_vec_cnt);
 
     size_t vec_start = 0;
     size_t vec_end   = n_row_vec_cnt;
@@ -1620,6 +1652,7 @@ static inline void fa_softmax_impl(
 }
 
 static void fa_softmax_thread_nomask(unsigned int n, unsigned int i, void * data) {
+    FARF(ERROR, "fa-hmx-worker softmax-nomask i=%u data=%p", i, data); // TEMP DEBUG
     fa_softmax_impl(n, i, data,
                     /*has_mask=*/false,
                     /*mask_broadcast=*/false,
@@ -1629,6 +1662,7 @@ static void fa_softmax_thread_nomask(unsigned int n, unsigned int i, void * data
 }
 
 static void fa_softmax_thread_mask_broadcast_g1(unsigned int n, unsigned int i, void * data) {
+    FARF(ERROR, "fa-hmx-worker softmax-mask-g1 i=%u data=%p", i, data); // TEMP DEBUG
     fa_softmax_impl(n, i, data,
                     /*has_mask=*/true,
                     /*mask_broadcast=*/true,
@@ -1638,6 +1672,7 @@ static void fa_softmax_thread_mask_broadcast_g1(unsigned int n, unsigned int i, 
 }
 
 static void fa_softmax_thread_mask_broadcast_gn(unsigned int n, unsigned int i, void * data) {
+    FARF(ERROR, "fa-hmx-worker softmax-mask-gn i=%u data=%p", i, data); // TEMP DEBUG
     fa_softmax_impl(n, i, data,
                     /*has_mask=*/true,
                     /*mask_broadcast=*/true,
@@ -1647,6 +1682,7 @@ static void fa_softmax_thread_mask_broadcast_gn(unsigned int n, unsigned int i, 
 }
 
 static void fa_softmax_thread(unsigned int n, unsigned int i, void * data) {
+    FARF(ERROR, "fa-hmx-worker softmax i=%u data=%p", i, data); // TEMP DEBUG
     fa_softmax_args_t *     args  = (fa_softmax_args_t *) data;
     struct hmx_fa_context * factx = args->factx;
 
@@ -1673,6 +1709,7 @@ static __attribute__((noinline)) void fa_build_d_diag_inv_l(struct hmx_fa_contex
                                                             size_t                  n_row_tiles_g_br,
                                                             uint32_t                kv_head,
                                                             size_t                  n_rows_g) {
+    FARF(ERROR, "fa-buildd-DBG d_inv=%p m_vec=%p l_vec=%p", (void *) factx->vtcm_d_inv_l, (void *) factx->vtcm_m_vec, (void *) factx->vtcm_l_vec); // TEMP DEBUG
     (void) n_row_tiles_g_br;
 
     // sinks: l += exp(sink - m * ln2) in f32, m and l are in the log2 domain
@@ -1781,6 +1818,7 @@ typedef struct {
 } hmx_fa_qk_job_t;
 
 static void hmx_fa_qk_dot_worker(void * data) {
+    { hmx_fa_qk_job_t * _j = (hmx_fa_qk_job_t *) data; FARF(ERROR, "fa-qkdot-DBG q=%p k=%p s=%p rows=%u cols=%u", _j->q_tiles, _j->k_tiles, _j->s_tiles, (unsigned) _j->n_row_tiles, (unsigned) _j->n_col_tiles); } // TEMP DEBUG
     hmx_fa_qk_job_t * job            = (hmx_fa_qk_job_t *) data;
     const size_t      n_row_tiles    = job->n_row_tiles;
     const size_t      n_col_tiles    = job->n_col_tiles;
@@ -1823,6 +1861,7 @@ typedef struct {
 } hmx_fa_o_update_job_t;
 
 static void hmx_fa_o_update_worker(void * data) {
+    { hmx_fa_o_update_job_t * _j = (hmx_fa_o_update_job_t *) data; FARF(ERROR, "fa-oupd-DBG p=%p v=%p d=%p o_curr=%p o_prev=%p", _j->p_tiles, _j->v_tiles, _j->d_tiles, _j->o_curr, _j->o_prev); } // TEMP DEBUG
     hmx_fa_o_update_job_t * job              = (hmx_fa_o_update_job_t *) data;
     const size_t            n_row_tiles      = job->n_row_tiles;
     const size_t            n_col_tiles      = job->n_col_tiles;
@@ -1969,6 +2008,7 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor 
                                      uint32_t b, size_t Bc, size_t size_k_row_padded, size_t size_k_row, size_t size_v_row_padded, size_t size_v_row,
                                      uint32_t ik2, uint32_t ik3, uint32_t iv2, uint32_t iv3, uint32_t q_start, uint32_t im3, uint32_t kv_head, uint32_t G,
                                      size_t m_line_bytes, size_t n_rows_q, size_t nek1, size_t prefetch_buf, struct hmx_fa_context * factx) {
+    FARF(ERROR, "fa-prefetch-DBG"); // TEMP DEBUG
     const uint32_t  prefetch_start = b * Bc;
     const uint32_t  prefetch_rows  = hex_smin(Bc, nek1 - prefetch_start);
     const dma_addr_t k_prefetch_src = k->data + prefetch_start * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
@@ -1991,6 +2031,7 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor 
 // ============================================================================
 
 int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+    FARF(ERROR, "fa-hmx-ENTER octx=%p vtcm=%p", octx, octx && octx->ctx ? octx->ctx->vtcm_base : NULL); // TEMP DEBUG
     struct htp_thread_trace * tr_hvx = &octx->ctx->trace[0];
     struct htp_thread_trace * tr_hmx = &octx->ctx->trace[HTP_MAX_NTHREADS];
     const struct htp_tensor * q    = octx->src[0];
@@ -2203,6 +2244,21 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     factx.m_cache    = &octx->dma_cache_fa[0];
     dma_cache_fa_init(factx.m_cache, (uint8_t *) factx.vtcm_mask_buf, L.m_buf_slot_bytes, HMX_FA_DMA_CACHE_SIZE);
 
+    // TEMP DEBUG: dump HMX setup pointers (remove after)
+    FARF(ERROR, "fa-hmx-SETUP g_br=%u DK=%u DV=%u DKp=%u DVp=%u nkv=%u nh=%u G=%u Bc=%u Br=%u "
+                "vtcm=%p q_dma=%p k0=%p v0=%p o0=%p mask=%p slopes=%p ddr=%p",
+         factx.g_br, DK, DV, DK_pad, DV_pad, factx.n_kv, factx.n_heads, factx.G, Bc, Br,
+         octx->ctx->vtcm_base, (void *) factx.vtcm_q_dma, (void *) factx.vtcm_k_fp16[0],
+         (void *) factx.vtcm_v_fp16[0], (void *) factx.vtcm_o_tiles[0],
+         (void *) factx.vtcm_mask_buf, (void *) factx.vtcm_slopes, (void *) ddr);
+    // TEMP DEBUG: softmax/worker VTCM pointers not in the main SETUP line
+    FARF(ERROR, "fa-hmx-SETUP2 q_tiles=%p s0=%p s1=%p p0=%p p1=%p m_vec=%p l_vec=%p row_bufs=%p d0=%p d1=%p d_inv=%p sinks=%p pipeline=%d",
+         (void *) factx.vtcm_q_tiles, (void *) factx.vtcm_s_tiles[0], (void *) factx.vtcm_s_tiles[1],
+         (void *) factx.vtcm_p_tiles[0], (void *) factx.vtcm_p_tiles[1],
+         (void *) factx.vtcm_m_vec, (void *) factx.vtcm_l_vec, (void *) factx.vtcm_row_bufs,
+         (void *) factx.vtcm_d_tiles[0], (void *) factx.vtcm_d_tiles[1], (void *) factx.vtcm_d_inv_l,
+         (void *) factx.vtcm_sinks, (int) factx.pipeline);
+
     // Head-dim padding: the K/V DMA staging buffers and the flat-Q buffer are laid out
     // with padded row strides (size_{k,v,q}_row_padded, covering D_pad columns) but the
     // DMA only writes the real D columns per row. Zero the whole staging buffers once up
@@ -2311,7 +2367,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                 }
 
                 // 2. Pop Q DMA (blocks until Q is loaded)
-                dma_queue_pop(dma_q);
+                { dma_data qd = dma_queue_pop(dma_q); FARF(ERROR, "fa-qpop-DBG q_dst=%p", (void *) qd.dst); } // TEMP DEBUG
 
                 // ---- Load Q block & Initialize per-block state ----
                 fa_phase_q_load(&factx, q, q_start, kv_head, ib3, n_rows_g);
@@ -2344,6 +2400,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                     // Prep and start QK-dot(0)
                     void * curr_k0 = (void *) dma_queue_pop(dma_q).dst;
+                    FARF(ERROR, "fa-kpop-DBG curr_k0=%p b0_rows=%u ring=%u/%u", curr_k0, b0_rows, dma_q->ring0->push_idx, dma_q->ring0->pop_idx); // TEMP DEBUG
+                    if (!curr_k0) continue; // DMA ring underflow
                     fa_phase_k_interleave(&factx, b0_rows, k_src_stride, curr_k0, b0_start, 0);
 
                     qk_job[0].q_tiles        = factx.vtcm_q_tiles;
@@ -2364,6 +2422,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // ---- 1. Pop and run V-prep for current block ----
                         void * curr_v = (void *) dma_queue_pop(dma_q).dst;
+                        FARF(ERROR, "fa-vpop-DBG curr_v=%p buf_idx=%u kv_rows=%u ring=%u/%u", curr_v, (unsigned) buf_idx, kv_rows, dma_q->ring0->push_idx, dma_q->ring0->pop_idx); // TEMP DEBUG
+                        if (!curr_v) continue;
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
 
                         // ---- 2. Pop and run mask-prep for current block ----
@@ -2371,6 +2431,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         if (mask) {
                             if (__builtin_expect(factx.mask_broadcast, true)) {
                                 current_mask_vtcm = (__fp16 *) dma_queue_pop(dma_q).dst;
+                                FARF(ERROR, "fa-mpop-DBG mask_vtcm=%p ring=%u/%u", current_mask_vtcm, dma_q->ring0->push_idx, dma_q->ring0->pop_idx); // TEMP DEBUG
                             } else {
                                 fa_pop_mask_dma_gqa(dma_q, G);
                                 current_mask_vtcm = factx.vtcm_mask_buf;
@@ -2409,6 +2470,8 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                             const size_t   next_buf   = 1 - buf_idx;
 
                             void * next_k = (void *) dma_queue_pop(dma_q).dst;
+                            FARF(ERROR, "fa-kpop2-DBG next_k=%p ring=%u/%u", next_k, dma_q->ring0->push_idx, dma_q->ring0->pop_idx); // TEMP DEBUG
+                            if (!next_k) continue;
                             fa_phase_k_interleave(&factx, next_rows, k_src_stride, next_k, next_start, next_buf);
 
                             qk_job[next_buf].q_tiles        = factx.vtcm_q_tiles;
@@ -2522,6 +2585,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Wait for current K DMA and interleave
                         void * curr_k = (void *) dma_queue_pop(dma_q).dst;
+                        if (!curr_k) continue;
                         fa_phase_k_interleave(&factx, kv_rows, k_src_stride, curr_k, kv_start, 0);
 
                         {
@@ -2540,6 +2604,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
 
                         // Wait for current V DMA and interleave
                         void * curr_v = (void *) dma_queue_pop(dma_q).dst;
+                        if (!curr_v) continue;
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[0], n_tiles_per_bc, kv_start);
 
                         // ---- Phase 3: softmax + build_D ----
