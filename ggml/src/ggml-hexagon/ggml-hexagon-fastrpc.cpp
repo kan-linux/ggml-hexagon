@@ -107,14 +107,11 @@
 #include "htp-kparams.h"
 
 // =================================================================================================
-//  section-1: forward declarations, macros
+//  section-1: forward declarations and special global vars
 // =================================================================================================
-// htp-common.h declares these extern; the dspqueue variant defines them in
-// ggml-hexagon.cpp. Only one of the two AP sources is compiled per build, so
-// defining them here for the mempool/fastrpc variant does not collide. The
-// kparams solvers (htp-kparams.cpp) and the shared inline helpers in
-// htp-common.h read them, so ALL of them must be defined or the link fails.
-// Defaults match ggml-hexagon.cpp.
+// htp-common.h declares these extern; Qualcomm's dspqueue-based ggml-hexagon defines them in ggml-hexagon.cpp.
+// The kparams solvers (htp-kparams.cpp) and the shared inline helpers in htp-common.h read them,
+// so ALL of them must be defined here to avoid link failure.
 int    opt_arch       = 0;    // autodetect
 size_t opt_ndev       = 1;
 size_t opt_nhvx       = 0;    // use all
@@ -141,33 +138,6 @@ int    opt_optrace     = 0;
 int    opt_oppoll      = 0;
 int    opt_opfusion    = 1;
 int    opt_rt_repack   = 1;   // runtime repacking: 0 = disabled, 1 = quantized only, 2 = always
-
-// Minimal session for the htp-kparams.cpp solvers. They only read four fields
-// through the htp_session_* accessors (never deref the struct directly), so a
-// private definition here is safe: ggml_hexagon.cpp (which has the full
-// dspqueue struct) is not compiled into the mempool build.
-struct ggml_hexagon_session {
-    uint32_t n_threads;
-    uint32_t n_hmx;
-    uint64_t vtcm_size;
-    uint32_t mdev_count;
-};
-
-const char * htp_session_name(const struct ggml_hexagon_session * sess) {
-    (void) sess;
-    return "fastrpc";
-}
-size_t       htp_session_vtcm_size(const struct ggml_hexagon_session * sess) { return sess->vtcm_size; }
-uint32_t     htp_session_n_threads(const struct ggml_hexagon_session * sess) { return (uint32_t) sess->n_threads; }
-uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * sess) { return sess->n_hmx; }
-uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * sess) { return sess->mdev_count; }
-
-// Macros
-#define GGML_HEXAGON_MAX_DEVICES                        16
-
-#define SIZE_IN_MB                                      (1 << 20)
-
-#define GGML_HEXAGON_VERSION                            "0.6.0"
 
 // Forward declarations
 static bool                  ggmlhexagon_is_op_on_device(ggml_backend_dev_t dev, const ggml_tensor * op);
@@ -219,7 +189,7 @@ struct ggml_hexagon_device_config {
     std::string name;
 };
 
-struct ggml_backend_hexagon_context {
+struct ggml_hexagon_session {
     int device;
     char name[GGML_MAX_NAME];
     char desc[GGML_MAX_NAME];
@@ -229,6 +199,12 @@ struct ggml_backend_hexagon_context {
     struct qcom_socinfo   socinfo;
 
     int n_threads;
+    // Solver-facing fields read by htp-kparams.cpp / htp-fusion.cpp through the
+    // htp_session_* accessors (opaque in htp-common.h). Keep n_hmx and vtcm_size
+    // in sync with has_hmx / socinfo at probe time.
+    uint32_t n_hmx = 0;
+    uint64_t vtcm_size = 0;
+    uint32_t mdev_count = 1;   // fastrpc is single-device
     int dsp_thread_counts = 0;                  // actual worker threads in effect on NPU (max_hw_threads - 2)
     int dsp_thread_counts_max = 0;              // safe upper bound reported by NPU at init
 
@@ -401,38 +377,34 @@ struct ggml_backend_hexagon_context {
     static constexpr size_t FENCE_SLOT_SIZE  = 128;
     static constexpr size_t FENCE_SLOTS_MAX  = GGML_HEXAGON_MAX_DEVICES;
 
-    ggml_backend_hexagon_context(int dev_id, ggml_backend_dev_t dev);
-    ~ggml_backend_hexagon_context();
+    ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev);
+    ~ggml_hexagon_session();
 };
 
-// Build a solver session from the fastrpc device context. The fastrpc variant is
-// single-device (mdev_count = 1). Must be after the context struct definition.
-static inline ggml_hexagon_session ggmlhexagon_make_solver_session(
-    const ggml_backend_hexagon_context * ctx
-) {
-    ggml_hexagon_session s;
-    s.n_threads   = (uint32_t) ctx->n_threads;
-    s.n_hmx       = ctx->has_hmx ? 1u : 0u;
-    s.vtcm_size   = ctx->socinfo.vtcm_size_in_mb * 1024ull * 1024ull;
-    s.mdev_count  = 1;
-    return s;
+// htp_session_* accessors: shared solvers never deref the session directly.
+const char * htp_session_name(const struct ggml_hexagon_session * sess) {
+    (void) sess;
+    return "fastrpc";
 }
+size_t       htp_session_vtcm_size(const struct ggml_hexagon_session * sess) { return sess->vtcm_size; }
+uint32_t     htp_session_n_threads(const struct ggml_hexagon_session * sess) { return (uint32_t) sess->n_threads; }
+uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * sess) { return sess->n_hmx; }
+uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * sess) { return sess->mdev_count; }
 
 // Solve base kparams via the shared upstream solver (htp-kparams.cpp). This is
 // the single source of truth for the AP<->DSP kparams contract; fastrpc must not
 // maintain a parallel implementation (PR-30843 showed how fast those drift).
 // Returns the resolved HTP opcode, or HTP_OP_INVALID if the op is unsupported.
 static inline enum htp_op_code ggmlhexagon_solve_kparams(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * sess,
     const ggml_tensor * node,
     void * kparams
 ) {
-    const ggml_hexagon_session sess = ggmlhexagon_make_solver_session(ctx);
-    const enum htp_op_code opcode   = htp_op_remap(node);
+    const enum htp_op_code opcode = htp_op_remap(node);
     if (opcode == HTP_OP_INVALID) {
         return HTP_OP_INVALID;
     }
-    return htp_kparams_solve(&sess, node, kparams) ? opcode : HTP_OP_INVALID;
+    return htp_kparams_solve(sess, node, kparams) ? opcode : HTP_OP_INVALID;
 }
 
 struct ggml_backend_hexagon_reg_context {
@@ -611,7 +583,7 @@ static struct qcom_socinfo g_hexagon_soc_info_table[] = {
 // does not delete reg->context (see FIXME in ggml-backend-reg.cpp), so we rely
 // on an atexit handler to release NPU sessions. atexit runs before static
 // dtors, so function-local std::mutex objects (e.g. the log mutex) are still
-// alive when ~ggml_backend_hexagon_context calls ggmlhexagon_deinit_cdsp.
+// alive when ~ggml_hexagon_session calls ggmlhexagon_deinit_cdsp.
 static ggml_backend_hexagon_reg_context * g_reg_ctx = nullptr;
 
 //For multi-NPU support
@@ -719,7 +691,7 @@ void ggmlhexagon_log_always_internal(int level, const char * file, const char * 
 // Invoke one no-op warmup call and record FastRPC transport overhead timing.
 // The 0xFFFB warmup mode does no NPU work, so measured time is an upper bound
 // of pure FastRPC transport overhead. Used at init only, no per-graph overhead.
-static int hexagon_warmup_invoke_timed(ggml_backend_hexagon_context * ctx) {
+static int hexagon_warmup_invoke_timed(ggml_hexagon_session * ctx) {
     int64_t t0 = ggml_time_us();
     // Use the existing no-op warmup mode (0xFFFB) instead of the legacy
     // batch_size==0 probe mode so no marker bytes are written to the pool.
@@ -735,7 +707,7 @@ static int hexagon_warmup_invoke_timed(ggml_backend_hexagon_context * ctx) {
 // Logging convention in this function:
 //   VERBOSE -> terminal + adb logcat (key summary for immediate visibility)
 //   ALWAYS  -> adb logcat only (detailed diagnostics for post-analysis)
-static void ggmlhexagon_print_running_timestamp(ggml_backend_hexagon_context * ctx) {
+static void ggmlhexagon_print_running_timestamp(ggml_hexagon_session * ctx) {
     char timestamp[GGMLHEXAGON_TMPBUF_LEN];
     memset(timestamp, 0, GGMLHEXAGON_TMPBUF_LEN);
 
@@ -1389,7 +1361,7 @@ static size_t ggmlhexagon_get_system_free_memory_in_bytes() {
 #endif
 }
 
-static bool ggmlhexagon_same_types(const ggml_backend_hexagon_context * ctx, const ggml_tensor * op_tensor) {
+static bool ggmlhexagon_same_types(const ggml_hexagon_session * ctx, const ggml_tensor * op_tensor) {
     GGML_UNUSED(ctx);
     ggml_tensor * src0 = op_tensor->src[0];
     ggml_tensor * src1 = op_tensor->src[1];
@@ -1441,7 +1413,7 @@ static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
 // Repack buffers hold quantized weight data in tiled (HMX) layout and
 // require set_tensor/get_tensor to repack/unrepack across the boundary.
 static bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buffer * b) {
-    auto * ctx = (ggml_backend_hexagon_context *)b->buft->context;
+    auto * ctx = (ggml_hexagon_session *)b->buft->context;
     return b->buft == &ctx->repack_buffer_type;
 }
 
@@ -1449,7 +1421,7 @@ static bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buff
 // Logging convention in this function (inverted from the usual level names):
 //   VERBOSE -> terminal + adb logcat (key summary for immediate visibility)
 //   ALWAYS  -> adb logcat only (detailed diagnostics for post-analysis)
-static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx) {
+static void ggmlhexagon_dump_perf_stats(const ggml_hexagon_session * ctx) {
     if (nullptr == ctx) {
         return;
     }
@@ -1936,7 +1908,7 @@ bail:
     return hexagon_error;
 }
 
-static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
+static int ggmlhexagon_probe_dspinfo(ggml_hexagon_session * ctx) {
     if (ctx == nullptr) {
         return 0;
     }
@@ -1985,6 +1957,8 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
     //FIXME: hmx_depth/hmx_spatial report 0 via DSPRPC_GET_DSP_INFO on some devices
     ctx->has_async_fastrpc  = ggmlhexagon_is_async_fastrpc_supported(ctx->domain_id);
     ctx->has_extended_map   = ggmlhexagon_is_extended_map_supported(ctx->domain_id);
+    ctx->n_hmx              = ctx->has_hmx ? 1u : 0u;
+    ctx->vtcm_size          = ctx->socinfo.vtcm_size_in_mb * 1024ull * 1024ull;
     GGMLHEXAGON_LOG_ALWAYS("device %d caps: has_vtcm=%d,has_hvx=%d,has_hmx=%d,hvx_support_128b %d,"
                             "unsigned pd supported %d, async fastrpc supported %d, extended va map supported %d",
                                 ctx->device, (int)ctx->has_vtcm, (int)ctx->has_hvx, (int)ctx->has_hmx, hvx_support_128b,
@@ -1994,7 +1968,7 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
     return htp_arch;
 }
 
-static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
+static int ggmlhexagon_init_rpcmempool(ggml_hexagon_session * ctx) {
     if (nullptr == ctx) {
         GGMLHEXAGON_LOG_ERROR("sanity check failure");
         return 1;
@@ -2086,7 +2060,7 @@ mempool_acquired:
     return 0;
 }
 
-static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
+static void ggmlhexagon_deinit_rpcmempool(ggml_hexagon_session * ctx) {
     if (ctx->rpc_mempool) {
         GGMLHEXAGON_LOG_DEBUG("free rpc mempool %p", ctx->rpc_mempool);
         fastrpc_munmap(ctx->domain_id, ctx->rpc_mempool_handle, ctx->rpc_mempool, ctx->rpc_mempool_len);
@@ -2097,7 +2071,7 @@ static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
     }
 }
 
-static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
+static void ggmlhexagon_deinit_cdsp(ggml_hexagon_session * ctx) {
     GGMLHEXAGON_LOG_ALWAYS("enter %s", __FUNCTION__);
     int hexagon_error  = AEE_SUCCESS;
     if (ctx->ggmlop_handle != 0) {
@@ -2117,7 +2091,7 @@ static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
     GGMLHEXAGON_LOG_ALWAYS("leave %s", __FUNCTION__);
 }
 
-static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
+static int ggmlhexagon_init_dsp(ggml_hexagon_session * ctx) {
     GGMLHEXAGON_LOG_ALWAYS("enter %s", __FUNCTION__);
     int htp_arch                = 0;
     int hexagon_error           = AEE_SUCCESS;
@@ -3759,7 +3733,7 @@ static int ggml_hexagon_get_fa_select(void) {
 // Writes to kparams; caller casts from op.kernel_params or a stack local.
 // Returns true if a valid kernel (HMX or HVX) was selected.
 static bool ggml_hexagon_compute_fa_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     struct htp_fa_kernel_params * kparams
 ) {
@@ -3976,7 +3950,7 @@ static bool ggml_op_to_htp_op_binary(int32_t ggml_op, uint32_t * htp_op) {
 // Returns false if the op is rejected (broadcasting beyond what the kernel
 // supports, or VTCM budget too small).
 static bool ggml_hexagon_precompute_binary_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     uint32_t op,
     const ggml_tensor * src0,
     const ggml_tensor * src1,
@@ -4220,7 +4194,7 @@ static void ggml_hexagon_unary_collapse_dims(struct ggml_tensor * src, struct gg
 // RMS_NORM_MUL, SCALE, SQR, SQRT, UNARY_*, L2_NORM, TRI, HADAMARD).
 // Mirrors htp_kparams_solve_unary_impl() in htp-kparams.cpp.
 static void ggml_hexagon_precompute_unary_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     uint32_t op,
     const ggml_tensor * src0,
     const ggml_tensor * src1,
@@ -4329,7 +4303,7 @@ static void ggml_hexagon_precompute_unary_params(
 // Precompute htp_glu_kernel_params on AP side for GLU ops. Mirrors
 // htp_kparams_solve_unary_mul_glu() in htp-kparams.cpp.
 static bool ggml_hexagon_precompute_glu_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     uint32_t op,
     const ggml_tensor * src0,
     const ggml_tensor * src1,
@@ -4383,7 +4357,7 @@ static bool ggml_hexagon_precompute_glu_params(
 
 // Precompute htp_get_rows_kernel_params on AP side for GET_ROWS.
 static void ggml_hexagon_precompute_get_rows_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * src0,
     const ggml_tensor * src1,
     const ggml_tensor * dst,
@@ -4446,7 +4420,7 @@ static void ggml_hexagon_precompute_get_rows_params(
 
 // Precompute htp_set_rows_kernel_params on AP side for SET_ROWS.
 static void ggml_hexagon_precompute_set_rows_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * src0, // values
     const ggml_tensor * src1, // indices
     const ggml_tensor * dst,  // destination
@@ -4465,7 +4439,7 @@ static void ggml_hexagon_precompute_set_rows_params(
 }
 
 static void ggml_hexagon_precompute_rope_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     struct htp_rope_kernel_params * kparams
 ) {
@@ -4493,7 +4467,7 @@ static void ggml_hexagon_precompute_rope_params(
 // Precompute htp_softmax_kernel_params on AP side for SOFT_MAX. Mirrors
 // ggml_hexagon_precompute_softmax_params() in ggml-hexagon.cpp.
 static void ggml_hexagon_precompute_softmax_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     struct htp_softmax_kernel_params * kparams
 ) {
@@ -4619,7 +4593,7 @@ static bool ggml_hexagon_mm_is_hmx_eligible_shared(
 // is suitable for HMX. Consulted only by is_mergeable_mul_mat to avoid
 // merging MUL_MATs that would benefit from HMX.
 // HMX dispatch itself is decided independently by ggml_hexagon_precompute_mm_params.
-static bool mm_is_hmx_eligible(const ggml_backend_hexagon_context * ctx, const ggml_tensor * t) {
+static bool mm_is_hmx_eligible(const ggml_hexagon_session * ctx, const ggml_tensor * t) {
     if (!ctx->has_hmx) return false;
     return ggml_hexagon_mm_is_hmx_eligible_shared(t->src[0], t->src[1], t);
 }
@@ -4629,7 +4603,7 @@ static bool mm_is_hmx_eligible(const ggml_backend_hexagon_context * ctx, const g
 //   - src1 is F32 (fusion kernels read F32 activations)
 //   - !mm_is_hmx_eligible (avoid merging MUL_MATs that would benefit from HMX)
 // NOTE: fusion is only attempted for MUL_MATs that match the QKV/FFN pattern.
-static bool is_mergeable_mul_mat(const ggml_backend_hexagon_context * ctx, const ggml_tensor * t) {
+static bool is_mergeable_mul_mat(const ggml_hexagon_session * ctx, const ggml_tensor * t) {
     if (!t || t->op != GGML_OP_MUL_MAT)   return false;
     if (ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD) return false;
     if (t->src[1]->type != GGML_TYPE_F32) return false;
@@ -4637,7 +4611,7 @@ static bool is_mergeable_mul_mat(const ggml_backend_hexagon_context * ctx, const
     return ggml_is_quantized(t->src[0]->type) && !mm_is_hmx_eligible(ctx, t);
 }
 
-static bool is_mergeable_mul_mat_pair(const ggml_backend_hexagon_context * ctx, const ggml_tensor * n1, const ggml_tensor * n2) {
+static bool is_mergeable_mul_mat_pair(const ggml_hexagon_session * ctx, const ggml_tensor * n1, const ggml_tensor * n2) {
     if (!is_mergeable_mul_mat(ctx, n1) || !is_mergeable_mul_mat(ctx, n2)) {
         return false;
     }
@@ -4654,7 +4628,7 @@ static bool is_mergeable_mul_mat_pair(const ggml_backend_hexagon_context * ctx, 
     return true;
 }
 
-static bool is_qkv_mergeable(const ggml_backend_hexagon_context * ctx, const ggml_tensor * n_q, const ggml_tensor * n_k, const ggml_tensor * n_v) {
+static bool is_qkv_mergeable(const ggml_hexagon_session * ctx, const ggml_tensor * n_q, const ggml_tensor * n_k, const ggml_tensor * n_v) {
     if (!is_mergeable_mul_mat(ctx, n_q) || !is_mergeable_mul_mat(ctx, n_k) || !is_mergeable_mul_mat(ctx, n_v)) {
         return false;
     }
@@ -4679,7 +4653,7 @@ static bool is_qkv_mergeable(const ggml_backend_hexagon_context * ctx, const ggm
 }
 
 static bool ggml_hexagon_precompute_hmx_mm_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * dst,
@@ -4703,7 +4677,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
 // Mirrors ggml_hexagon_precompute_fused_mmnx_params() in ggml-hexagon.cpp: the extra
 // weights share one prefetch slot (is_fused_nx layout), so there is no per-weight VTCM size.
 static void ggml_hexagon_precompute_fused_mmnx_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * act,
     int32_t n_weights,
@@ -4793,7 +4767,7 @@ finalize:
 }
 
 static void ggml_hexagon_precompute_fused_qkv_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     struct htp_mm_kernel_params * kparams
@@ -4802,7 +4776,7 @@ static void ggml_hexagon_precompute_fused_qkv_params(
 }
 
 static void ggml_hexagon_precompute_fused_ffn_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     struct htp_mm_kernel_params * kparams
@@ -4818,7 +4792,7 @@ static void ggml_hexagon_precompute_fused_ffn_params(
 // When is_matmul_id=false, the node is a plain MUL_MAT (not MUL_MAT_ID).
 // The HMX-first-then-HVX-fallback policy is preserved.
 static bool ggml_hexagon_precompute_hmx_mm_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * dst,
@@ -4914,7 +4888,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
 }
 
 static void ggml_hexagon_precompute_hvx_mm_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * src1,
     const struct ggml_tensor * dst,
@@ -5078,7 +5052,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
 }
 
 static void ggml_hexagon_precompute_mm_params(
-    ggml_backend_hexagon_context * ctx,
+    ggml_hexagon_session * ctx,
     const ggml_tensor * src0,
     const ggml_tensor * src1,
     const ggml_tensor * dst,
@@ -5221,7 +5195,7 @@ static bool ggml_hexagon_op_mul_mat_use_fwht(const struct ggml_tensor * dst) {
 //  section-9: backend implementation
 // =================================================================================================
 static bool ggmlhexagon_supported_mul_mat(const struct ggml_tensor * dst,
-                                          ggml_backend_hexagon_context * ctx) {
+                                          ggml_hexagon_session * ctx) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -5340,7 +5314,7 @@ static bool ggmlhexagon_supported_mul_mat(const struct ggml_tensor * dst,
 }
 
 static bool ggmlhexagon_supported_flash_attn(
-    const ggml_backend_hexagon_context * ctx, const struct ggml_tensor * dst) {
+    const ggml_hexagon_session * ctx, const struct ggml_tensor * dst) {
     const struct ggml_tensor * q     = dst->src[0];
     const struct ggml_tensor * k     = dst->src[1];
     const struct ggml_tensor * v     = dst->src[2];
@@ -5387,10 +5361,10 @@ static bool ggmlhexagon_supported_flash_attn(
 // Replaces the large switch statement with individual validator functions
 // indexed by GGML_OP. Each validator receives the Hexagon context and the
 // op tensor; returns true if the NPU can handle the op.
-typedef bool (*hexagon_op_validator_t)(ggml_backend_hexagon_context * ctx, const ggml_tensor * op);
+typedef bool (*hexagon_op_validator_t)(ggml_hexagon_session * ctx, const ggml_tensor * op);
 
 // Binary element-wise ops: ADD, SUB, MUL, DIV
-static bool hexagon_validate_binary_op(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_binary_op(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -5413,11 +5387,11 @@ static bool hexagon_validate_binary_op(ggml_backend_hexagon_context * ctx, const
     return ggmlhexagon_solve_kparams(ctx, op, &dummy_kp) != HTP_OP_INVALID;
 }
 
-static bool hexagon_validate_mul_mat(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_mul_mat(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     return ggmlhexagon_supported_mul_mat(op, ctx);
 }
 
-static bool hexagon_validate_rms_norm(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_rms_norm(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
@@ -5431,7 +5405,7 @@ static bool hexagon_validate_rms_norm(ggml_backend_hexagon_context * ctx, const 
 // Common validator for unary-family ops (NORM, L2_NORM, SCALE, CLAMP,
 // LEAKY_RELU, SQR, SQRT, LOG, ...).  Mirrors ggml_hexagon_supported_unary()
 // in ggml-hexagon.cpp: F32/F16, same shape, contiguous dst.
-static bool ggml_hexagon_supported_unary(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool ggml_hexagon_supported_unary(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -5482,7 +5456,7 @@ static bool ggml_hexagon_supported_unary(ggml_backend_hexagon_context * ctx, con
     return true;
 }
 
-static bool hexagon_validate_rope(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_rope(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
     const ggml_tensor * src2 = op->src[2];
@@ -5585,7 +5559,7 @@ static bool hexagon_validate_rope(ggml_backend_hexagon_context * ctx, const ggml
     return true;
 }
 
-static bool hexagon_validate_soft_max(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_soft_max(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -5645,7 +5619,7 @@ static bool hexagon_validate_soft_max(ggml_backend_hexagon_context * ctx, const 
     return true;
 }
 
-static bool hexagon_validate_glu(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_glu(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -5684,18 +5658,18 @@ static bool hexagon_validate_glu(ggml_backend_hexagon_context * ctx, const ggml_
 }
 
 static bool ggml_hexagon_precompute_cpy_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * op,
     struct htp_copy_kernel_params * kparams
 );
 
 static bool ggml_hexagon_precompute_concat_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * op,
     struct htp_concat_kernel_params * kparams
 );
 
-static bool hexagon_validate_cpy(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_cpy(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
 
@@ -5729,7 +5703,7 @@ static bool hexagon_validate_cpy(ggml_backend_hexagon_context * ctx, const ggml_
     return ggmlhexagon_solve_kparams(ctx, op, &kparams) != HTP_OP_INVALID;
 }
 
-static bool hexagon_validate_get_rows(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_get_rows(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -5799,7 +5773,7 @@ static bool hexagon_validate_get_rows(ggml_backend_hexagon_context * ctx, const 
     return ggmlhexagon_solve_kparams(ctx, op, &kparams) != HTP_OP_INVALID;
 }
 
-static bool hexagon_validate_set_rows(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_set_rows(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -5821,7 +5795,7 @@ static bool hexagon_validate_set_rows(ggml_backend_hexagon_context * ctx, const 
     return true;
 }
 
-static bool hexagon_validate_sum_rows(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_sum_rows(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -5837,7 +5811,7 @@ static bool hexagon_validate_sum_rows(ggml_backend_hexagon_context * ctx, const 
     return true;
 }
 
-static bool hexagon_validate_cont(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_cont(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     // CONT is same-type only and supports F32, F16, and I32.
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
@@ -5847,7 +5821,7 @@ static bool hexagon_validate_cont(ggml_backend_hexagon_context * ctx, const ggml
     return ggmlhexagon_solve_kparams(ctx, op, &kparams) != HTP_OP_INVALID;
 }
 
-static bool hexagon_validate_concat(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_concat(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     int dim = ((const int32_t *) op->op_params)[0];
     if (dim < 0 || dim >= GGML_MAX_DIMS) {
         return false;
@@ -5867,7 +5841,7 @@ static bool hexagon_validate_concat(ggml_backend_hexagon_context * ctx, const gg
     return ggmlhexagon_solve_kparams(ctx, op, &kparams) != HTP_OP_INVALID;
 }
 
-static bool hexagon_validate_repeat(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_repeat(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -5886,7 +5860,7 @@ static bool hexagon_validate_repeat(ggml_backend_hexagon_context * ctx, const gg
     return true;
 }
 
-static bool hexagon_validate_cumsum(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_cumsum(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -5900,7 +5874,7 @@ static bool hexagon_validate_cumsum(ggml_backend_hexagon_context * ctx, const gg
     return true;
 }
 
-static bool hexagon_validate_diag(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_diag(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -5922,7 +5896,7 @@ static bool hexagon_validate_diag(ggml_backend_hexagon_context * ctx, const ggml
 // Precompute htp_sort_kernel_params on AP side for ARGSORT / TOP_K.
 // Mirrors ggml_hexagon_precompute_sort_params() in ggml-hexagon.cpp.
 static void ggml_hexagon_precompute_sort_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     bool is_top_k,
     struct htp_sort_kernel_params * kparams
@@ -5962,7 +5936,7 @@ static void ggml_hexagon_precompute_sort_params(
     kparams->div_ne01_ne02 = init_fastdiv_values((uint32_t)(src0->ne[1] * src0->ne[2]));
 }
 
-static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_argsort(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
 
@@ -5985,7 +5959,7 @@ static bool hexagon_validate_argsort(ggml_backend_hexagon_context * ctx, const g
     return true;
 }
 
-static bool hexagon_validate_top_k(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_top_k(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0]; // values
     const ggml_tensor * dst  = op;         // indices
 
@@ -6008,7 +5982,7 @@ static bool hexagon_validate_top_k(ggml_backend_hexagon_context * ctx, const ggm
     return true;
 }
 
-static bool hexagon_validate_sum(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_sum(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -6024,7 +5998,7 @@ static bool hexagon_validate_sum(ggml_backend_hexagon_context * ctx, const ggml_
     return true;
 }
 
-static bool hexagon_validate_argmax(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_argmax(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -6040,7 +6014,7 @@ static bool hexagon_validate_argmax(ggml_backend_hexagon_context * ctx, const gg
     return true;
 }
 
-static bool hexagon_validate_pad(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_pad(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -6051,7 +6025,7 @@ static bool hexagon_validate_pad(ggml_backend_hexagon_context * ctx, const ggml_
     return true;
 }
 
-static bool hexagon_validate_im2col(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_im2col(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * dst  = op;
@@ -6089,7 +6063,7 @@ static bool im2col_3d_calc_output_size(uint32_t input, uint32_t kernel, int32_t 
 // ggml_hexagon_precompute_im2col_3d_params in ggml-hexagon.cpp; the shared
 // op_im2col_3d kernel consumes the packed params via op.kernel_params.
 static bool ggml_hexagon_precompute_im2col_3d_params(
-    ggml_backend_hexagon_context * ctx,
+    ggml_hexagon_session * ctx,
     const struct ggml_tensor * op,
     struct htp_im2col_kernel_params * kparams
 ) {
@@ -6268,14 +6242,14 @@ static bool ggml_hexagon_precompute_im2col_3d_params(
     return false;
 }
 
-static bool hexagon_validate_im2col_3d(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_im2col_3d(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     struct htp_im2col_kernel_params kparams;
     return ggmlhexagon_solve_kparams(ctx, op, &kparams) != HTP_OP_INVALID;
 }
 
 // Qwen3.5-2B delta net: offload conv1d to avoid cgraph split
 // Mirrors htp_kparams_solve_ssm_conv() in htp-kparams.cpp.
-static void ggml_hexagon_precompute_ssm_conv_params(ggml_backend_hexagon_context * ctx,
+static void ggml_hexagon_precompute_ssm_conv_params(ggml_hexagon_session * ctx,
                                                    const ggml_tensor * node,
                                                    struct htp_ssm_conv_kernel_params * kparams) {
     memset(kparams, 0, sizeof(*kparams));
@@ -6342,7 +6316,7 @@ static void ggml_hexagon_precompute_ssm_conv_params(ggml_backend_hexagon_context
     kparams->div_d_inner_tile = init_fastdiv_values(kparams->d_inner_tile);
 }
 
-static bool hexagon_validate_ssm_conv(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_ssm_conv(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -6383,7 +6357,7 @@ static bool hexagon_validate_ssm_conv(ggml_backend_hexagon_context * ctx, const 
 }
 
 // Qwen3.5-2B delta net: offload solve_tri to avoid cgraph split
-static bool hexagon_validate_solve_tri(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_solve_tri(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0]; // A
     const ggml_tensor * src1 = op->src[1]; // B
@@ -6402,7 +6376,7 @@ static bool hexagon_validate_solve_tri(ggml_backend_hexagon_context * ctx, const
     return true;
 }
 
-static bool hexagon_validate_tri(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_tri(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * dst  = op;
@@ -6415,14 +6389,14 @@ static bool hexagon_validate_tri(ggml_backend_hexagon_context * ctx, const ggml_
     return true;
 }
 
-static bool hexagon_validate_fill(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_fill(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16)
         return false;
     return true;
 }
 
-static bool hexagon_validate_roll(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_roll(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * dst  = op;
@@ -6472,7 +6446,7 @@ static bool ggml_hexagon_pool_shape_fits(
 }
 
 static void ggml_hexagon_precompute_pool_2d_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * src0,
     const struct ggml_tensor * dst,
     struct htp_pool_2d_kernel_params * kparams,
@@ -6543,7 +6517,7 @@ static void ggml_hexagon_precompute_pool_2d_params(
 
 // Precompute htp_fill_kernel_params. Mirrors htp_kparams_solve_fill().
 static void ggml_hexagon_precompute_fill_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     struct htp_fill_kernel_params * kparams
 ) {
@@ -6573,7 +6547,7 @@ static void ggml_hexagon_precompute_fill_params(
 
 // Precompute htp_pad_kernel_params. Mirrors htp_kparams_solve_pad().
 static void ggml_hexagon_precompute_pad_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     struct htp_pad_kernel_params * kparams
 ) {
@@ -6625,7 +6599,7 @@ static void ggml_hexagon_precompute_pad_params(
 
 // Precompute htp_solve_tri_kernel_params. Mirrors htp_kparams_solve_solve_tri().
 static void ggml_hexagon_precompute_solve_tri_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     struct htp_solve_tri_kernel_params * kparams
 ) {
@@ -6660,7 +6634,7 @@ static void ggml_hexagon_precompute_solve_tri_params(
 
 // Precompute htp_gdn_kernel_params. Mirrors htp_kparams_solve_gated_delta_net().
 static bool ggml_hexagon_precompute_gdn_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const ggml_tensor * node,
     struct htp_gdn_kernel_params * kparams
 ) {
@@ -6735,7 +6709,7 @@ static bool ggml_hexagon_precompute_gdn_params(
 }
 
 static bool ggml_hexagon_precompute_concat_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * op,
     struct htp_concat_kernel_params * kparams
 ) {
@@ -6807,7 +6781,7 @@ static bool ggml_hexagon_precompute_concat_params(
 }
 
 static bool ggml_hexagon_precompute_cpy_params(
-    const ggml_backend_hexagon_context * ctx,
+    const ggml_hexagon_session * ctx,
     const struct ggml_tensor * op,
     struct htp_copy_kernel_params * kparams
 ) {
@@ -6933,7 +6907,7 @@ static bool ggml_hexagon_precompute_cpy_params(
     return true;
 }
 
-static bool hexagon_validate_pool_2d(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_pool_2d(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const int32_t * params = op->op_params;
 
@@ -6973,7 +6947,7 @@ static bool hexagon_validate_pool_2d(ggml_backend_hexagon_context * ctx, const g
                                  n_threads, vtcm_budget);
 }
 
-static bool hexagon_validate_pool_1d(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_pool_1d(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const int32_t * params = op->op_params;
 
@@ -7005,11 +6979,11 @@ static bool hexagon_validate_pool_1d(ggml_backend_hexagon_context * ctx, const g
     return htp_pool_solve_layout(&layout, (uint32_t) src0->ne[0], 1, (uint32_t) op->ne[0], 1, n_threads, vtcm_budget);
 }
 
-static bool hexagon_validate_flash_attn(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_flash_attn(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     return ggmlhexagon_supported_flash_attn(ctx, op);
 }
 
-static bool hexagon_validate_gated_delta_net(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+static bool hexagon_validate_gated_delta_net(ggml_hexagon_session * ctx, const ggml_tensor * op) {
     struct htp_gdn_kernel_params kparams;
     return ggmlhexagon_solve_kparams(ctx, op, &kparams) != HTP_OP_INVALID;
 }
@@ -7097,7 +7071,7 @@ static bool ggmlhexagon_can_handle_op_through_cdsp(ggml_backend_dev_t dev, const
 
     init_op_validators();
 
-    ggml_backend_hexagon_context * ctx = (ggml_backend_hexagon_context *)dev->context;
+    ggml_hexagon_session * ctx = (ggml_hexagon_session *)dev->context;
     hexagon_op_validator_t validator = s_op_validators[op_tensor->op];
     if (validator) {
         const bool ok = validator(ctx, op_tensor);
@@ -7167,7 +7141,7 @@ struct ggml_backend_hexagon_buffer_context {
     size_t buffer_size  = 0;
     bool   is_mempool_buffer= false;
 
-    struct ggml_backend_hexagon_context * backend_ctx = nullptr;
+    struct ggml_hexagon_session * backend_ctx = nullptr;
 };
 
 // Repack quantized types into tiled (HMX) layout only when the tensor
@@ -7176,7 +7150,7 @@ struct ggml_backend_hexagon_buffer_context {
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                ggml_tensor * tensor, const void * data,
                                                size_t offset, size_t size) {
-    ggml_backend_hexagon_context * hctx        = (ggml_backend_hexagon_context *)buffer->buft->context;
+    ggml_hexagon_session * hctx        = (ggml_hexagon_session *)buffer->buft->context;
     bool is_repack                             = ggml_backend_buffer_is_hexagon_repack(buffer);
     if (is_repack) {
         GGMLHEXAGON_LOG_DEBUG("[SET_TENSOR] #%llu name=%s type=%d(%s) ne=[%d,%d,%d,%d] nbytes=%zu is_repack=%d offset=%zu size=%zu\n",
@@ -7208,7 +7182,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             char * parse_end = nullptr;
             long idx = strtol(digit_start, &parse_end, 10);
             if (parse_end == digit_end && idx >= 0) {
-                ggml_backend_hexagon_context * ctx = (ggml_backend_hexagon_context *) buffer->buft->context;
+                ggml_hexagon_session * ctx = (ggml_hexagon_session *) buffer->buft->context;
                 if ((uint32_t)idx > ctx->max_layer_idx_seen) {
                     ctx->max_layer_idx_seen = (uint32_t)idx;
                 }
@@ -7378,7 +7352,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
     if (ggml_backend_buffer_is_hexagon_repack(buffer)) {
         // In CPU-fallback mode (model exceeds mempool) weights are stored raw,
         // so a plain memcpy is the correct read-back.
-        ggml_backend_hexagon_context * hctx = (ggml_backend_hexagon_context *)buffer->buft->context;
+        ggml_hexagon_session * hctx = (ggml_hexagon_session *)buffer->buft->context;
         const char * dp                     = (const char *)tensor->data;
         const char * base                   = (const char *)hctx->rpc_mempool;
         const char * end                    = base + (ptrdiff_t)hctx->rpc_mempool_len;
@@ -7531,7 +7505,7 @@ static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer
     ggml_backend_hexagon_buffer_context * ctx = (ggml_backend_hexagon_buffer_context *)buffer->context;
     // Buffers are freed on model unload. Clear the caches keyed by tensor
     // pointers so a reload that reuses the same addresses does not hit stale entries.
-    struct ggml_backend_hexagon_context * bctx = ctx->backend_ctx;
+    struct ggml_hexagon_session * bctx = ctx->backend_ctx;
     if (bctx) {
         bctx->cgraph_cache.clear();
         bctx->mm_params_cache.clear();
@@ -7573,7 +7547,7 @@ static ggml_backend_buffer_i ggml_backend_hexagon_buffer_interface = {
 };
 
 static const char * ggml_backend_hexagon_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
+    struct ggml_hexagon_session * ctx = static_cast<ggml_hexagon_session *>(buft->context);
     if (ctx) {
         if (buft == &ctx->repack_buffer_type) {
             return ctx->repack_buft_name;
@@ -7584,7 +7558,7 @@ static const char * ggml_backend_hexagon_buffer_type_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
+    struct ggml_hexagon_session * ctx = static_cast<ggml_hexagon_session *>(buft->context);
     GGML_ASSERT(nullptr != ctx);
     GGMLHEXAGON_LOG_ALWAYS("[ALLOC] ENTER device=%d size=%zu bytes (%.2f MiB)", ctx->device, size, (double)size / (1024.0 * 1024.0));
     ggml_backend_hexagon_buffer_context * buffer_ctx = new ggml_backend_hexagon_buffer_context;
@@ -7741,7 +7715,7 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
+    struct ggml_hexagon_session * ctx = static_cast<ggml_hexagon_session *>(buft->context);
     GGML_ASSERT(nullptr != ctx);
     return ctx->rpc_mempool_len;
 }
@@ -7840,12 +7814,12 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size_n(
 }
 
 // Repack buft is identified by comparing the buft pointer against the
-// repack_buffer_type member stored in ggml_backend_hexagon_context (both
+// repack_buffer_type member stored in ggml_hexagon_session (both
 // main and repack bufts share the same context pointer). Used by
 // supports_buft to allow GGML core to route quantized weights through
 // set_tensor (which does the in-place tile repack).
 static bool ggml_backend_buft_is_hexagon_repack(ggml_backend_buffer_type_t buft) {
-    auto * ctx = (ggml_backend_hexagon_context *)buft->context;
+    auto * ctx = (ggml_hexagon_session *)buft->context;
     return buft == &ctx->repack_buffer_type;
 }
 
@@ -7878,8 +7852,8 @@ static bool ggmlhexagon_is_tensor_buffer_on_device(ggml_backend_dev_t dev, const
     if (!ggml_backend_buft_is_hexagon(buft) && !ggml_backend_buft_is_hexagon_repack(buft)) {
         return false;
     }
-    ggml_backend_hexagon_context * dev_ctx  = (ggml_backend_hexagon_context *)dev->context;
-    ggml_backend_hexagon_context * buft_ctx = (ggml_backend_hexagon_context *)buft->context;
+    ggml_hexagon_session * dev_ctx  = (ggml_hexagon_session *)dev->context;
+    ggml_hexagon_session * buft_ctx = (ggml_hexagon_session *)buft->context;
     return buft_ctx->device == dev_ctx->device;
 }
 
@@ -7901,11 +7875,11 @@ static bool ggmlhexagon_is_op_on_device(ggml_backend_dev_t dev, const struct ggm
 }
 
 static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
-    ggml_backend_hexagon_context * ctx = (ggml_backend_hexagon_context *) backend->context;
+    ggml_hexagon_session * ctx = (ggml_hexagon_session *) backend->context;
     return ctx->name;
 }
 
-ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_backend_dev_t dev)
+ggml_hexagon_session::ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev)
     : device(dev_id),
       backend(nullptr),
       socinfo(),
@@ -8023,7 +7997,7 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
     }
 }
 
-ggml_backend_hexagon_context::~ggml_backend_hexagon_context() {
+ggml_hexagon_session::~ggml_hexagon_session() {
     ggmlhexagon_deinit_cdsp(this);
     ggmlhexagon_print_running_timestamp(NULL);
 }
@@ -8034,7 +8008,7 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
     // must persist across inferences so that model tensors which reference
     // buffer types remain valid. The context is owned by the device and
     // freed during registry shutdown.
-    ggml_backend_hexagon_context * ctx = (ggml_backend_hexagon_context *)backend->context;
+    ggml_hexagon_session * ctx = (ggml_hexagon_session *)backend->context;
     ctx->backend = nullptr;
     delete backend;
 
@@ -8044,7 +8018,7 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
 static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     enum ggml_status result             = GGML_STATUS_SUCCESS;
     int64_t begin_time                  = ggml_time_us();
-    ggml_backend_hexagon_context * ctx  = (ggml_backend_hexagon_context *)backend->context;
+    ggml_hexagon_session * ctx  = (ggml_hexagon_session *)backend->context;
     int64_t gap_from_prev               = ctx->last_graph_end_us ? (begin_time - ctx->last_graph_end_us) : 0;
     (void)gap_from_prev; // used only in GGMLHEXAGON_LOG_DEBUG
     uint32_t graph_n_nodes              = (uint32_t)cgraph->n_nodes;
@@ -8090,7 +8064,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // every node on every call).
     std::vector<ggml_tensor *>  supported_nodes;
 
-    ggml_backend_hexagon_context::cgraph_cache_entry * cached_entry = nullptr;
+    ggml_hexagon_session::cgraph_cache_entry * cached_entry = nullptr;
 
     // Track per-graph node statistics (what ggml core assigned to this backend)
     ctx->total_nodes_processed += graph_n_nodes;
@@ -8436,8 +8410,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                     // Fused RMS_NORM+MUL kparams via the shared solver (it takes
                     // the two source tensors and the fused destination).
                     if (op.src_idx[0] >= 0 && op.src_idx[1] >= 0 && op.dst_idx[0] >= 0) {
-                        const ggml_hexagon_session sess = ggmlhexagon_make_solver_session(ctx);
-                        htp_kparams_solve_rms_norm_mul(&sess,
+                        htp_kparams_solve_rms_norm_mul(ctx,
                             tensor_src[op.src_idx[0]], tensor_src[op.src_idx[1]], tensor_src[op.dst_idx[0]],
                             (struct htp_unary_kernel_params *) op.kernel_params);
                     }
@@ -9632,7 +9605,7 @@ static const char * ggml_backend_hexagon_device_get_description(ggml_backend_dev
 }
 
 static const char * ggml_backend_hexagon_device_get_name(ggml_backend_dev_t dev) {
-    struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(dev->context);
+    struct ggml_hexagon_session * ctx = static_cast<ggml_hexagon_session *>(dev->context);
     if (nullptr != ctx) {
         return ctx->name;
     }
@@ -9650,7 +9623,7 @@ static const char * ggml_backend_hexagon_device_get_name(ggml_backend_dev_t dev)
 }
 
 static void ggml_backend_hexagon_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(dev->context);
+    struct ggml_hexagon_session * ctx = static_cast<ggml_hexagon_session *>(dev->context);
     if ((nullptr == ctx) || (ctx->device >= GGML_HEXAGON_MAX_DEVICES)) {
         GGMLHEXAGON_LOG_ALWAYS("pls check params");
         if (free)  *free  = 0;
@@ -9728,7 +9701,7 @@ ggml_backend_hexagon_reg_context::~ggml_backend_hexagon_reg_context() {
         // context persists across inferences (not freed in ggml_backend_hexagon_free),
         // so it is always present and must be cleaned up here.
         if (dev->context) {
-            auto * hctx = static_cast<ggml_backend_hexagon_context *>(dev->context);
+            auto * hctx = static_cast<ggml_hexagon_session *>(dev->context);
             delete hctx;
         }
         delete dev;
@@ -9741,9 +9714,9 @@ ggml_backend_hexagon_reg_context::~ggml_backend_hexagon_reg_context() {
 // Called from get_buffer_type, get_repack_buffer_type, supports_buft, and
 // device_init_backend. Context persists across inferences (ggml_backend_hexagon_free
 // only deletes the backend, not the context) and is freed during registry shutdown.
-static ggml_backend_hexagon_context * ggml_backend_hexagon_ensure_context(ggml_backend_dev_t dev) {
+static ggml_hexagon_session * ggml_backend_hexagon_ensure_context(ggml_backend_dev_t dev) {
     if (nullptr != dev && nullptr != dev->context) {
-        return (ggml_backend_hexagon_context *)dev->context;
+        return (ggml_hexagon_session *)dev->context;
     }
 
     ggmlhexagon_load_cfg();
@@ -9768,9 +9741,9 @@ static ggml_backend_hexagon_context * ggml_backend_hexagon_ensure_context(ggml_b
     }
 
     GGMLHEXAGON_LOG_ALWAYS("creating context for dev_index=%d", dev_index);
-    ggml_backend_hexagon_context * ctx = nullptr;
+    ggml_hexagon_session * ctx = nullptr;
     try {
-        ctx = new ggml_backend_hexagon_context(dev_index, dev);
+        ctx = new ggml_hexagon_session(dev_index, dev);
     } catch (const std::exception & e) {
         GGMLHEXAGON_LOG_ERROR("%s", e.what());
         return nullptr;
@@ -9828,7 +9801,7 @@ static ggml_backend_t ggml_backend_hexagon_device_init_backend(ggml_backend_dev_
 }
 
 static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_buffer_type(ggml_backend_dev_t dev) {
-    ggml_backend_hexagon_context * ctx = ggml_backend_hexagon_ensure_context(dev);
+    ggml_hexagon_session * ctx = ggml_backend_hexagon_ensure_context(dev);
     if (nullptr == ctx) {
         GGMLHEXAGON_LOG_ERROR("get_buffer_type: failed to create context");
         return nullptr;
@@ -9838,7 +9811,7 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_buffer_type(gg
 }
 
 static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_repack_buffer_type(ggml_backend_dev_t dev) {
-    ggml_backend_hexagon_context * ctx = ggml_backend_hexagon_ensure_context(dev);
+    ggml_hexagon_session * ctx = ggml_backend_hexagon_ensure_context(dev);
     if (nullptr == ctx) {
         GGMLHEXAGON_LOG_ERROR("get_repack_buffer_type: failed to create context");
         return nullptr;
@@ -9855,12 +9828,12 @@ static ggml_backend_buffer_type_t * ggml_backend_hexagon_device_get_extra_buffer
 
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     if (ggml_backend_buft_is_hexagon(buft) || ggml_backend_buft_is_hexagon_repack(buft)) {
-        ggml_backend_hexagon_context * dev_ctx  = ggml_backend_hexagon_ensure_context(dev);
+        ggml_hexagon_session * dev_ctx  = ggml_backend_hexagon_ensure_context(dev);
         if (nullptr == dev_ctx) {
             GGMLHEXAGON_LOG_ERROR("supports_buft: failed to create context");
             return false;
         }
-        ggml_backend_hexagon_context * buft_ctx = (ggml_backend_hexagon_context *)buft->context;
+        ggml_hexagon_session * buft_ctx = (ggml_hexagon_session *)buft->context;
         return buft_ctx->device == dev_ctx->device;
     }
     return false;
@@ -9891,7 +9864,7 @@ bool ggml_backend_is_hexagon(ggml_backend_t backend) {
 static void ggml_backend_hexagon_set_n_threads(ggml_backend_t backend, int n_threads) {
     GGML_ASSERT(ggml_backend_is_hexagon(backend));
 
-    struct ggml_backend_hexagon_context * ctx = (struct ggml_backend_hexagon_context *)backend->context;
+    struct ggml_hexagon_session * ctx = (struct ggml_hexagon_session *)backend->context;
     // Safe cap reported by the NPU at init (max_hw_threads - 2). Fall back to
     // cfg value if set_n_threads is called before NPU init completes.
     const int cap = (ctx->dsp_thread_counts_max > 0) ? ctx->dsp_thread_counts_max : g_hexagon_appcfg.thread_counts;
@@ -10026,7 +9999,7 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     // Pointers into each device's mempool (AP can see all via mmap)
     std::vector<char *> data_ptrs(n_backends);
     for (size_t r = 0; r < n_backends; r++) {
-        auto * ctx = (ggml_backend_hexagon_context *) comm_ctx->backends[r]->context;
+        auto * ctx = (ggml_hexagon_session *) comm_ctx->backends[r]->context;
         char * pool_base = (char *)ctx->rpc_mempool;
         char * data_ptr = (char *)tensors[r]->data;
         if (!pool_base || !data_ptr) {

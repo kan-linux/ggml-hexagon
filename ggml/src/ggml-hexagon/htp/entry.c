@@ -2324,10 +2324,10 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
 
         if (htp_op == HTP_OP_GATED_DELTA_NET) {
             const struct htp_gdn_kernel_params * gk = (const struct htp_gdn_kernel_params *) octx.kernel_params;
-            GGMLHEXAGON_LOG_DEBUG("[DSP-GDN-KP] op%u ktype=%u pipe=%u ch=%u nch=%u bh=%u nth=%u",
+            GGMLHEXAGON_LOG_VERBOSE("[DSP-GDN-KP] op%u ktype=%u pipe=%u ch=%u nch=%u bh=%u nth=%u",
                                     i, gk->kernel_type, gk->pipeline, gk->chunk_size, gk->n_chunks,
                                     gk->n_heads_batch, gk->n_threads);
-            GGMLHEXAGON_LOG_DEBUG("[DSP-GDN-KP] op%u Sv=%u H=%u nt=%u ns=%u K=%u rows=%u kda=%u vtcm=%u",
+            GGMLHEXAGON_LOG_VERBOSE("[DSP-GDN-KP] op%u Sv=%u H=%u nt=%u ns=%u K=%u rows=%u kda=%u vtcm=%u",
                                     i, gk->S_v, gk->H, gk->n_tokens, gk->n_seqs, gk->K,
                                     gk->total_rows, gk->kda, gk->vtcm_size);
         }

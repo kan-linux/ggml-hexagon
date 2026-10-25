@@ -14,6 +14,12 @@ extern "C" {
 
 #define GGML_HTP_IDL_VERSION           "0.0.2"
 
+#define GGML_HEXAGON_MAX_DEVICES       16
+
+#define SIZE_IN_MB                     (1 << 20)
+
+#define GGML_HEXAGON_VERSION           "0.7.0"
+
 /* Op-level profiling is disabled by default
  * Compile with -DHEX_OP_PROF=1 to enable */
 #ifndef HEX_OP_PROF
