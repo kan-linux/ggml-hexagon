@@ -21,6 +21,7 @@ message(STATUS "hexagon: using ${HEXAGON_SDK_ROOT} and ${HEXAGON_TOOLS_ROOT} for
 
 include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
 include(ExternalProject)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 option(GGML_HEXAGON_USE_MEMPOOL "ggml-hexagon: mempool/FastRPC-invoke AP implementation (single mempool, synchronous invoke); OFF = dspqueue/per-buffer implementation" OFF)
 option(GGML_HEXAGON_HTP_DEBUG  "ggml-hexagon: enable HTP debug output" OFF)
@@ -84,7 +85,8 @@ if (GGML_HEXAGON_USE_MEMPOOL)
                 -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
                 -DDSP_VERSION=${V}
                 -DGGML_HEXAGON_USE_MEMPOOL=ON
-                -DPREBUILT_LIB_DIR="toolv19_${V}")
+                -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
+                -DPREBUILT_LIB_DIR="toolv21_${V}")
         list(APPEND HTP_SKELS ${CMAKE_BINARY_DIR}/bin/libggml-htp-${V}.so)
         list(APPEND HTP_PROJECTS htp-mempool-${V})
         set(HTP_SKELS ${HTP_SKELS} PARENT_SCOPE)
@@ -126,6 +128,13 @@ else()
 
     ggml_add_backend_library(${TARGET_NAME}
         ggml-hexagon.cpp
+        htp-common.h
+        htp-kparams.cpp
+        htp-kparams.h
+        htp-opnode.cpp
+        htp-opnode.h
+        htp-fusion.cpp
+        htp-fusion.h
         htp-repack.cpp
         htp-repack.h
         htp-drv.cpp
@@ -150,7 +159,8 @@ else()
                 -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_ROOT}
                 -DHEXAGON_HTP_DEBUG=${GGML_HEXAGON_HTP_DEBUG}
                 -DDSP_VERSION=${V}
-                -DPREBUILT_LIB_DIR="toolv19_${V}")
+                -DPython3_EXECUTABLE=${Python3_EXECUTABLE}
+                -DPREBUILT_LIB_DIR="toolv21_${V}")
         list(APPEND HTP_SKELS ${CMAKE_CURRENT_BINARY_DIR}/libggml-htp-${V}.so)
         list(APPEND HTP_PROJECTS htp-${V})
         set(HTP_SKELS ${HTP_SKELS} PARENT_SCOPE)
@@ -161,6 +171,7 @@ else()
     build_htp_skel(v75)
     build_htp_skel(v79)
     build_htp_skel(v81)
+    build_htp_skel(v85)
 
 endif()
 

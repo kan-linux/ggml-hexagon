@@ -26,7 +26,7 @@ set(HTP_OPS_SRCS
     unary-ops.c
     sum-rows-ops.c
     softmax-ops.c
-    act-ops.c
+    glu-ops.c
     rope-ops.c
     set-rows-ops.c
     get-rows-ops.c
@@ -69,10 +69,6 @@ if (GGML_HEXAGON_USE_MEMPOOL)
     target_compile_options(${HTP_LIB} PRIVATE -Wno-error)
 
     build_idl(ggml_htp.idl ${HTP_LIB})
-
-    set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
-
-    install(TARGETS ${HTP_LIB})
 else()
     set(HTP_LIB ggml-htp-${DSP_VERSION})
 
@@ -88,8 +84,17 @@ else()
     )
 
     build_idl(htp_iface.idl ${HTP_LIB})
-
-    set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
-
-    install(TARGETS ${HTP_LIB})
 endif()
+
+set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
+
+if (NOT Python3_EXECUTABLE)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+endif()
+
+add_custom_command(TARGET ${HTP_LIB} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Adding SWIV section $<TARGET_FILE_NAME:${HTP_LIB}>"
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/htp-swiv.py -i $<TARGET_FILE:${HTP_LIB}> -o $<TARGET_FILE:${HTP_LIB}>
+    VERBATIM)
+
+install(TARGETS ${HTP_LIB})
