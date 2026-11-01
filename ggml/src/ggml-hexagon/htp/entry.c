@@ -204,6 +204,9 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_LEAKY_RELU:      return "LEAKY_RELU";
         case HTP_OP_IM2COL:          return "IM2COL";
         case HTP_OP_IM2COL_3D:       return "IM2COL_3D";
+        case HTP_OP_CONV_2D:         return "CONV_2D";
+        case HTP_OP_CONV_2D_DW:      return "CONV_2D_DW";
+        case HTP_OP_UPSCALE:         return "UPSCALE";
         case HTP_OP_GATED_DELTA_NET: return "GATED_DELTA_NET";
         case HTP_OP_ROLL:            return "ROLL";
         case HTP_OP_POOL_2D:         return "POOL_2D";
@@ -923,11 +926,14 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_CONCAT]          = op_concat,
     [HTP_OP_IM2COL]          = op_im2col,
     [HTP_OP_IM2COL_3D]       = op_im2col_3d,
+    [HTP_OP_CONV_2D]         = op_conv_2d,
+    [HTP_OP_CONV_2D_DW]      = op_conv_2d_dw,
     [HTP_OP_GATED_DELTA_NET] = op_gated_delta_net,
     [HTP_OP_ROLL]            = op_roll,
     [HTP_OP_POOL_2D]         = op_pool_2d,
     [HTP_OP_POOL_1D]         = op_pool_1d,
     [HTP_OP_TRI]             = op_unary,
+    [HTP_OP_UPSCALE]         = op_upscale,
     [HTP_OP_HADAMARD]        = op_unary,
     [HTP_OP_FENCE]           = op_fence,
     [HTP_OP_ALLREDUCE]       = op_allreduce,
@@ -1075,6 +1081,9 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_PAD:     *htp_op = HTP_OP_PAD;         return 0;
         case GGML_OP_IM2COL:  *htp_op = HTP_OP_IM2COL;      return 0;
         case GGML_OP_IM2COL_3D: *htp_op = HTP_OP_IM2COL_3D; return 0;
+        case GGML_OP_CONV_2D: *htp_op = HTP_OP_CONV_2D;     return 0;
+        case GGML_OP_CONV_2D_DW: *htp_op = HTP_OP_CONV_2D_DW; return 0;
+        case GGML_OP_UPSCALE: *htp_op = HTP_OP_UPSCALE;     return 0;
         case GGML_OP_GATED_DELTA_NET: *htp_op = HTP_OP_GATED_DELTA_NET; return 0;
         case GGML_OP_ROLL:   *htp_op = HTP_OP_ROLL;        return 0;
         case GGML_OP_POOL_2D: *htp_op = HTP_OP_POOL_2D;   return 0;

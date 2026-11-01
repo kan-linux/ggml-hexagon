@@ -18,7 +18,7 @@ extern "C" {
 
 #define SIZE_IN_MB                     (1 << 20)
 
-#define GGML_HEXAGON_VERSION           "0.7.0"
+#define GGML_HEXAGON_VERSION           "0.7.1"
 
 /* Op-level profiling is disabled by default
  * Compile with -DHEX_OP_PROF=1 to enable */
