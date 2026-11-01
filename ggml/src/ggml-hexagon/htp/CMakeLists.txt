@@ -42,8 +42,10 @@ set(HTP_OPS_SRCS
     pad-ops.c
     argsort-ops.c
     im2col-ops.c
+    conv2d-ops.c
     roll-ops.c
     pool-ops.c
+    upscale-ops.c
     allreduce-ops.c
 )
 
