@@ -18,7 +18,7 @@ extern "C" {
 
 #define SIZE_IN_MB                     (1 << 20)
 
-#define GGML_HEXAGON_VERSION           "0.7.1"
+#define GGML_HEXAGON_VERSION           "0.7.2"
 
 /* Op-level profiling is disabled by default
  * Compile with -DHEX_OP_PROF=1 to enable */
@@ -169,6 +169,7 @@ struct dsp_context {
     // Configuration
     int thread_counts;
     int max_hw_threads;     /* qurt_sysenv_get_max_hw_threads, set once at open */
+    uint32_t hw_nhvx;       /* qurt_hvx_get_units HVX count, set once at open */
     int dump_diag_info;
 
     // VTCM
