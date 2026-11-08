@@ -35,6 +35,7 @@ set(HTP_OPS_SRCS
     repeat-ops.c
     ssm-conv.c
     cumsum-ops.c
+    top-k-mask-ops.c
     fill-ops.c
     concat-ops.c
     diag-ops.c
@@ -47,6 +48,8 @@ set(HTP_OPS_SRCS
     pool-ops.c
     upscale-ops.c
     allreduce-ops.c
+    dsv4-hc-ops.c
+    lightning-indexer-ops.c
 )
 
 # Both variants build ggml-htp-${DSP_VERSION} (libggml-htp-vXX.so); only one
