@@ -1537,7 +1537,7 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
 
     unsigned int api_version = qurt_api_version();
     printf("qurt_api_version            = 0x%x\n", api_version);
-    printf("qurt_hvx_units              = 0x%d\n", qurt_hvx_get_units());
+    printf("qurt_hvx_units              = 0x%x\n", qurt_hvx_get_units());
     qurt_arch_version_t  vers;
     qurt_sysenv_get_arch_version(&vers);
     printf("qurt_arch_version           = 0x%x\n", vers.arch_version);
@@ -1550,7 +1550,7 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
     ctx->max_hw_threads = mhwt.max_hthreads;
     ctx->thread_counts = mhwt.max_hthreads;
     uint32_t hw_nhvx = (qurt_hvx_get_units() >> 8) & 0xFF;
-    printf("hw_nhvx = %lu\n", hw_nhvx);
+    printf("hw_nhvx = %u\n", hw_nhvx);
     ctx->hw_nhvx = hw_nhvx;
 
     /* Step 1: Power up HVX and HMX */
