@@ -30,7 +30,7 @@ VULKAN_SDK_PATH=${TOOLCHAIN_PATH}/Vulkan_SDK
 ######## part-2: prompt and LLM models ########
 #supported models will be downloadded automatically in check_prebuilt_models() when running this script at the first time
 
-LLM_PATH=/media/zhouwg/0893c374-f64c-4121-9192-21e7fd97edef/LLM
+LLM_PATH=/run/media/zhouwg/0893c374-f64c-4121-9192-21e7fd97edef/LLM
 GGUF_MODEL_NAME=${LLM_PATH}/gemma-4-E2B-it-Q4_0.gguf
 
 # Model aliases for quick testing of multiple models
