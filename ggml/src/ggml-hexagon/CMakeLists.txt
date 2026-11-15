@@ -39,10 +39,11 @@ if (GGML_HEXAGON_USE_MEMPOOL)
 
     target_include_directories(ggml_htp PUBLIC
         ${HEXAGON_SDK_ROOT}/incs
-        ${HEXAGON_SDK_ROOT}/incs/stddef
         ${HEXAGON_SDK_ROOT}/utils/examples
         ${CMAKE_CURRENT_SOURCE_DIR}/htp
         ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(ggml_htp PRIVATE
+        ${HEXAGON_SDK_ROOT}/incs/stddef)
 
     build_idl(htp/ggml_htp.idl ggml_htp)
 
@@ -63,11 +64,17 @@ if (GGML_HEXAGON_USE_MEMPOOL)
         libdl.h
         ../../include/ggml-hexagon.h)
 
+    if (WIN32)
+        # some clang-cl drivers do not predefine ARM64 macros for winnt.h
+        target_compile_definitions(${TARGET_NAME} PRIVATE _M_ARM64=1 _ARM64_=1)
+    endif()
+
     target_include_directories(${TARGET_NAME} PRIVATE
         ${HEXAGON_SDK_ROOT}/incs
-        ${HEXAGON_SDK_ROOT}/incs/stddef
         ${CMAKE_CURRENT_SOURCE_DIR}/htp
         ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(${TARGET_NAME} SYSTEM PRIVATE
+        ${HEXAGON_SDK_ROOT}/incs/stddef)
 
     target_link_libraries(${TARGET_NAME} PRIVATE ggml_htp)
     target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
@@ -113,10 +120,11 @@ else()
     set_target_properties(htp_iface PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(htp_iface PUBLIC
         ${HEXAGON_SDK_ROOT}/incs
-        ${HEXAGON_SDK_ROOT}/incs/stddef
         ${HEXAGON_SDK_ROOT}/utils/examples
         ${CMAKE_CURRENT_SOURCE_DIR}/htp
         ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(htp_iface PRIVATE
+        ${HEXAGON_SDK_ROOT}/incs/stddef)
 
     build_idl(htp/htp_iface.idl htp_iface)
 
@@ -144,8 +152,14 @@ else()
         libdl.h
         ../../include/ggml-hexagon.h)
 
+    if (WIN32)
+        # some clang-cl drivers do not predefine ARM64 macros for winnt.h
+        target_compile_definitions(${TARGET_NAME} PRIVATE _M_ARM64=1 _ARM64_=1)
+    endif()
+
     target_link_libraries(${TARGET_NAME} PRIVATE htp_iface)
     target_include_directories(${TARGET_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/htp ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(${TARGET_NAME} SYSTEM PRIVATE ${HEXAGON_SDK_ROOT}/incs/stddef)
 
     # Build HTP skels
     set(HTP_SKELS)
