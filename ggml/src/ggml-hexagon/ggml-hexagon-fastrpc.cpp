@@ -6848,8 +6848,8 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
                     }
                     fclose(f);
                 }
-                if (avail > 0 && size_aligned > avail / 2) {
-                    GGMLHEXAGON_LOG_ERROR("device=%d CPU fallback %zu MiB would consume >50%% of available %zu MiB -- rejecting to avoid OOM",
+                if (avail > 0 && size_aligned > avail / 5 * 4) {
+                    GGMLHEXAGON_LOG_ERROR("device=%d CPU fallback %zu MiB would consume >80%% of available %zu MiB -- rejecting to avoid OOM",
                                           ctx->device, size_aligned / SIZE_IN_MB, avail / SIZE_IN_MB);
                     delete buffer_ctx;
                     return nullptr;
