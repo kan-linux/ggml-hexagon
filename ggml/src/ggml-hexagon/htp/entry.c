@@ -200,6 +200,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_TOP_K:           return "TOP_K";
         case HTP_OP_TOP_K_MASK:      return "TOP_K_MASK";
         case HTP_OP_SSM_CONV:        return "SSM_CONV";
+        case HTP_OP_SSM_SCAN:        return "SSM_SCAN";
         case HTP_OP_CUMSUM:          return "CUMSUM";
         case HTP_OP_FILL:            return "FILL";
         case HTP_OP_DIAG:            return "DIAG";
@@ -219,6 +220,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_LIGHTNING_INDEXER: return "LIGHTNING_INDEXER";
         case HTP_OP_GATED_DELTA_NET: return "GATED_DELTA_NET";
         case HTP_OP_ROLL:            return "ROLL";
+        case HTP_OP_TIMESTEP_EMBEDDING: return "TIMESTEP_EMBEDDING";
         case HTP_OP_POOL_2D:         return "POOL_2D";
         case HTP_OP_POOL_1D:         return "POOL_1D";
         case HTP_OP_TRI:             return "TRI";
@@ -930,6 +932,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_TOP_K_MASK]      = op_top_k_mask,
     [HTP_OP_ARGMAX]          = op_argmax,
     [HTP_OP_SSM_CONV]        = op_ssm_conv,
+    [HTP_OP_SSM_SCAN]        = op_ssm_scan,
     [HTP_OP_CUMSUM]          = op_cumsum,
     [HTP_OP_FILL]            = op_fill,
     [HTP_OP_DIAG]            = op_diag,
@@ -946,6 +949,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_LIGHTNING_INDEXER] = op_lightning_indexer,
     [HTP_OP_GATED_DELTA_NET] = op_gated_delta_net,
     [HTP_OP_ROLL]            = op_roll,
+    [HTP_OP_TIMESTEP_EMBEDDING] = op_timestep_embedding,
     [HTP_OP_POOL_2D]         = op_pool_2d,
     [HTP_OP_POOL_1D]         = op_pool_1d,
     [HTP_OP_TRI]             = op_unary,
@@ -1084,6 +1088,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_SUM:     *htp_op = HTP_OP_SUM;         return 0;
         case GGML_OP_SUM_ROWS: *htp_op = HTP_OP_SUM_ROWS;   return 0;
         case GGML_OP_SSM_CONV: *htp_op = HTP_OP_SSM_CONV;   return 0;
+        case GGML_OP_SSM_SCAN: *htp_op = HTP_OP_SSM_SCAN;   return 0;
         case GGML_OP_CONT:    *htp_op = HTP_OP_CPY;         return 0;
         case GGML_OP_REPEAT:  *htp_op = HTP_OP_REPEAT;       return 0;
         case GGML_OP_NORM:    *htp_op = HTP_OP_NORM;        return 0;
@@ -1106,6 +1111,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_LIGHTNING_INDEXER: *htp_op = HTP_OP_LIGHTNING_INDEXER; return 0;
         case GGML_OP_GATED_DELTA_NET: *htp_op = HTP_OP_GATED_DELTA_NET; return 0;
         case GGML_OP_ROLL:   *htp_op = HTP_OP_ROLL;        return 0;
+        case GGML_OP_TIMESTEP_EMBEDDING: *htp_op = HTP_OP_TIMESTEP_EMBEDDING; return 0;
         case GGML_OP_POOL_2D: *htp_op = HTP_OP_POOL_2D;   return 0;
         case GGML_OP_POOL_1D: *htp_op = HTP_OP_POOL_1D;   return 0;
         case GGML_OP_CUMSUM:  *htp_op = HTP_OP_CUMSUM;      return 0;
