@@ -764,6 +764,8 @@ function commit_so_file_md5() {
 # while dspqueue DSP skels are still on device leaves an AP/DSP mismatch.
 function update_ggml_libs()
 {
+    check_android_phone
+
     #adb push ${LOCAL_BUILD_DIR}/bin/*.so ${REMOTE_PATH}/
     adb push ${LOCAL_BUILD_DIR}/bin/libggml-base.so                 ${REMOTE_PATH}/
     adb push ${LOCAL_BUILD_DIR}/bin/libggml-cpu.so                  ${REMOTE_PATH}/
