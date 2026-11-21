@@ -917,6 +917,8 @@ function detect_build_type()
 
 function prepare_run_on_phone()
 {
+    check_android_phone
+
     if [ $# != 1 ]; then
         print "invalid param"
         return
@@ -1772,7 +1774,7 @@ function show_usage_for_developer()
 show_pwd
 
 check_commands_in_host
-check_android_phone
+#check_android_phone
 check_and_download_ndk
 check_and_download_opencl_sdk
 check_and_download_hexagon_sdk
