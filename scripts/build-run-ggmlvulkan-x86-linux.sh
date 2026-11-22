@@ -53,7 +53,7 @@ GGUF_MODEL_NAME=${LLM_PATH}/gemma-4-E2B-it-Q4_0.gguf
 #   minicpm5-1b-q80     -> MiniCPM5-1B-Q8_0.gguf
 #   minicpm5-1b-q4-k-m  -> MiniCPM5-1B-Q4_K_M.gguf
 #   minicpm5-2b-q80     -> MiniCPM5-2B-Q8_0.gguf
-#   spark-4b            -> Spark-X2.5-4B.gguf
+#   spark-4b            -> Spark-X2.6-4B-Q8_0.gguf
 #   qwen3-27b           -> Qwen3.8-27B-Q4_0.gguf (x86-linux only, this alias maps to Ternary-Bonsai-2-27B-PTQ1_0.gguf in build-run-ggmlhexagon-android.sh)
 function resolve_model_name()
 {
@@ -72,9 +72,11 @@ function resolve_model_name()
         minicpm5-1b-q80)    echo "${LLM_PATH}/MiniCPM5-1B-Q8_0.gguf";;
         minicpm5-1b-q4-k-m) echo "${LLM_PATH}/MiniCPM5-1B-Q4_K_M.gguf";;
         minicpm5-2b-q80)    echo "${LLM_PATH}/MiniCPM5-2B-Q8_0.gguf";;
-        spark-4b)           echo "${LLM_PATH}/Spark-X2.5-4B.gguf";;
+        spark-4b)           echo "${LLM_PATH}/Spark-X2.6-4B-Q8_0.gguf";;
         qwen3-27b)          echo "${LLM_PATH}/Qwen3.8-27B-Q4_0.gguf" ;;
         aion-2b)            echo "${LLM_PATH}/Aion-1.0-Instruct-2.3B-AD-Q4_K_M.gguf";;
+        inkling-2)          echo "${LLM_PATH}/Inkling-2-Mini-UD-IQ2_XXS.gguf";;
+        nemotron-3b)        echo "${LLM_PATH}/NVIDIA-Nemotron-3.5-Bolt-E4B-Q8_0.gguf";;
         *)                  echo "" ; return 1 ;;
     esac
 }
@@ -490,7 +492,7 @@ function show_usage()
     echo "    nanbeige-3b   -> Nanbeige_Nanbeige4.2-3B-Q4_0.gguf"
     echo "    minicpm5-1b   -> minicpm5-1b-q4_0.gguf"
     echo "    spark-1b      -> Spark-X2.5-1.7B.gguf"
-    echo "    spark-4b      -> Spark-X2.5-4B.gguf"
+    echo "    spark-4b      -> Spark-X2.6-4B-Q8_0.gguf"
     echo "    qwen3-27b     -> Qwen3.8-27B-Q4_0.gguf (x86-linux only, maps to Ternary-Bonsai-2-27B-PTQ1_0.gguf in ggml-hexagon android)"
     echo "  Examples:"
     echo "    $0 run_llamacli/run_llamabench              # run gemma4-e2b inference test on x86-linux"

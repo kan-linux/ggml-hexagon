@@ -99,7 +99,7 @@ GGUF_MODEL_NAME=/sdcard/gemma-4-E2B-it-Q4_0.gguf
 #   minicpm5-1b-q80     -> MiniCPM5-1B-Q8_0.gguf
 #   minicpm5-1b-q4-k-m  -> MiniCPM5-1B-Q4_K_M.gguf
 #   minicpm5-2b-q80     -> MiniCPM5-2B-Q8_0.gguf
-#   spark-4b            -> Spark-X2.5-4B.gguf
+#   spark-4b            -> Spark-X2.6-4B-Q8_0.gguf
 #   qwen3-27b           -> Ternary-Bonsai-2-27B-PTQ1_0.gguf
 function resolve_model_name()
 {
@@ -118,7 +118,7 @@ function resolve_model_name()
         minicpm5-1b-q80)    echo "/sdcard/MiniCPM5-1B-Q8_0.gguf";;
         minicpm5-1b-q4-k-m) echo "/sdcard/MiniCPM5-1B-Q4_K_M.gguf";;
         minicpm5-2b-q80)    echo "/sdcard/MiniCPM5-2B-Q8_0.gguf";;
-        spark-4b)           echo "/sdcard/Spark-X2.5-4B.gguf";;
+        spark-4b)           echo "/sdcard/Spark-X2.6-4B-Q8_0.gguf";;
         qwen3-27b)          echo "/sdcard/Ternary-Bonsai-2-27B-PTQ1_0.gguf";;
         *)                  echo "" ; return 1 ;;
     esac
@@ -1702,7 +1702,7 @@ function show_usage()
     echo "    nanbeige-3b   -> Nanbeige_Nanbeige4.2-3B-Q4_0.gguf"
     echo "    minicpm5-1b   -> minicpm5-1b-q4_0.gguf"
     echo "    spark-1b      -> Spark-X2.5-1.7B.gguf"
-    echo "    spark-4b      -> Spark-X2.5-4B.gguf"
+    echo "    spark-4b      -> Spark-X2.6-4B.gguf"
     echo "  Examples:"
     echo "    $0 run_llamacli/run_llamabench              # run gemma4-e2b inference test on an Qualcomm mobile SoC-based Android phone"
     echo "    $0 run_llamacli/run_llamabench qwen3-2b     # test qwen3-2b"
