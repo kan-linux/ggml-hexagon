@@ -83,6 +83,7 @@ PROMPT_STRING="Hello, good morning, you are a powerful domain expert and know ma
 
 #running_params=" -ngl 99 -t 6 -n 256 --no-warmup --load-mode none --poll 1000 --cpu-mask 0xfc --cpu-strict 1 --ctx-size 8192 --ubatch-size 1024 -fa on"
 running_params=" -ngl 99 -t 6 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on --jinja -st"
+running_params_for_ci=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on --jinja -st"
 
 ######## part-3: utilities and functions ########
 
@@ -300,13 +301,42 @@ function run_llamacli()
 
 }
 
+function run_llamacli_for_ci()
+{
+    local model_name=""
+    local model_path=""
+
+    if [ $# -ge 1 ]; then
+        model_name="$1"
+        model_path=$(resolve_model_name "$model_name")
+        if [ -z "$model_path" ]; then
+            echo "ERROR: unknown model alias '$model_name'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
+            exit 1
+        fi
+    else
+        model_path="${GGUF_MODEL_NAME}"
+    fi
+
+    local vulkan_running_envs="export GGML_VK_MEMORY_LOGGER=1 export GGML_VK_PERF_LOGGER=1"
+    local vulkan_running_envs="export GGML_VK_ALLOW_SYSMEM_FALLBACK=1"
+    echo "cd ${LOCAL_PATH} \
+               && export LD_LIBRARY_PATH=${LOCAL_PATH} \
+               && ${LOCAL_PATH}/llama-completion ${running_params_for_ci} -m ${model_path} -p ${PROMPT_STRING@Q}"
+    cd ${LOCAL_PATH} \
+               && export LD_LIBRARY_PATH=${LOCAL_PATH} \
+               && ${vulkan_running_envs} \
+               && ${LOCAL_PATH}/llama-completion ${running_params_for_ci} -m ${model_path} -p "${PROMPT_STRING}"
+
+
+}
+
 
 #running llama-server on local x86-linux
 function run_llamaserver()
 {
     local model_name=""
     local model_path=""
-    local server_running_params=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on -np 1 --host 0.0.0.0"
+    local server_running_params=" -ngl 99 -t 6 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on -np 1 --host 0.0.0.0"
 
     if [ $# -ge 1 ]; then
         model_name="$1"
@@ -369,7 +399,7 @@ function run_llamacli_all()
         count=$(( count + 1 ))
         echo ""
         echo "--- [${count}/${total}] model=${model} ---"
-        run_llamacli "${model}"
+        run_llamacli_for_ci "${model}"
     done
 
     echo ""
