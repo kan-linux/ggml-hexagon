@@ -35,32 +35,45 @@ GGUF_MODEL_NAME=${LLM_PATH}/gemma-4-E2B-it-Q4_0.gguf
 
 # Model aliases for quick testing of multiple models
 # Usage: ./scripts/build-run-ggmlvulkan-x86-linux.sh run_llamacli <alias>
-#   qwen3-2b            -> Qwen3.5-2B-Q4_0.gguf
-#   qwen3-9b            -> Qwen3.5-9B-Q4_0.gguf
-#   gemma4-e2b          -> gemma-4-E2B-it-Q4_0.gguf
-#   gemma4-e4b          -> gemma-4-E4B_q4_0-it.gguf
-#   qwen1               -> qwen1_5-1_8b-chat-q4_0.gguf
-#   llama3              -> Llama-3.2-1B-Instruct-Q4_0.gguf
-#   nanbeige-3b         -> Nanbeige_Nanbeige4.2-3B-Q4_0.gguf
+# 8 models for PP & TG Performance Comparison: ggml-vulkan x86-linux vs ggml-hexagon on Android phone
+# automatically downloadded on first run
 #   minicpm5-1b         -> minicpm5-1b-q4_0.gguf
-#   (default)           -> gemma-4-E2B-it-Q4_0.gguf
+#   qwen3-2b            -> Qwen3.5-2B-Q4_0.gguf
+#   qwen3-4b            -> Qwen3.5-4B-Q4_0.gguf
+#   spark-1b            -> Spark-X2.5-1.7B.gguf
+#   gemma4-e2b          -> gemma-4-E2B-it-Q4_0.gguf (2.9 GiB, default test model)
+#   gemma4-e4b          -> gemma-4-E4B_q4_0-it.gguf (4.9 GiB)
+#   nanbeige-3b         -> Nanbeige_Nanbeige4.2-3B-Q4_0.gguf
+#   qwen3-9b            -> Qwen3.5-9B-Q4_0.gguf
+#
+#models for development purposes
+#   llama3              -> Llama-3.2-1B-Instruct-Q4_0.gguf
+#   qwen1               -> qwen1_5-1_8b-chat-q4_0.gguf
 #   nanbeige-3b-q80     -> Nanbeige_Nanbeige4.2-3B-Q8_0.gguf
 #   minicpm5-1b-q80     -> MiniCPM5-1B-Q8_0.gguf
-#   qwen3-27b           -> Qwen3.8-27B-Q4_0.gguf
+#   minicpm5-1b-q4-k-m  -> MiniCPM5-1B-Q4_K_M.gguf
+#   minicpm5-2b-q80     -> MiniCPM5-2B-Q8_0.gguf
+#   spark-4b            -> Spark-X2.5-4B.gguf
+#   qwen3-27b           -> Qwen3.8-27B-Q4_0.gguf (x86-linux only, this alias maps to Ternary-Bonsai-2-27B-PTQ1_0.gguf in build-run-ggmlhexagon-android.sh)
 function resolve_model_name()
 {
     case "$1" in
-        qwen3-2b)           echo "/${LLM_PATH}/Qwen3.5-2B-Q4_0.gguf" ;;
-        qwen3-9b)           echo "/${LLM_PATH}/Qwen3.5-9B-Q4_0.gguf" ;;
-        gemma4-e2b)         echo "/${LLM_PATH}/gemma-4-E2B-it-Q4_0.gguf" ;;
-        gemma4-e4b)         echo "/${LLM_PATH}/gemma-4-E4B_q4_0-it.gguf" ;;
-        qwen1)              echo "/${LLM_PATH}/qwen1_5-1_8b-chat-q4_0.gguf" ;;
-        llama3)             echo "/${LLM_PATH}/Llama-3.2-1B-Instruct-Q4_0.gguf" ;;
-        nanbeige-3b)        echo "/${LLM_PATH}/Nanbeige_Nanbeige4.2-3B-Q4_0.gguf";;
-        nanbeige-3b-q80)    echo "/${LLM_PATH}/Nanbeige_Nanbeige4.2-3B-Q8_0.gguf";;
-        minicpm5-1b)        echo "/${LLM_PATH}/minicpm5-1b-q4_0.gguf";;
-        minicpm5-1b-q80)    echo "/${LLM_PATH}/MiniCPM5-1B-Q8_0.gguf";;
-        qwen3-27b)          echo "/${LLM_PATH}/Qwen3.8-27B-Q4_0.gguf" ;;
+        minicpm5-1b)        echo "${LLM_PATH}/minicpm5-1b-q4_0.gguf";;
+        qwen3-2b)           echo "${LLM_PATH}/Qwen3.5-2B-Q4_0.gguf" ;;
+        qwen3-4b)           echo "${LLM_PATH}/Qwen3.5-4B-Q4_0.gguf" ;;
+        spark-1b)           echo "${LLM_PATH}/Spark-X2.5-1.7B.gguf";;
+        gemma4-e2b)         echo "${LLM_PATH}/gemma-4-E2B-it-Q4_0.gguf" ;;
+        gemma4-e4b)         echo "${LLM_PATH}/gemma-4-E4B_q4_0-it.gguf" ;;
+        nanbeige-3b)        echo "${LLM_PATH}/Nanbeige_Nanbeige4.2-3B-Q4_0.gguf";;
+        qwen3-9b)           echo "${LLM_PATH}/Qwen3.5-9B-Q4_0.gguf" ;;
+        llama3)             echo "${LLM_PATH}/Llama-3.2-1B-Instruct-Q4_0.gguf" ;;
+        qwen1)              echo "${LLM_PATH}/qwen1_5-1_8b-chat-q4_0.gguf" ;;
+        nanbeige-3b-q80)    echo "${LLM_PATH}/Nanbeige_Nanbeige4.2-3B-Q8_0.gguf";;
+        minicpm5-1b-q80)    echo "${LLM_PATH}/MiniCPM5-1B-Q8_0.gguf";;
+        minicpm5-1b-q4-k-m) echo "${LLM_PATH}/MiniCPM5-1B-Q4_K_M.gguf";;
+        minicpm5-2b-q80)    echo "${LLM_PATH}/MiniCPM5-2B-Q8_0.gguf";;
+        spark-4b)           echo "${LLM_PATH}/Spark-X2.5-4B.gguf";;
+        qwen3-27b)          echo "${LLM_PATH}/Qwen3.8-27B-Q4_0.gguf" ;;
         *)                  echo "" ; return 1 ;;
     esac
 }
@@ -198,25 +211,40 @@ function check_prebuilt_models()
 {
     set +e
 
-    #1.12 GiB
-    check_and_download_model qwen1_5-1_8b-chat-q4_0.gguf  https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat-GGUF/resolve/main/qwen1_5-1_8b-chat-q4_0.gguf
+    #8 models for PP & TG Performance Comparison: ggml-vulkan x86-linux vs ggml-hexagon on Android phone
+
+    #635 MiB
+    check_and_download_model minicpm5-1b-q4_0.gguf               https://huggingface.co/Elmermoreno/MiniCPM5-1B-Q4_0-GGUF/resolve/main/minicpm5-1b-q4_0.gguf
 
     #1.2 GiB
     check_and_download_model Qwen3.5-2B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_0.gguf
 
-    #5.1 GiB
-    check_and_download_model Qwen3.5-9B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf
+    #2.58 GiB
+    check_and_download_model Qwen3.5-4B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_0.gguf
+
+    #3.2 GiB
+    check_and_download_model Spark-X2.5-1.7B.gguf               https://huggingface.co/XHToken/Spark-X2.5-1.7B-GGUF/resolve/main/Spark-X2.5-1.7B.gguf
 
     #2.9 GiB
     check_and_download_model gemma-4-E2B-it-Q4_0.gguf     https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf
 
+    #4.9 GiB
     check_and_download_model gemma-4-E4B_q4_0-it.gguf     https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf
 
-    #737 MiB
-    check_and_download_model Llama-3.2-1B-Instruct-Q4_0.gguf     https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
-
     #2.4 GiB
-    check_and_download_model Nanbeige_Nanbeige4.2-3B-Q4_0.gguf   https://huggingface.com/bartowski/Nanbeige_Nanbeige4.2-3B-GGUF/resolve/main/Nanbeige_Nanbeige4.2-3B-Q4_0.gguf
+    check_and_download_model Nanbeige_Nanbeige4.2-3B-Q4_0.gguf   https://huggingface.co/bartowski/Nanbeige_Nanbeige4.2-3B-GGUF/resolve/main/Nanbeige_Nanbeige4.2-3B-Q4_0.gguf
+
+    #5.1 GiB
+    check_and_download_model Qwen3.5-9B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf
+
+
+    #temporary models for development purposes
+
+    #737 MiB
+    #check_and_download_model Llama-3.2-1B-Instruct-Q4_0.gguf     https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
+
+    #1.12 GiB
+    #check_and_download_model qwen1_5-1_8b-chat-q4_0.gguf  https://huggingface.co/Qwen/Qwen1.5-1.8B-Chat-GGUF/resolve/main/qwen1_5-1_8b-chat-q4_0.gguf
 
     #4.2 GiB
     #check_and_download_model Nanbeige_Nanbeige4.2-3B-Q8_0.gguf   https://huggingface.co/bartowski/Nanbeige_Nanbeige4.2-3B-GGUF/resolve/main/Nanbeige_Nanbeige4.2-3B-Q8_0.gguf
@@ -224,9 +252,22 @@ function check_prebuilt_models()
     #1.1 GiB
     #check_and_download_model MiniCPM5-1B-Q8_0.gguf               https://huggingface.co/openbmb/MiniCPM5-1B-GGUF/resolve/main/MiniCPM5-1B-Q8_0.gguf
 
-    #635 MiB
-    check_and_download_model minicpm5-1b-q4_0.gguf               https://huggingface.co/Elmermoreno/MiniCPM5-1B-Q4_0-GGUF/resolve/main/minicpm5-1b-q4_0.gguf
+    #7.7 GiB
+    #check_and_download_model Spark-X2.5-4B.gguf                  https://huggingface.co/XHToken/Spark-X2.5-4B-GGUF/resolve/main/Spark-X2.5-4B.gguf
+
     set -e
+}
+
+
+function run_llamaversion()
+{
+    echo "cd ${LOCAL_PATH} \
+               && export LD_LIBRARY_PATH=${LOCAL_PATH} \
+               && ${LOCAL_PATH}/llama-completion --version"
+
+    cd ${LOCAL_PATH} \
+               && export LD_LIBRARY_PATH=${LOCAL_PATH} \
+               && ${LOCAL_PATH}/llama-completion --version
 }
 
 
@@ -239,7 +280,7 @@ function run_llamacli()
         model_name="$1"
         model_path=$(resolve_model_name "$model_name")
         if [ -z "$model_path" ]; then
-            echo "ERROR: unknown model alias '$model_name'. Valid aliases: qwen3-2b, qwen3-9b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$model_name'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
             exit 1
         fi
     else
@@ -259,21 +300,62 @@ function run_llamacli()
 }
 
 
-function run_llamabench()
+#running llama-server on local x86-linux
+function run_llamaserver()
 {
+    local model_name=""
+    local model_path=""
+    local server_running_params=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on -np 1 --host 0.0.0.0"
+
+    if [ $# -ge 1 ]; then
+        model_name="$1"
+        model_path=$(resolve_model_name "$model_name")
+        if [ -z "$model_path" ]; then
+            echo "ERROR: unknown model alias '$model_name'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
+            exit 1
+        fi
+    else
+        model_path="${GGUF_MODEL_NAME}"
+    fi
+
     echo "cd ${LOCAL_PATH} \
                && export LD_LIBRARY_PATH=${LOCAL_PATH} \
-               && ${LOCAL_PATH}/llama-bench -t 6 --poll 1000 -ngl 99 -fa 1 --ubatch-size 1024 -p 200,500,800,1024 -n 128 -m ${GGUF_MODEL_NAME}"
+               && ${LOCAL_PATH}/llama-server ${server_running_params} -m ${model_path}"
+    cd ${LOCAL_PATH} \
+               && export LD_LIBRARY_PATH=${LOCAL_PATH} \
+               && ${LOCAL_PATH}/llama-server ${server_running_params} -m ${model_path}
+}
+
+
+function run_llamabench()
+{
+    local model_name=""
+    local model_path=""
+
+    if [ $# -ge 1 ]; then
+        model_name="$1"
+        model_path=$(resolve_model_name "$model_name")
+        if [ -z "$model_path" ]; then
+            echo "ERROR: unknown model alias '$model_name'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
+            exit 1
+        fi
+    else
+        model_path="${GGUF_MODEL_NAME}"
+    fi
+
+    echo "cd ${LOCAL_PATH} \
+               && export LD_LIBRARY_PATH=${LOCAL_PATH} \
+               && ${LOCAL_PATH}/llama-bench -t 6 --poll 1000 -ngl 99 -fa 1 --ubatch-size 1024 -p 200,500,800,1024 -n 128 -m ${model_path}"
 
     cd ${LOCAL_PATH} \
                && export LD_LIBRARY_PATH=${LOCAL_PATH} \
-               && ${LOCAL_PATH}/llama-bench -t 6 --poll 1000 -ngl 99 -fa 1 --ubatch-size 1024 -p 200,500,800,1024 -n 128 -m ${GGUF_MODEL_NAME}
+               && ${LOCAL_PATH}/llama-bench -t 6 --poll 1000 -ngl 99 -fa 1 --ubatch-size 1024 -p 200,500,800,1024 -n 128 -m ${model_path}
 }
 
 
 function run_llamacli_all()
 {
-    local models=("qwen1" "minicpm5-1b" "llama3" "qwen3-2b" "gemma4-e2b" "nanbeige-3b" "gemma4-e4b" "qwen3-9b" "qwen3-27b")
+    local models=("minicpm5-1b" "qwen3-2b" "qwen3-4b" "spark-1b" "gemma4-e2b" "gemma4-e4b" "nanbeige-3b" "qwen3-9b" "llama3" "qwen1" "nanbeige-3b-q80" "minicpm5-1b-q80" "minicpm5-1b-q4-k-m" "minicpm5-2b-q80" "spark-4b")
 
     local total=${#models[@]}
     local count=0
@@ -354,33 +436,38 @@ function show_usage()
     echo "  $0 build"
     echo "  $0 clean"
 
+    echo "  $0 run_llamaversion         (display llama-cpp version information, e.g. version: 0.2.0-dev (build 11120, commit 9f03708a9))"
     echo "  $0 run_testops"
     echo "  $0 run_testop     ADD/MUL_MAT/FLASH_ATTN_EXT (verify accuracy    of ADD/MUL_MAT)"
     echo "  $0 run_perfop     ADD/MUL_MAT/FLASH_ATTN_EXT (verify performance of ADD/MUL_MAT)"
-    echo "  $0 run_llamacli"
-    echo "  $0 run_llamabench"
+    echo -e "\n"
 
-    echo "  $0 run_llamacli_all     (batch test 8 models = 8 tests)"
+    echo "  $0 run_llamacli_all     (batch test 15 models = 15 tests)"
     echo "    Log capture example:"
     echo "      $0 run_llamacli_all 2>&1 | tee log_ci_\$(date +%Y%m%d-%H%M%S).txt"
     echo -e "\n"
 
-    echo "  $0 run_llamacli   [model_alias]"
+    echo "  $0 run_llamacli     [model_alias]"
+    echo "  $0 run_llamabench   [model_alias]"
+    echo "  $0 run_llamaserver  [model_alias]"
     echo "  Model aliases for run_llamacli:"
     echo "    qwen3-2b      -> Qwen3.5-2B-Q4_0.gguf"
+    echo "    qwen3-4b      -> Qwen3.5-4B-Q4_0.gguf"
     echo "    qwen3-9b      -> Qwen3.5-9B-Q4_0.gguf"
-    echo "    gemma4-e2b    -> gemma-4-E2B-it-Q4_0.gguf (2.9 GiB)"
-    echo "    gemma4-e4b    -> gemma-4-E4B_q4_0-it.gguf (4.9 GiB)"
-    echo "    qwen1         -> qwen1_5-1_8b-chat-q4_0.gguf"
-    echo "    llama3        -> Llama-3.2-1B-Instruct-Q4_0.gguf"
-    echo "    (default)     -> gemma-4-E2B-it-Q4_0.gguf"
-    echo "    qwen3-27b     -> Qwen3.8-27B-Q4_0.gguf"
+    echo "    gemma4-e2b    -> gemma-4-E2B-it-Q4_0.gguf"
+    echo "    gemma4-e4b    -> gemma-4-E4B_q4_0-it.gguf"
+    echo "    nanbeige-3b   -> Nanbeige_Nanbeige4.2-3B-Q4_0.gguf"
+    echo "    minicpm5-1b   -> minicpm5-1b-q4_0.gguf"
+    echo "    spark-1b      -> Spark-X2.5-1.7B.gguf"
+    echo "    spark-4b      -> Spark-X2.5-4B.gguf"
+    echo "    qwen3-27b     -> Qwen3.8-27B-Q4_0.gguf (x86-linux only, maps to Ternary-Bonsai-2-27B-PTQ1_0.gguf in ggml-hexagon android)"
     echo "  Examples:"
-    echo "    $0 run_llamacli qwen3-2b     # test qwen3-2b"
-    echo "    $0 run_llamacli qwen3-9b     # test qwen3-9b"
-    echo "    $0 run_llamacli qwen3-27b    # test qwen3-27b"
-    echo "    $0 run_llamacli gemma4-e2b   # test gemma4-e2b"
-    echo "    $0 run_llamacli gemma4-e4b   # test gemma4-e4b"
+    echo "    $0 run_llamacli/run_llamabench              # run gemma4-e2b inference test on x86-linux"
+    echo "    $0 run_llamacli/run_llamabench qwen3-2b     # test qwen3-2b"
+    echo "    $0 run_llamacli/run_llamabench qwen3-4b     # test qwen3-4b"
+    echo "    $0 run_llamacli/run_llamabench gemma4-e2b   # test gemma4-e2b"
+    echo "    $0 run_llamacli/run_llamabench gemma4-e4b   # test gemma4-e4b"
+    echo "    $0 run_llamacli/run_llamabench spark-1b     # test spark-1b"
     echo -e "\n"
 }
 
@@ -416,6 +503,12 @@ elif [ $# == 1 ]; then
     elif [ "$1" == "run_llamacli" ]; then
         run_llamacli
         exit 0
+    elif [ "$1" == "run_llamaversion" ]; then
+        run_llamaversion
+        exit 0
+    elif [ "$1" == "run_llamaserver" ]; then
+        run_llamaserver
+        exit 0
     elif [ "$1" == "run_llamabench" ]; then
         run_llamabench
         exit 0
@@ -437,11 +530,27 @@ elif [ $# == 2 ]; then
         exit 0
     elif [ "$1" == "run_llamacli" ]; then
         if [ -z "$(resolve_model_name "$2")" ]; then
-            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3-2b, qwen3-9b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$2'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
             show_usage
             exit 1
         fi
         run_llamacli "$2"
+        exit 0
+    elif [ "$1" == "run_llamabench" ]; then
+        if [ -z "$(resolve_model_name "$2")" ]; then
+            echo "ERROR: unknown model alias '$2'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
+            show_usage
+            exit 1
+        fi
+        run_llamabench "$2"
+        exit 0
+    elif [ "$1" == "run_llamaserver" ]; then
+        if [ -z "$(resolve_model_name "$2")" ]; then
+            echo "ERROR: unknown model alias '$2'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
+            show_usage
+            exit 1
+        fi
+        run_llamaserver "$2"
         exit 0
     else
         show_usage
@@ -458,7 +567,7 @@ elif [ $# == 3 ]; then
         exit 0
     elif [ "$1" == "run_llamacli" ]; then
         if [ -z "$(resolve_model_name "$2")" ]; then
-            echo "ERROR: unknown model alias '$2'. Valid aliases: qwen3-2b, qwen3-9b, gemma4-e2b, gemma4-e4b, qwen1, llama3"
+            echo "ERROR: unknown model alias '$2'. Valid aliases: minicpm5-1b, qwen3-2b, qwen3-4b, spark-1b, gemma4-e2b, gemma4-e4b, nanbeige-3b, qwen3-9b, llama3, qwen1, nanbeige-3b-q80, minicpm5-1b-q80, minicpm5-1b-q4-k-m, minicpm5-2b-q80, spark-4b, qwen3-27b"
             show_usage
             exit 1
         fi

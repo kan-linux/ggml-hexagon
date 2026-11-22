@@ -116,7 +116,7 @@ function resolve_model_name()
         qwen1)              echo "/sdcard/qwen1_5-1_8b-chat-q4_0.gguf" ;;
         nanbeige-3b-q80)    echo "/sdcard/Nanbeige_Nanbeige4.2-3B-Q8_0.gguf";;
         minicpm5-1b-q80)    echo "/sdcard/MiniCPM5-1B-Q8_0.gguf";;
-        minicpm5-1b-q4-k-m) echo "/sdcard/minicpm5-1B-Q4_K_M.gguf";;
+        minicpm5-1b-q4-k-m) echo "/sdcard/MiniCPM5-1B-Q4_K_M.gguf";;
         minicpm5-2b-q80)    echo "/sdcard/MiniCPM5-2B-Q8_0.gguf";;
         spark-4b)           echo "/sdcard/Spark-X2.5-4B.gguf";;
         qwen3-27b)          echo "/sdcard/Ternary-Bonsai-2-27B-PTQ1_0.gguf";;
@@ -676,7 +676,7 @@ function check_prebuilt_models()
     check_and_download_model gemma-4-E4B_q4_0-it.gguf     https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf
 
     #2.4 GiB
-    check_and_download_model Nanbeige_Nanbeige4.2-3B-Q4_0.gguf   https://huggingface.com/bartowski/Nanbeige_Nanbeige4.2-3B-GGUF/resolve/main/Nanbeige_Nanbeige4.2-3B-Q4_0.gguf
+    check_and_download_model Nanbeige_Nanbeige4.2-3B-Q4_0.gguf   https://huggingface.co/bartowski/Nanbeige_Nanbeige4.2-3B-GGUF/resolve/main/Nanbeige_Nanbeige4.2-3B-Q4_0.gguf
 
     #5.1 GiB
     check_and_download_model Qwen3.5-9B-Q4_0.gguf         https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf
