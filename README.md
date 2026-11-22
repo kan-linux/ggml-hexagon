@@ -106,13 +106,13 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
 ## Branches
 
 - master
-  https://github.com/zhouwg/ggml-hexagon/tree/master, track [upstream llama.cpp project](https://github.com/ggml-org/llama.cpp/).
+  https://github.com/kan-linux/ggml-hexagon/tree/master, track [upstream llama.cpp project](https://github.com/ggml-org/llama.cpp/).
 
 - self-build-jz
-  https://github.com/zhouwg/ggml-hexagon/tree/self-build-jz, the default branch, FastRPC-based ggml-hexagon & upstream dspqueue-based ggml-hexagon can be found in this branch.
+  https://github.com/kan-linux/ggml-hexagon/tree/self-build-jz, the default branch, FastRPC-based ggml-hexagon & upstream dspqueue-based ggml-hexagon can be found in this branch.
 
 - pr_to_upstream_v3
-  [https://github.com/zhouwg/ggml-hexagon/tree/pr_to_upstream_v3](https://github.com/ggml-hexagon/ggml-hexagon/tree/pr_to_upstream_v3), candidate PR to upstream llama.cpp.
+  [https://github.com/kan-linux/ggml-hexagon/tree/pr_to_upstream_v3](https://github.com/ggml-hexagon/ggml-hexagon/tree/pr_to_upstream_v3), candidate PR to upstream llama.cpp.
 
 ## Introducing FastRPC-based ggml-hexagon
 
@@ -127,5 +127,5 @@ Since upstream llama.cpp updates rapidly, this project synchronizes with upstrea
 - English and Chinese are **both fine** for issues and discussions.
 - Discussions, issues and PRs should include **human-written content**. **AI-assisted polish is accepted and welcomed**(many of us are non-native English speakers). What matters is not who typed the content but whether a human understands it.
 - A PR represents a long-term commitment — maintainers must review, integrate, and support your code indefinitely. What matters is not who wrote the code but whether a human understands it: **either fully, or at the 70–90% level, and is able to explain major change to reviewers, even with AI assistance**(many of us are not AI experts).
-- Fully AI-generated content and fully automated PRs are not permitted. We value human connection and communication over fully AI-driven interaction.
+- Fully automated AI-generated content and fully automated PRs are not permitted. We value human connection and communication over fully AI-driven interaction.
 
