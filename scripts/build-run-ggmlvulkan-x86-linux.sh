@@ -74,6 +74,7 @@ function resolve_model_name()
         minicpm5-2b-q80)    echo "${LLM_PATH}/MiniCPM5-2B-Q8_0.gguf";;
         spark-4b)           echo "${LLM_PATH}/Spark-X2.5-4B.gguf";;
         qwen3-27b)          echo "${LLM_PATH}/Qwen3.8-27B-Q4_0.gguf" ;;
+        aion-2b)            echo "${LLM_PATH}/Aion-1.0-Instruct-2.3B-AD-Q4_K_M.gguf";;
         *)                  echo "" ; return 1 ;;
     esac
 }
@@ -81,7 +82,7 @@ function resolve_model_name()
 PROMPT_STRING="Hello, good morning, you are a powerful domain expert and know many things, now pls help to introduce the movie Once Upon a Time in America briefly, pls pay attention short then 1000 words\n"
 
 #running_params=" -ngl 99 -t 6 -n 256 --no-warmup --load-mode none --poll 1000 --cpu-mask 0xfc --cpu-strict 1 --ctx-size 8192 --ubatch-size 1024 -fa on"
-running_params=" -ngl 99 -t 6 -n 256 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on --jinja -st"
+running_params=" -ngl 99 -t 6 --ctx-size 8192 --ubatch-size 64 --poll 1000 --no-warmup --load-mode none -fa on --jinja -st"
 
 ######## part-3: utilities and functions ########
 
