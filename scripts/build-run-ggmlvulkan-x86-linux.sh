@@ -166,7 +166,6 @@ function check_and_download_vulkan_sdk()
 
     if [ ${is_vulkan_sdk_exist} -eq 0 ]; then
         mkdir -p ${VULKAN_SDK_PATH}
-        cd ${VULKAN_SDK_PATH}
 
         if [ ! -f ${VULKAN_SDK_NAME} ]; then
             echo -e "download vulkan sdk from ${VULKAN_SDK_URL}...\n"
@@ -177,7 +176,9 @@ function check_and_download_vulkan_sdk()
             fi
         fi
         printf "decompress ${VULKAN_SDK_NAME}..."
-        tar Jxf ${VULKAN_SDK_NAME}
+        # -C, not cd: leaving this function in prebuilts/ would run the cmake that
+        # follows in the wrong directory on a fresh checkout (the SDK download path).
+        tar Jxf ${VULKAN_SDK_PATH}/${VULKAN_SDK_NAME} -C ${VULKAN_SDK_PATH}
     else
         printf "VULKAN SDK already exist:    ${VULKAN_SDK_PATH} \n\n"
     fi
